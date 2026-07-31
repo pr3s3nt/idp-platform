@@ -732,16 +732,38 @@ def guard_ordering(deployed: str, sha: str, app_dir: Path | None, env: str) -> N
         )
 
 
-def upstream_record(config: Path, env: str) -> str:
+def upstream_record(config: Path, env: str, base: str) -> str:
     """The deploy record as it exists on the remote RIGHT NOW ('' if absent).
 
     Read after a fetch, so it reflects writers that landed since this job cloned the repo.
+    `base` is the branch this deploy targets — with the PR flow the working branch is a
+    throwaway, so reading HEAD's name would compare against the wrong thing.
     """
-    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                 cwd=config, capture=True).stdout.strip()
-    cp = run(["git", "show", f"origin/{branch}:{sha_record_dir()}/{env}.sha"],
+    cp = run(["git", "show", f"origin/{base}:{sha_record_dir()}/{env}.sha"],
              cwd=config, check=False, capture=True)
     return cp.stdout.strip() if cp.returncode == 0 else ""
+
+
+def open_pull_request(config: Path, base: str, head: str, title: str, body: str) -> str:
+    """Open a PR and return its URL. Does NOT merge — a human approves and merges.
+
+    Used for environments whose branch requires review. Deliberately stops here: the point
+    of the approval is that a person looks at the manifest diff before production changes,
+    and a bot that merges its own PR would defeat it.
+    """
+    cp = run(["gh", "pr", "create", "--base", base, "--head", head,
+              "--title", title, "--body", body],
+             cwd=config, check=False, capture=True)
+    if cp.returncode != 0:
+        err = (cp.stderr or "") + (cp.stdout or "")
+        # A PR for this branch may already exist if the job is being re-run.
+        if "already exists" in err:
+            existing = run(["gh", "pr", "view", head, "--json", "url", "-q", ".url"],
+                           cwd=config, check=False, capture=True)
+            if existing.returncode == 0:
+                return existing.stdout.strip()
+        raise SystemExit(f"could not open pull request: {err.strip()}")
+    return cp.stdout.strip().splitlines()[-1] if cp.stdout.strip() else ""
 
 
 def cmd_commit(args) -> None:
@@ -766,6 +788,33 @@ def cmd_commit(args) -> None:
         msg += f" (catalog: {args.catalog_ref})"
     run(["git", "commit", "-m", msg], cwd=config)
 
+    # Optional so a hand-replay on the runner, and every existing caller, still works:
+    # no --branch means "whatever branch this checkout is on".
+    base = getattr(args, "branch", None) or run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=config, capture=True).stdout.strip()
+
+    # Environments whose branch requires review never get a direct push. The bot puts the
+    # change on its own branch and opens a PR; a person reads the manifest diff and merges.
+    if getattr(args, "via_pr", False):
+        head = f"deploy/{args.app}-{args.env}-{args.sha[:8]}"
+        run(["git", "checkout", "-B", head], cwd=config)
+        run(["git", "push", "--force-with-lease", "origin", head], cwd=config)
+        url = open_pull_request(
+            config, base, head,
+            title=msg,
+            body=(
+                f"Triển khai tự động do orchestrator sinh ra.\n\n"
+                f"| | |\n|---|---|\n"
+                f"| app | `{args.app}` |\n| môi trường | `{args.env}` |\n"
+                f"| commit | `{args.sha}` |\n| catalog | `{args.catalog_ref or 'n/a'}` |\n\n"
+                "Diff bên dưới chính là thứ sẽ thay đổi trên cụm sau khi merge.\n"
+                "**Không sửa tay** — lần triển khai sau sẽ ghi đè."
+            ),
+        )
+        log(f"opened pull request into {base}: {url}")
+        print(url)
+        return
+
     for attempt in (1, 2, 3):
         if run(["git", "push"], cwd=config, check=False).returncode == 0:
             log("pushed")
@@ -780,7 +829,7 @@ def cmd_commit(args) -> None:
         # environment back. The guard only ran against the stale clone, so run it again
         # against what is actually on the remote now.
         run(["git", "fetch", "origin"], cwd=config)
-        guard_ordering(upstream_record(config, args.env), args.sha, app_dir, args.env)
+        guard_ordering(upstream_record(config, args.env, base), args.sha, app_dir, args.env)
 
         rebase = run(["git", "pull", "--rebase"], cwd=config, check=False, capture=True)
         if rebase.returncode != 0:
@@ -1044,6 +1093,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--sha", required=True)
     p.add_argument("--app-dir", help="app checkout, needed for the ancestry guard")
     p.add_argument("--catalog-ref")
+    p.add_argument("--branch", help="branch of the config repo this environment targets")
+    p.add_argument("--via-pr", action="store_true",
+                   help="open a pull request instead of pushing; for environments that "
+                        "require review before the cluster changes")
     p.set_defaults(func=cmd_commit)
 
     p = sub.add_parser("promote")

@@ -7,6 +7,7 @@ with the catalog in this repo (provisioners/ + patches/).
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -745,3 +746,57 @@ def test_config_file_overrides_defaults_without_dropping_them(tmp_path):
 def test_missing_config_file_is_fatal():
     with pytest.raises(SystemExit, match="env config not found"):
         orc.EnvConfig.load("/nope/platform.env.yaml")
+
+
+# ----------------------------------------------------------------- PR flow (branch protection)
+def fake_gh(tmp_path: Path) -> Path:
+    """A stand-in `gh` on PATH, so the PR path is testable without a real remote."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'echo "$@" >> "$GH_CALLS"\n'
+        'echo https://example.invalid/pr/1\n'
+    )
+    gh.chmod(0o755)
+    return bindir
+
+
+def test_commit_via_pr_pushes_a_branch_and_opens_a_pr(tmp_path, repo_with_two_commits, monkeypatch):
+    """Production requires review, so the bot must NOT push onto the protected branch.
+    It puts the change on its own branch and opens a PR for a human to merge."""
+    app, _old, new = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+    base = branch_of(config)
+
+    calls = tmp_path / "gh-calls.txt"
+    monkeypatch.setenv("GH_CALLS", str(calls))
+    monkeypatch.setenv("PATH", f"{fake_gh(tmp_path)}:{os.environ['PATH']}")
+
+    (config / "staging" / "manifests.yaml").write_text("rendered\n")
+    orc.cmd_commit(orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="prod", sha=new, app_dir=str(app),
+        catalog_ref="main", branch=base, via_pr=True,
+    ))
+
+    # A dedicated branch reached the remote...
+    head = f"deploy/a-prod-{new[:8]}"
+    assert head in git(config, "ls-remote", "--heads", "origin")
+    # ...the protected base branch was NOT moved by us...
+    assert git(config, "rev-parse", f"origin/{base}") == git(config, "rev-parse", f"{base}@{{u}}")
+    # ...and a PR was opened against it.
+    text = calls.read_text()
+    assert "pr create" in text and f"--base {base}" in text and f"--head {head}" in text
+
+
+def test_commit_without_via_pr_still_pushes_directly(tmp_path, repo_with_two_commits):
+    """Staging needs no review, so it keeps the fast path: a plain push, no PR."""
+    app, _old, new = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+    (config / "staging" / "manifests.yaml").write_text("rendered\n")
+    orc.cmd_commit(orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="staging", sha=new, app_dir=str(app),
+        catalog_ref=None, branch=None, via_pr=False,
+    ))
+    assert new in git(config, "log", "--format=%s", "-1", "@{u}")
