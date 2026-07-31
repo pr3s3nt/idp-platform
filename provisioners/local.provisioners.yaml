@@ -114,7 +114,7 @@
             automountServiceAccountToken: false
             containers:
             - name: postgres-db
-              image:  registry.staging.internal.dev/platform-images/postgres:17-alpine   # <-- ĐỔI: image Harbor
+              image:  ghcr.io/pr3s3nt/postgres:17-alpine   # <-- SANDBOX: mirror GHCR thay image Harbor
               ports:
               - name: postgres
                 containerPort: 5432

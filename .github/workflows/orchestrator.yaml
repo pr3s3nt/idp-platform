@@ -58,13 +58,14 @@ on:
         required: false
 
 env:
-  ORG: org-team
-  # Repos in this org are all platform-prefixed (platform-sample-app, platform-sample-app-config),
+  # SANDBOX: a personal github.com account stands in for the GitHub Enterprise org.
+  ORG: pr3s3nt
+  # Repos in this org are all idp-prefixed (idp-sample-nginx, idp-sample-nginx-config),
   # while `app` stays unprefixed (sample-nginx) so namespaces read sample-nginx-staging.
-  CONFIG_PREFIX: platform-
-  # Harbor project holding the app images. Matches the Postgres image path already used by
+  CONFIG_PREFIX: idp-
+  # SANDBOX: GHCR stands in for Harbor. Matches the Postgres image path already used by
   # provisioners/local.provisioners.yaml.
-  REGISTRY: registry.staging.internal.dev/platform-images
+  REGISTRY: ghcr.io/pr3s3nt
 
 jobs:
   # ===========================================================================
