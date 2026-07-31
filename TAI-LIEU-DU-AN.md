@@ -398,6 +398,43 @@ trường.
 
 ---
 
+### 6.8. Gom toàn bộ cấu hình môi trường về một file
+
+Mục tiêu: mang platform sang môi trường khác chỉ cần **đưa file cấu hình**, không sửa code.
+
+Trước khi làm, giá trị phụ thuộc hạ tầng nằm rải ở **5 file, 3 cú pháp khác nhau**:
+
+| File | Cú pháp | Chứa gì |
+|---|---|---|
+| workflow của orchestrator | YAML | tổ chức git, tiền tố repo, registry, nhãn máy chủ CI |
+| bộ sinh manifest | Python | namespace lưu trạng thái, tên secret, thư mục ghi nhận |
+| thư viện resource | Go template | tên miền, tên Gateway, StorageClass, ảnh Postgres |
+| chuẩn chung ×2 | Go template | tên pull secret, số bản sao, hạn mức tài nguyên |
+
+Chuyển môi trường nghĩa là sửa 5 file bằng 3 cú pháp, và sai một chỗ thì hỏng im lặng.
+
+**Sau khi làm: một file `platform.env.yaml`.** Thư viện resource và chuẩn chung dùng ô trống
+dạng `%%khoá%%`; bộ sinh manifest điền giá trị vào một **bản sao** trong thư mục tạm trước
+khi công cụ bên ngoài nhìn thấy — bản gốc không bị đụng, và khi lỗi thì file thật đã dùng
+vẫn nằm đó để xem.
+
+Ba quyết định đáng ghi lại:
+
+**File này KHÔNG bị ghim phiên bản theo ứng dụng.** Ứng dụng ghim *thư viện resource* (cách
+một thứ được hiện thực hoá). File này là *toạ độ hạ tầng đang chạy*. Nếu ghim nó, một ứng
+dụng dùng thư viện cũ sẽ triển khai vào tên Gateway đã bị đổi từ lâu — mà lỗi đó không báo
+gì cả.
+
+**Ô trống sai tên là lỗi ngay, kèm danh sách khoá hợp lệ.** Không render thành chuỗi rỗng.
+Mọi lỗi hạ tầng trong dự án này đều hỏng theo kiểu im lặng; cái này không được vào danh sách đó.
+
+**Một ngoại lệ không thể đưa vào file:** nhãn chọn máy chủ CI. GitHub quyết định chạy trên
+máy nào *trước khi* thực thi bước đầu tiên, nên không đọc được từ file. Nó lấy từ một biến
+cấu hình của repo — vẫn là cấu hình chứ không phải code, nhưng là **chỗ thứ hai** phải sửa.
+
+Kiểm chứng sau khi đổi: triển khai lại cùng một phiên bản cho ra `no manifest changes` —
+không tạo commit thừa, tức kết quả sinh ra đã tất định.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
