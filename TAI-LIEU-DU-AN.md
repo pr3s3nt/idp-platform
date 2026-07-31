@@ -435,10 +435,119 @@ cấu hình của repo — vẫn là cấu hình chứ không phải code, nhưn
 Kiểm chứng sau khi đổi: triển khai lại cùng một phiên bản cho ra `no manifest changes` —
 không tạo commit thừa, tức kết quả sinh ra đã tất định.
 
+### 6.9. Nhánh được bảo vệ: production phải qua duyệt
+
+Công ty bật branch protection ở mọi nhánh, merge bắt buộc qua pull request, và quy tắc là
+**production cần duyệt, staging thì không**. Orchestrator trước đó push thẳng, nên sẽ bị
+chặn — đây là thay đổi code chứ không phải cấu hình.
+
+Cách tổ chức đã chọn: **repo cấu hình dùng hai nhánh**, trùng đúng mô hình nhánh của
+repo ứng dụng.
+
+| Nhánh | Môi trường | Cách máy ghi vào |
+|---|---|---|
+| `dev` | staging | ghi thẳng, không cần duyệt |
+| `main` | production | mở pull request, người đọc diff rồi merge |
+
+Vì sao hai nhánh thay vì một nhánh hai thư mục: quy tắc "chỉ duyệt production" diễn đạt
+được bằng branch protection thuần, không cần cấu hình quyền theo đường dẫn.
+
+**Hai nhánh này KHÔNG bao giờ merge vào nhau.** Cấu hình hai môi trường khác nhau thật —
+số bản sao, hạn mức, tên miền. Merge `dev` sang `main` sẽ kéo số bản sao của staging sang
+production. Mỗi nhánh do máy sinh độc lập với giá trị đúng của môi trường đó.
+
+**Máy cố ý KHÔNG tự merge pull request của chính nó.** Mục đích của việc duyệt là có người
+đọc diff trước khi production đổi; máy tự merge là vô hiệu hoá điều đó. (GitHub cũng chặn
+cứng việc tự duyệt pull request của chính mình — đã kiểm bằng thực nghiệm.)
+
+Đã kiểm chứng đầy đủ trên một repo bật branch protection thật:
+
+| Bước | Kết quả |
+|---|---|
+| Push thẳng vào nhánh production | **Bị GitHub từ chối** — "Changes must be made through a pull request" |
+| Triển khai staging | ghi thẳng vào `dev`, **không** tạo pull request |
+| Triển khai production | mở pull request, nhánh production **không nhúc nhích** |
+| Sau khi người merge | Fleet nhặt đúng phiên bản mới và áp lên cụm production |
+
+Bước cuối là thứ trước đó chưa ai kiểm bao giờ.
+
+**Hai lỗi lộ ra khi chạy thật, không nhìn ra được bằng đọc code:**
+
+- Lệnh đẩy code không ghi rõ nhánh đích thì phụ thuộc cấu hình theo dõi nhánh. Nhánh mới
+  chưa thiết lập theo dõi sẽ báo lỗi, và vòng thử lại **hiểu nhầm** thành "có người đẩy
+  trước" rồi đi hợp nhất — báo lỗi lạc đề hoàn toàn.
+- Sau một lần đẩy hỏng, thay đổi nằm lại trên máy. Lần chạy lại không thấy gì mới nên
+  **thoát sớm** và không đẩy phần còn sót — nghĩa là chạy lại một lần triển khai hỏng
+  không sửa được gì.
+
+### 6.10. Hai service ở hai kho mã khác nhau
+
+Câu hỏi: backend một kho, frontend một kho — platform có chạy đúng không? **Không**, và
+lỗi rất rõ:
+
+```
+resource 'service.default#frontend.backend': unknown workload
+```
+
+Cơ chế tham chiếu chéo sẵn có chỉ nhìn thấy các thành phần được sinh **trong cùng một
+lần**. Hai kho là hai lần sinh tách biệt. Đây là giới hạn cố hữu chứ không phải lỗi: lúc
+dựng cấu hình cho frontend, platform không biết backend tồn tại — và cũng không nên biết,
+vì hai ứng dụng triển khai độc lập nhau.
+
+Đã thêm loại phụ thuộc mới: **không tra cứu gì cả**, ráp thẳng địa chỉ nội bộ mà Kubernetes
+vốn đã cấp cho mọi service, theo đúng quy ước đặt tên nằm trong file cấu hình môi trường.
+
+```
+staging → backend.backend-staging.svc.cluster.local:8080
+prod    → backend.backend-prod.svc.cluster.local:8080
+```
+
+**Đánh đổi đã ghi rõ:** không có kiểm tra tồn tại. Gõ sai tên ứng dụng thì cấu hình vẫn
+sinh ra bình thường, chỉ hỏng lúc chạy. Cách cũ bắt lỗi ngay nhưng chỉ dùng được trong
+cùng một kho. Đó là cái giá của việc hai ứng dụng triển khai độc lập — không có cách nào
+vừa độc lập vừa kiểm tra chéo được.
+
+### 6.11. Bí mật của riêng ứng dụng
+
+Platform vốn đã lo được bí mật do **nó** sinh ra: mật khẩu cơ sở dữ liệu không bao giờ vào
+Git, chỉ có tham chiếu. Nhưng bí mật của **riêng ứng dụng** — khoá API bên thứ ba — thì
+không có đường nào, nên cách duy nhất là viết thẳng vào file khai báo. Khi đó khoá đi vào
+Git của ứng dụng **lẫn** vào kho cấu hình dưới dạng đọc được.
+
+Đã thêm loại tài nguyên `secret`: lập trình viên chỉ khai **tên** và **khoá**, không khai
+giá trị.
+
+Kiểm chứng thật trên cụm, không chỉ trên giấy:
+
+| Nơi | Nội dung |
+|---|---|
+| Bên trong container | `STRIPE_API_KEY=sk_live_...` — giá trị thật |
+| Trong Git | `valueFrom.secretKeyRef {name, key}` — **chỉ có tham chiếu** |
+
+**Cố ý không nói bí mật đó từ đâu ra.** Platform không bao giờ nhìn thấy giá trị; Secret do
+bên sở hữu đưa vào. Nhờ vậy khi sau này thêm cổng tự khai báo bí mật, **file khai báo của
+mọi ứng dụng không phải sửa dòng nào** — chỉ đổi cơ chế bơm giá trị.
+
+### 6.12. Commit triển khai đang ghi công cho một người lạ
+
+Phát hiện khi trả lời câu hỏi "máy dùng để làm gì". Địa chỉ thư dùng cho commit tự động
+được gắn cứng theo định dạng mà GitHub dùng để **ánh xạ về một tài khoản**. Vì tài khoản
+trùng tên đó tồn tại thật, mọi commit triển khai đang được ghi công cho một người dùng
+không liên quan gì tới dự án — làm hỏng đúng thứ mà lịch sử kho cấu hình sinh ra để phục
+vụ: truy vết ai triển khai cái gì.
+
+Đã đưa danh tính vào file cấu hình, mặc định dùng địa chỉ không thể ánh xạ về tài khoản
+nào, kèm một kiểm thử chặn hẳn việc dùng lại định dạng cũ.
+
+> Ghi chú: hiện **chưa có tài khoản máy riêng**. Mọi thao tác chạy bằng token cá nhân.
+> Khi lên môi trường thật nên dùng GitHub App — vừa truy vết đúng, vừa không chết theo
+> người nghỉ việc, vừa làm cho "người tạo khác người duyệt" đúng về mặt cấu trúc.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
-**30/30 test đạt.** Bao gồm test cho các tình huống đua đã nêu ở mục 6.5.
+**54/54 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
+pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10) và bí mật của ứng dụng (6.11).
 
 ### Kiểm chứng chạy thật
 
@@ -452,6 +561,9 @@ không tạo commit thừa, tức kết quả sinh ra đã tất định.
 | App nhiều service | 11 service, tham chiếu chéo nhau đều đúng địa chỉ |
 | Luồng nghiệp vụ thật | Vào trang, xem sản phẩm, thêm giỏ hàng, tính tiền — có dùng Redis thật |
 | Các tình huống đua | 4 kịch bản mô phỏng, đều bị chặn đúng như thiết kế |
+| Nhánh được bảo vệ | Push thẳng bị GitHub từ chối; production đi qua pull request; sau khi merge Fleet áp lên cụm |
+| Bí mật của ứng dụng | Giá trị thật vào được container, trong Git chỉ có tham chiếu |
+| Phụ thuộc xuyên kho mã | Địa chỉ tự đổi theo môi trường, không cần hai ứng dụng biết nhau |
 
 ### Quy mô hiện tại
 
@@ -471,7 +583,9 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 | Hai ứng dụng cùng có workload tên `frontend` sẽ trùng tên miền | Cổng vào chỉ trỏ được tới một trong hai | Tên miền suy ra từ tên workload, chưa tính tên ứng dụng. Cần đổi quy tắc thành `<app>-<workload>` hoặc để ứng dụng tự khai |
 | Hàng đợi triển khai vẫn có thể bỏ sót | Đã giảm mạnh và **đã có cảnh báo**, nhưng chưa loại trừ tuyệt đối | Cảnh báo hiện ra ở phần tóm tắt của lần chạy |
 | Commit trung gian không có image | Do gộp các lần push liên tiếp | Muốn thăng cấp đúng commit đó phải build lại |
+| **Không kiểm tra quyền sở hữu ứng dụng** | Tên ứng dụng và kho mã do bên gọi **tự khai**, không có bước xác thực nào. Bất kỳ ai gọi được vào platform đều có thể triển khai thay ứng dụng của đội khác | **Đã cân nhắc và tạm chấp nhận**: sandbox một người dùng, chưa có nhiều đội. Phải xử lý trước khi nhiều đội dùng chung |
 | Sandbox chưa có phân quyền | Mọi thứ dùng chung một token toàn quyền | Môi trường thật cần tách quyền theo từng repo |
+| Một kho cấu hình đang để công khai | `helloworld-config` được chuyển sang công khai để bật branch protection (bản miễn phí chỉ hỗ trợ kho công khai) | Đã soát toàn bộ lịch sử trước khi chuyển: **0 bí mật**, không có Secret nào. Kho mã ứng dụng vẫn riêng tư |
 
 ---
 
