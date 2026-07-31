@@ -21,6 +21,14 @@ CATALOG = Path(__file__).parent
 # Tests render the real catalog, which now carries %%placeholders%%. Load the repo's own
 # environment config so substitution has values — same file the workflow passes in.
 orc.CONFIG = orc.EnvConfig.load(str(CATALOG / "platform.env.yaml"))
+
+
+@pytest.fixture
+def no_branch_config(monkeypatch):
+    """Git fixtures create repos on whatever branch this git defaults to (often master),
+    while the repo's own config names `main`. Tests about ordering are not about branch
+    names, so drop the environments block for them."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
 HAS_SCORE_K8S = shutil.which("score-k8s") is not None
 needs_score_k8s = pytest.mark.skipif(not HAS_SCORE_K8S, reason="score-k8s not installed")
 
@@ -201,7 +209,7 @@ def make_config_repo(tmp_path: Path) -> Path:
     return config
 
 
-def test_commit_refuses_out_of_order_deploy(tmp_path, repo_with_two_commits):
+def test_commit_refuses_out_of_order_deploy(tmp_path, repo_with_two_commits, no_branch_config):
     """The ordering bug: build durations differ, so an older commit can dispatch second.
     Without this guard the config repo silently regresses to the older SHA."""
     app, old, new = repo_with_two_commits
@@ -218,7 +226,7 @@ def test_commit_refuses_out_of_order_deploy(tmp_path, repo_with_two_commits):
         orc.cmd_commit(args)
 
 
-def test_commit_allows_newer_deploy(tmp_path, repo_with_two_commits):
+def test_commit_allows_newer_deploy(tmp_path, repo_with_two_commits, no_branch_config):
     app, old, new = repo_with_two_commits
     config = make_config_repo(tmp_path)
     record = config / orc.sha_record_dir() / "staging.sha"
@@ -445,7 +453,7 @@ def record_deploy(repo: Path, env: str, sha: str, msg: str) -> None:
     git(repo, "commit", "-qm", msg)
 
 
-def test_commit_refuses_stale_render_after_remote_moved_ahead(tmp_path, repo_with_two_commits):
+def test_commit_refuses_stale_render_after_remote_moved_ahead(tmp_path, repo_with_two_commits, no_branch_config):
     """The rebase hole: the guard used to run ONCE, against the clone taken at job start.
 
     Another writer lands a newer deploy while we render. Our push is rejected, and the
@@ -474,7 +482,7 @@ def test_commit_refuses_stale_render_after_remote_moved_ahead(tmp_path, repo_wit
     assert git(other, "show", f"{up}:{orc.sha_record_dir()}/staging.sha").strip() == new
 
 
-def test_commit_rebases_when_concurrent_change_is_unrelated(tmp_path, repo_with_two_commits):
+def test_commit_rebases_when_concurrent_change_is_unrelated(tmp_path, repo_with_two_commits, no_branch_config):
     """The same race, but the other writer touched something else (a human editing
     fleet.yaml). Rebasing is correct here and must still happen."""
     app, old, new = repo_with_two_commits
@@ -763,7 +771,7 @@ def fake_gh(tmp_path: Path) -> Path:
     return bindir
 
 
-def test_commit_via_pr_pushes_a_branch_and_opens_a_pr(tmp_path, repo_with_two_commits, monkeypatch):
+def test_commit_via_pr_pushes_a_branch_and_opens_a_pr(tmp_path, repo_with_two_commits, monkeypatch, no_branch_config):
     """Production requires review, so the bot must NOT push onto the protected branch.
     It puts the change on its own branch and opens a PR for a human to merge."""
     app, _old, new = repo_with_two_commits
@@ -790,7 +798,7 @@ def test_commit_via_pr_pushes_a_branch_and_opens_a_pr(tmp_path, repo_with_two_co
     assert "pr create" in text and f"--base {base}" in text and f"--head {head}" in text
 
 
-def test_commit_without_via_pr_still_pushes_directly(tmp_path, repo_with_two_commits):
+def test_commit_without_via_pr_still_pushes_directly(tmp_path, repo_with_two_commits, no_branch_config):
     """Staging needs no review, so it keeps the fast path: a plain push, no PR."""
     app, _old, new = repo_with_two_commits
     config = make_config_repo(tmp_path)
@@ -800,3 +808,55 @@ def test_commit_without_via_pr_still_pushes_directly(tmp_path, repo_with_two_com
         catalog_ref=None, branch=None, via_pr=False,
     ))
     assert new in git(config, "log", "--format=%s", "-1", "@{u}")
+
+
+def test_require_pr_is_read_from_config_not_a_yaml_string_compare(tmp_path, repo_with_two_commits, monkeypatch):
+    """The workflow used to compare REQUIRE_PR to the string 'True'. Writing
+    `require_pr: "true"` as a string instead of a boolean would slip past that comparison
+    and push straight at a protected branch. Python decides it once, for every caller."""
+    app, _old, new = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+    base = branch_of(config)
+
+    calls = tmp_path / "gh-calls.txt"
+    monkeypatch.setenv("GH_CALLS", str(calls))
+    monkeypatch.setenv("PATH", f"{fake_gh(tmp_path)}:{os.environ['PATH']}")
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"environments": {"prod": {"config_branch": base, "require_pr": True}}}))
+
+    (config / "staging" / "manifests.yaml").write_text("rendered\n")
+    # Note: neither --branch nor --via-pr is passed. Both come from config.
+    orc.cmd_commit(orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="prod", sha=new,
+        app_dir=str(app), catalog_ref=None,
+    ))
+    assert "pr create" in calls.read_text()
+
+
+def test_env_without_require_pr_pushes_directly(tmp_path, repo_with_two_commits, monkeypatch):
+    """staging has require_pr: false, so it must keep the direct-push fast path."""
+    app, _old, new = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"environments": {"staging": {"config_branch": branch_of(config), "require_pr": False}}}))
+    (config / "staging" / "manifests.yaml").write_text("rendered\n")
+    orc.cmd_commit(orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="staging", sha=new,
+        app_dir=str(app), catalog_ref=None,
+    ))
+    assert new in git(config, "log", "--format=%s", "-1", "@{u}")
+
+
+def test_branch_mismatch_between_checkout_and_config_is_fatal(tmp_path, repo_with_two_commits, monkeypatch):
+    """The job clones one branch and the config names another: publishing there would put
+    manifests on a branch this run never rendered against. Refuse rather than guess."""
+    app, _old, new = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"environments": {"staging": {"config_branch": "some-other-branch"}}}))
+    (config / "staging" / "manifests.yaml").write_text("rendered\n")
+    with pytest.raises(SystemExit, match="checkout and the target must match"):
+        orc.cmd_commit(orc.argparse.Namespace(
+            config_dir=str(config), app="a", env="staging", sha=new,
+            app_dir=str(app), catalog_ref=None,
+        ))

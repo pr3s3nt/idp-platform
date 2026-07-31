@@ -236,9 +236,8 @@ jobs:
         run: |
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env "$DEPLOY_ENV" --sha "$SHA" \
-            --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}" \
-            --branch "$CONFIG_BRANCH" \
-            ${{ env.REQUIRE_PR == 'True' && '--via-pr' || '' }}
+            --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}"
+
 
       # CONVERGENCE CHECK. GitHub keeps only one run pending per concurrency group, so a
       # burst of pushes can leave the newest commit's run CANCELLED — and a cancelled run
@@ -432,9 +431,8 @@ jobs:
       - name: Commit & push config repo
         run: |
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
-            --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app \
-            --branch "$CONFIG_BRANCH" \
-            ${{ env.REQUIRE_PR == 'True' && '--via-pr' || '' }}
+            --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app
+
 
       - name: Scrub kubeconfig
         if: always()

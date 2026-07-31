@@ -788,14 +788,31 @@ def cmd_commit(args) -> None:
         msg += f" (catalog: {args.catalog_ref})"
     run(["git", "commit", "-m", msg], cwd=config)
 
-    # Optional so a hand-replay on the runner, and every existing caller, still works:
-    # no --branch means "whatever branch this checkout is on".
-    base = getattr(args, "branch", None) or run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=config, capture=True).stdout.strip()
+    # Branch and review requirement come from platform.env.yaml, read HERE rather than
+    # compared as strings in the workflow YAML. `require_pr: "true"` written as a string
+    # instead of a boolean would silently fail a YAML string comparison and push straight
+    # at a protected branch; Python decides once, correctly, for every caller.
+    # Base is ALWAYS the branch actually checked out — we must push to the thing we
+    # rendered against, never to a branch named somewhere else. The configured value is
+    # used to CHECK that, not to override it: if they disagree the job cloned one branch
+    # and would publish to another, which is how an environment silently gets the wrong
+    # manifests. Fail instead.
+    checked_out = run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                      cwd=config, capture=True).stdout.strip()
+    base = getattr(args, "branch", None) or checked_out
+    configured = CONFIG.get(f"environments.{args.env}.config_branch")
+    if configured and configured != base:
+        raise SystemExit(
+            f"config repo is checked out on '{base}' but platform.env.yaml says {args.env} "
+            f"lives on '{configured}'. The checkout and the target must match, or this "
+            "deploy would publish manifests to a branch it never rendered against."
+        )
+    via_pr = getattr(args, "via_pr", False) or bool(
+        CONFIG.get(f"environments.{args.env}.require_pr", False))
 
     # Environments whose branch requires review never get a direct push. The bot puts the
     # change on its own branch and opens a PR; a person reads the manifest diff and merges.
-    if getattr(args, "via_pr", False):
+    if via_pr:
         head = f"deploy/{args.app}-{args.env}-{args.sha[:8]}"
         run(["git", "checkout", "-B", head], cwd=config)
         run(["git", "push", "--force-with-lease", "origin", head], cwd=config)
