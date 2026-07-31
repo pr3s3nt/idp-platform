@@ -467,7 +467,8 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 
 | Vấn đề | Ảnh hưởng | Ghi chú |
 |---|---|---|
-| Thư viện resource `dns` gắn cứng chuỗi `staging` | Tên miền sinh cho production cũng mang chữ "staging" | Cần thêm cơ chế truyền biến môi trường vào |
+| ~~Tên miền production mang chữ "staging"~~ | ~~Sai tên miền trên production~~ | ✅ **Đã sửa ở mục 6.8** — tên miền lấy theo môi trường từ file cấu hình. Kiểm chứng: staging ra `*.staging.internal.dev`, prod ra `*.prod.internal.dev` |
+| Hai ứng dụng cùng có workload tên `frontend` sẽ trùng tên miền | Cổng vào chỉ trỏ được tới một trong hai | Tên miền suy ra từ tên workload, chưa tính tên ứng dụng. Cần đổi quy tắc thành `<app>-<workload>` hoặc để ứng dụng tự khai |
 | Hàng đợi triển khai vẫn có thể bỏ sót | Đã giảm mạnh và **đã có cảnh báo**, nhưng chưa loại trừ tuyệt đối | Cảnh báo hiện ra ở phần tóm tắt của lần chạy |
 | Commit trung gian không có image | Do gộp các lần push liên tiếp | Muốn thăng cấp đúng commit đó phải build lại |
 | Sandbox chưa có phân quyền | Mọi thứ dùng chung một token toàn quyền | Môi trường thật cần tách quyền theo từng repo |
