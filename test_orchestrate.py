@@ -883,3 +883,65 @@ def test_rerun_pushes_a_commit_stranded_by_an_earlier_failed_push(tmp_path, repo
         app_dir=str(app), catalog_ref=None,
     ))
     assert git(config, "rev-parse", f"origin/{base}") != before, "stranded commit never pushed"
+
+
+# --------------------------------------------------------- cross-repo service dependencies
+def write_frontend_calling(tmp_path: Path, resource: dict) -> Path:
+    app = tmp_path / "frontend-repo"
+    write(app / "score.yaml", {
+        "apiVersion": "score.dev/v1b1",
+        "metadata": {"name": "frontend"},
+        "containers": {"web": {"image": ".", "variables": {
+            "BACKEND_ADDR": "${resources.backend.host}:${resources.backend.port}"}}},
+        "service": {"ports": {"http": {"port": 80, "targetPort": 80}}},
+        "resources": {"backend": resource},
+    })
+    return app
+
+
+def render_app(tmp_path: Path, app_dir: Path, env: str, name="frontend"):
+    args = orc.argparse.Namespace(
+        app=name, image=name, tag="v1", env=env, registry="r.io/p",
+        catalog=str(CATALOG), app_dir=str(app_dir), work=str(tmp_path / f"w-{env}"),
+        out=str(tmp_path / f"out-{env}.yaml"), kubeconfig=None,
+        state_file=str(tmp_path / "st.yaml"), no_state=False, tag_strategy="commit",
+    )
+    orc.cmd_render(args)
+    return orc.load_all(Path(args.out))
+
+
+@needs_score_k8s
+def test_type_service_cannot_reach_another_repo(tmp_path):
+    """Documents the real limitation. `type: service` looks the peer up in the workloads of
+    THIS render; a second repo is a separate render, so it simply is not there."""
+    app = write_frontend_calling(tmp_path, {"type": "service"})
+    with pytest.raises(subprocess.CalledProcessError):
+        render_app(tmp_path, app, "staging")
+
+
+@needs_score_k8s
+def test_external_service_resolves_across_repos_per_environment(tmp_path):
+    """The fix: no lookup at all. Kubernetes already gives every Service a stable DNS name,
+    and the namespace convention lives in platform.env.yaml — so staging points at the
+    other app's staging namespace and prod at its prod one, with no shared render."""
+    app = write_frontend_calling(
+        tmp_path, {"type": "external-service", "params": {"app": "backend", "port": 8080}})
+
+    got = {}
+    for env in ("staging", "prod"):
+        docs = render_app(tmp_path, app, env)
+        dep = next(d for d in docs if d["kind"] == "Deployment")
+        got[env] = {e["name"]: e.get("value")
+                    for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+    assert got["staging"]["BACKEND_ADDR"] == "backend.backend-staging.svc.cluster.local:8080"
+    assert got["prod"]["BACKEND_ADDR"] == "backend.backend-prod.svc.cluster.local:8080"
+
+
+@needs_score_k8s
+def test_external_service_requires_app_and_port(tmp_path):
+    """A missing param must fail at render, not produce a half-formed hostname that only
+    breaks at runtime."""
+    app = write_frontend_calling(tmp_path, {"type": "external-service", "params": {"port": 8080}})
+    with pytest.raises(subprocess.CalledProcessError):
+        render_app(tmp_path, app, "staging")

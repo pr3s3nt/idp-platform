@@ -1,0 +1,55 @@
+# `external-service` — gọi service của một APP KHÁC, nằm ở repo khác.
+#
+# VÌ SAO CẦN LOẠI RIÊNG
+# `type: service` (service.provisioners.yaml) chỉ tra được workload render CÙNG một lần
+# `score-k8s generate`. Hai app ở hai repo là hai lần render tách biệt, nên tham chiếu
+# chéo bằng `type: service` sẽ hỏng với đúng thông báo:
+#     resource 'service.default#frontend.backend': unknown workload
+# Đó là giới hạn cố hữu chứ không phải lỗi: lúc render frontend, platform không hề biết
+# backend tồn tại, cũng không nên biết — hai app deploy độc lập nhau.
+#
+# CÁCH GIẢI QUYẾT
+# Không tra cứu gì cả. Kubernetes đã có sẵn DNS nội bộ ổn định cho mọi Service:
+#     <tên-service>.<namespace>.<hậu-tố-cụm>
+# App khai báo NÓ GỌI AI, provisioner ráp địa chỉ theo đúng quy ước namespace của platform.
+# Quy ước đó nằm trong platform.env.yaml (kubernetes.namespace_pattern), không nằm ở đây.
+#
+# CÁCH DÙNG
+#   resources:
+#     backend:
+#       type: external-service
+#       params:
+#         app: backend          # tên app kia (quyết định namespace)
+#         port: 8080
+#         workload: backend     # tuỳ chọn, mặc định bằng app
+#   containers:
+#     web:
+#       variables:
+#         BACKEND_ADDR: "${resources.backend.host}:${resources.backend.port}"
+#
+# ĐÁNH ĐỔI PHẢI BIẾT
+# Không có kiểm tra tồn tại. Gõ sai tên app thì render vẫn xanh, chỉ hỏng lúc chạy khi
+# DNS không phân giải được. `type: service` bắt lỗi ngay lúc render, nhưng chỉ dùng được
+# trong cùng repo. Đây là cái giá của việc hai app deploy độc lập.
+#
+# CÒN PHẢI KIỂM: nếu cụm bật NetworkPolicy chặn mặc định, lưu lượng xuyên namespace bị
+# chặn dù DNS đúng. Cần policy cho phép — không thuộc phạm vi provisioner này.
+- uri: template://custom/external-service
+  type: external-service
+  description: Địa chỉ DNS của service thuộc một app khác, ở namespace khác.
+  init: |
+    {{ if not .Params.app }}{{ fail "external-service: thiếu params.app (tên app cần gọi)" }}{{ end }}
+    {{ if not .Params.port }}{{ fail "external-service: thiếu params.port" }}{{ end }}
+    target: {{ dig "workload" .Params.app .Params }}
+  outputs: |
+    host: {{ .Init.target }}.%%computed.namespace_go_template%%.%%kubernetes.cluster_domain%%
+    port: {{ .Params.port }}
+    url: http://{{ .Init.target }}.%%computed.namespace_go_template%%.%%kubernetes.cluster_domain%%:{{ .Params.port }}
+  supported_params:
+    - app
+    - port
+    - workload
+  expected_outputs:
+    - host
+    - port
+    - url

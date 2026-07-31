@@ -111,6 +111,17 @@ class EnvConfig:
         walk(self.data)
         for key, value in (self.get(f"environments.{env}") or {}).items():
             flat[f"env.{key}"] = value
+        flat["env.name"] = env
+
+        # A provisioner that points at ANOTHER app's namespace only learns that app's name
+        # at render time, from a param — so it cannot be substituted here. What we CAN do is
+        # bake the environment in and leave the app as a Go template expression, so the
+        # namespace convention still lives in config and not in the provisioner:
+        #   "{app}-{env}"  ->  "{{ .Params.app }}-staging"
+        pattern = self.get("kubernetes.namespace_pattern", "{app}-{env}") or "{app}-{env}"
+        flat["computed.namespace_go_template"] = (
+            pattern.replace("{env}", env).replace("{app}", "{{ .Params.app }}")
+        )
         return flat
 
     def render(self, text: str, env: str, *, where: str) -> str:
