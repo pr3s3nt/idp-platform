@@ -42,7 +42,9 @@ import yaml
 # The DEFAULTS below are the sandbox's values and exist only so the tool still runs with no
 # config file — tests and hand-replay on a runner. Anything real passes --env-config.
 DEFAULTS: dict = {
-    "git": {"org": "", "config_repo_pattern": "{app}-config", "default_branch": "main"},
+    "git": {"org": "", "config_repo_pattern": "{app}-config", "default_branch": "main",
+            "committer_name": "idp-orchestrator",
+            "committer_email": "idp-orchestrator@noreply.invalid"},
     "registry": {"host": "", "path": "", "pull_secret": "registry-pull"},
     "kubernetes": {
         "state_namespace": "cluster-state",
@@ -809,8 +811,12 @@ def cmd_commit(args) -> None:
     via_pr = getattr(args, "via_pr", False) or bool(
         CONFIG.get(f"environments.{args.env}.require_pr", False))
 
-    run(["git", "config", "user.name", "platform-orchestrator"], cwd=config)
-    run(["git", "config", "user.email", "ci-bot@users.noreply.github.com"], cwd=config)
+    # Danh tính này quyết định lịch sử config repo ghi công cho ai — thứ dùng để truy vết
+    # "ai deploy cái gì". Lấy từ cấu hình, không gắn cứng.
+    run(["git", "config", "user.name",
+         CONFIG.get("git.committer_name", "idp-orchestrator")], cwd=config)
+    run(["git", "config", "user.email",
+         CONFIG.get("git.committer_email", "idp-orchestrator@noreply.invalid")], cwd=config)
     run(["git", "add", "."], cwd=config)
     nothing_staged = run(["git", "diff", "--cached", "--quiet"],
                          cwd=config, check=False).returncode == 0

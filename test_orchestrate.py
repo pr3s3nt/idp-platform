@@ -945,3 +945,22 @@ def test_external_service_requires_app_and_port(tmp_path):
     app = write_frontend_calling(tmp_path, {"type": "external-service", "params": {"port": 8080}})
     with pytest.raises(subprocess.CalledProcessError):
         render_app(tmp_path, app, "staging")
+
+
+def test_committer_identity_never_uses_github_noreply(tmp_path, repo_with_two_commits, no_branch_config, monkeypatch):
+    """`<name>@users.noreply.github.com` is how GitHub maps a commit to an ACCOUNT. The
+    sandbox shipped `ci-bot@users.noreply.github.com`, and because a real user named
+    `ci-bot` exists, every deploy commit was credited to a stranger — quietly ruining the
+    one record that answers "who deployed this"."""
+    app, _old, new = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+
+    (config / "staging" / "manifests.yaml").write_text("rendered\n")
+    orc.cmd_commit(orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="staging", sha=new,
+        app_dir=str(app), catalog_ref=None,
+    ))
+    email = git(config, "log", "-1", "--format=%ae")
+    assert "users.noreply.github.com" not in email, (
+        f"committer email {email} would be attributed to a real GitHub account")
