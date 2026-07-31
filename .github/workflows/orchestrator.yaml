@@ -104,6 +104,21 @@ jobs:
         with:
           path: platform
 
+      # Mint một token của GitHub App cho ĐÚNG lần chạy này. Token sống 1 giờ rồi tự chết,
+      # và chỉ có quyền trên những repo App được cài — thay cho PAT cá nhân vốn có
+      # admin:org + delete_repo và không bao giờ hết hạn.
+      #
+      # Đây cũng là thứ làm cổng duyệt production hoạt động được: GitHub CHẶN tự duyệt pull
+      # request của chính mình, nên nếu PR do token của một người tạo ra mà người đó cũng là
+      # người duyệt thì không ai duyệt được.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Load environment config
         run: |
           set -euo pipefail
@@ -148,7 +163,7 @@ jobs:
         with:
           repository: ${{ env.APP_REPO }}
           ref: ${{ env.SHA }}
-          token: ${{ secrets.APP_REPOS_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           path: app
           # Full history is REQUIRED by the ancestry guard in `commit`: with the default
           # shallow clone, `git merge-base` cannot compare against the deployed SHA and the
@@ -174,7 +189,7 @@ jobs:
         with:
           repository: ${{ env.ORG }}/${{ env.CONFIG_REPO_NAME }}
           ref: ${{ env.CONFIG_BRANCH }}
-          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           path: config
 
       - name: Render ${{ env.DEPLOY_ENV }}
@@ -233,6 +248,11 @@ jobs:
             --kubeconfig cluster-config-prod
 
       - name: Commit & push config repo
+        env:
+          # Bắt buộc: `gh pr create` bên trong orchestrate.py phải chạy bằng token App.
+          # Không đặt thì nó rơi về gh auth có sẵn trên runner — tức tài khoản người, và
+          # pull request sẽ mang tên người đó thay vì App.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env "$DEPLOY_ENV" --sha "$SHA" \
@@ -319,6 +339,21 @@ jobs:
         with:
           path: platform
 
+      # Mint một token của GitHub App cho ĐÚNG lần chạy này. Token sống 1 giờ rồi tự chết,
+      # và chỉ có quyền trên những repo App được cài — thay cho PAT cá nhân vốn có
+      # admin:org + delete_repo và không bao giờ hết hạn.
+      #
+      # Đây cũng là thứ làm cổng duyệt production hoạt động được: GitHub CHẶN tự duyệt pull
+      # request của chính mình, nên nếu PR do token của một người tạo ra mà người đó cũng là
+      # người duyệt thì không ai duyệt được.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Load environment config
         run: |
           set -euo pipefail
@@ -347,7 +382,7 @@ jobs:
         with:
           repository: ${{ env.ORG }}/${{ env.CONFIG_REPO_NAME }}
           ref: ${{ env.CONFIG_BRANCH }}
-          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           path: config
 
       # Checked out for BOTH modes. tag-only needs no source to render — it rewrites the
@@ -360,7 +395,7 @@ jobs:
         with:
           repository: ${{ env.APP_REPO }}
           ref: ${{ env.TAG }}
-          token: ${{ secrets.APP_REPOS_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           path: app
           fetch-depth: 0
 
@@ -429,6 +464,11 @@ jobs:
       # --app-dir is what arms the ordering guard: without it `commit` cannot tell whether
       # this tag is older than what prod already runs, and promotes silently roll back.
       - name: Commit & push config repo
+        env:
+          # Bắt buộc: `gh pr create` bên trong orchestrate.py phải chạy bằng token App.
+          # Không đặt thì nó rơi về gh auth có sẵn trên runner — tức tài khoản người, và
+          # pull request sẽ mang tên người đó thay vì App.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app
