@@ -539,9 +539,38 @@ vụ: truy vết ai triển khai cái gì.
 Đã đưa danh tính vào file cấu hình, mặc định dùng địa chỉ không thể ánh xạ về tài khoản
 nào, kèm một kiểm thử chặn hẳn việc dùng lại định dạng cũ.
 
-> Ghi chú: hiện **chưa có tài khoản máy riêng**. Mọi thao tác chạy bằng token cá nhân.
-> Khi lên môi trường thật nên dùng GitHub App — vừa truy vết đúng, vừa không chết theo
-> người nghỉ việc, vừa làm cho "người tạo khác người duyệt" đúng về mặt cấu trúc.
+### 6.13. Chuyển sang GitHub App
+
+Trước đó **năm** chỗ dùng credential khác nhau — đọc kho ứng dụng, ghi kho cấu hình, gọi
+platform từ CI, đẩy ảnh, và Fleet đọc kho cấu hình — **đều là cùng một token cá nhân** có
+quyền quản trị tổ chức và xoá kho mã. Nghĩa là token cho phép CI của một ứng dụng gọi sang
+platform cũng xoá được mọi kho mã trong tài khoản.
+
+Đã thay bằng một GitHub App với **đúng ba quyền**: đọc/ghi nội dung, đọc/ghi pull request,
+đọc metadata. Token được cấp mới cho từng lần chạy và tự hết hạn sau một giờ.
+
+**Lý do quan trọng nhất không phải bảo mật, mà là cổng duyệt production tự khoá.** GitHub
+chặn cứng việc tự duyệt pull request của chính mình. Khi pull request triển khai do token
+của một người tạo ra, và người đó cũng là người duyệt, thì **không ai duyệt được**. Đã kiểm
+cả hai chiều:
+
+| Ai tạo pull request | Người duyệt | Kết quả |
+|---|---|---|
+| Token cá nhân | chính người đó | **Bị từ chối** — "Can not approve your own pull request" |
+| GitHub App | người đó | **Duyệt được**, merge được, Fleet áp lên cụm |
+
+Nhân đó phát hiện một lỗ hổng lặng lẽ: bước tạo pull request **không** truyền thông tin
+xác thực, nên nó âm thầm dùng phiên đăng nhập sẵn có trên máy chủ CI — tức tài khoản
+người. Pull request triển khai mang tên người thay vì máy, và chính điều đó làm cổng duyệt
+tự khoá. Nay truyền tường minh.
+
+**Ba loại credential, không phải một** — App không thay thế được tất cả:
+
+| Việc | Dùng gì |
+|---|---|
+| Đọc/ghi kho mã, mở pull request | GitHub App |
+| Fleet đọc kho cấu hình | **Khoá triển khai chỉ-đọc** — token App hết hạn sau một giờ mà Fleet kiểm tra 15 giây một lần và không tự làm mới được |
+| Đẩy/kéo ảnh | Tài khoản máy của kho ảnh |
 
 ## 7. Đã kiểm chứng những gì
 
