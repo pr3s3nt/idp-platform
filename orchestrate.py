@@ -268,11 +268,39 @@ def make_state_store(args) -> StateStore:
 # --------------------------------------------------------------------------------------
 # render
 # --------------------------------------------------------------------------------------
+def strip_managed_by(docs: list[dict]) -> int:
+    """Drop the top-level app.kubernetes.io/managed-by label from every manifest.
+
+    score-k8s stamps `managed-by: score-k8s`. Fleet deploys a Bundle as a Helm release and
+    Helm overwrites that same label with `Helm` on whatever it applies, so a manifest that
+    carries the label in git can NEVER match the cluster: the Bundle sits at Modified and
+    never reaches Ready. Leaving the label out makes git agree with reality — Fleet ignores
+    labels that are present live but absent from the desired state.
+
+    Only the top-level metadata is touched. Helm does not rewrite pod template labels, so
+    those still match, and nothing selects on managed-by (selectors use name/instance).
+
+    The alternative — per-resource `diff.comparePatches` in fleet.yaml — cannot work in
+    general: provisioner-generated resources are named with a GUID (redis-cart-d2eaf96b),
+    so their names are not knowable when the config repo is written.
+    """
+    label = "app.kubernetes.io/managed-by"
+    stripped = 0
+    for doc in docs:
+        labels = (doc.get("metadata") or {}).get("labels") or {}
+        if labels.pop(label, None) is not None:
+            stripped += 1
+    return stripped
+
+
 def split_manifests(manifests: Path, work: Path) -> tuple[Path, Path]:
     """Partition generated manifests into secrets (cluster-only) and everything else (git)."""
     docs = load_all(manifests)
     secrets = [d for d in docs if d.get("kind") == "Secret"]
     public = [d for d in docs if d.get("kind") != "Secret"]
+    n = strip_managed_by(public)
+    if n:
+        log(f"stripped managed-by label from {n} manifest(s) so Fleet sees no false drift")
     sec_path, pub_path = work / "secrets.yaml", work / "app.yaml"
     dump_all(secrets, sec_path)
     dump_all(public, pub_path)

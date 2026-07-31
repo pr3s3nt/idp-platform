@@ -376,3 +376,42 @@ def test_patch_changes_still_apply_across_state_restore(tmp_path):
 
     assert render("staging", "w1") == 1
     assert render("prod", "w2") == 3
+
+
+# ------------------------------------------------------------- managed-by / Fleet drift
+def test_strip_managed_by_removes_only_top_level_label():
+    """Helm rewrites the top-level managed-by label on apply, so keeping score-k8s's value
+    in git guarantees a permanently Modified Fleet Bundle. Pod template labels are left
+    alone — Helm does not touch those, so they still match the cluster."""
+    docs = [
+        {"kind": "Deployment",
+         "metadata": {"labels": {"app.kubernetes.io/managed-by": "score-k8s", "env": "staging"}},
+         "spec": {"template": {"metadata": {"labels": {"app.kubernetes.io/managed-by": "score-k8s"}}}}},
+        {"kind": "HTTPRoute", "metadata": {"labels": {"app.kubernetes.io/name": "route-x"}}},
+        {"kind": "Service", "metadata": {}},
+    ]
+    assert orc.strip_managed_by(docs) == 1
+    assert docs[0]["metadata"]["labels"] == {"env": "staging"}
+    # pod template untouched
+    assert (docs[0]["spec"]["template"]["metadata"]["labels"]
+            == {"app.kubernetes.io/managed-by": "score-k8s"})
+    # manifests without the label are left exactly as they were
+    assert docs[1]["metadata"]["labels"] == {"app.kubernetes.io/name": "route-x"}
+    assert docs[2]["metadata"] == {}
+
+
+@needs_score_k8s
+def test_rendered_config_repo_output_has_no_managed_by(tmp_path):
+    """End to end: whatever reaches the config repo must not carry the label at top level."""
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    shutil.copyfile(CATALOG / "examples" / "simple-nginx" / "score.yaml", app_dir / "score.yaml")
+    args = orc.argparse.Namespace(
+        app="nginx", image="nginx", tag="sha1", env="staging", registry="h.io/p",
+        catalog=str(CATALOG), app_dir=str(app_dir), work=str(tmp_path / "w"),
+        out=str(tmp_path / "out.yaml"), kubeconfig=None,
+        state_file=str(tmp_path / "state.yaml"), no_state=False,
+    )
+    orc.cmd_render(args)
+    for doc in orc.load_all(Path(args.out)):
+        assert "app.kubernetes.io/managed-by" not in (doc.get("metadata") or {}).get("labels", {})

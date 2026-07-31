@@ -4,26 +4,3 @@
 # Replace <app> with the app name, e.g. sample-nginx.
 namespace: <app>-prod
 defaultNamespace: <app>-prod
-
-# Fleet deploys a Bundle as a Helm release, and Helm always stamps
-# app.kubernetes.io/managed-by=Helm onto whatever it applies. score-k8s writes
-# managed-by=score-k8s into the manifests, so live and desired differ on that one label
-# FOREVER: the Bundle sits at Modified and never reaches Ready, for every single app.
-# Ignoring the label in the comparison is the fix — nothing else actually drifts.
-# NOTE: comparePatches REQUIRES name + namespace. Leaving them out matches nothing and
-# the patch is silently ignored (the Bundle stays Modified with no error anywhere).
-# One entry per workload: add more if the app renders several Deployments/Services.
-diff:
-  comparePatches:
-  - apiVersion: apps/v1
-    kind: Deployment
-    name: <app>
-    namespace: <app>-prod
-    operations:
-    - {op: remove, path: /metadata/labels/app.kubernetes.io~1managed-by}
-  - apiVersion: v1
-    kind: Service
-    name: <app>
-    namespace: <app>-prod
-    operations:
-    - {op: remove, path: /metadata/labels/app.kubernetes.io~1managed-by}
