@@ -45,13 +45,16 @@ SHA_RECORD_DIR = ".platform"
 # --------------------------------------------------------------------------------------
 # plumbing
 # --------------------------------------------------------------------------------------
+# Logs go to stderr so stdout carries DATA only. `image-plan` prints JSON that an app's CI
+# parses; with the transcript on stdout too, that JSON is unparseable. Actions captures both
+# streams identically, so nothing is lost in the run log.
 def log(msg: str) -> None:
-    print(f"==> {msg}", flush=True)
+    print(f"==> {msg}", file=sys.stderr, flush=True)
 
 
 def warn(msg: str) -> None:
     # ::warning:: renders as an annotation in the Actions UI and is harmless elsewhere.
-    print(f"::warning::{msg}", flush=True)
+    print(f"::warning::{msg}", file=sys.stderr, flush=True)
 
 
 def run(
@@ -152,8 +155,65 @@ def image_ref(registry: str, image: str, service: Service, tag: str, *, multi: b
     return f"{registry}/{name}:{tag}"
 
 
-def rewrite_images(services: list[Service], registry: str, image: str, tag: str) -> None:
-    """Pin each workload's container image in place.
+def service_dir(app_dir: Path, service: Service) -> str:
+    """The service's directory relative to the app checkout; '.' for a root score.yaml."""
+    return str(service.path.parent.relative_to(app_dir))
+
+
+def content_tag(app_dir: Path, rel: str) -> str | None:
+    """Git's hash of that directory's CONTENT, or None if it cannot be determined.
+
+    Not the commit SHA: git already stores a hash per directory tree, and it only changes
+    when something inside that directory changes. Two commits that leave `frontend/`
+    untouched produce the same hash for it.
+    """
+    target = "HEAD^{tree}" if rel == "." else f"HEAD:{rel}"
+    cp = run(["git", "rev-parse", target], cwd=app_dir, check=False, capture=True)
+    if cp.returncode != 0:
+        return None
+    value = cp.stdout.strip()
+    return value or None
+
+
+def plan_images(
+    services: list[Service], registry: str, image: str, tag: str,
+    app_dir: Path, strategy: str,
+) -> dict[str, str]:
+    """workload -> the full image reference this render will pin.
+
+    THE ONE PLACE that decides image names. An app's CI asks for this plan (via the
+    `image-plan` subcommand) so it builds exactly the tags the renderer is going to
+    reference — if the two ever disagreed, Fleet would apply a manifest pointing at an
+    image nobody pushed.
+
+    Strategies:
+      commit   every workload tagged with the repo's commit SHA. Simple, and correct for a
+               single-workload repo.
+      content  each workload tagged with the hash of ITS OWN directory. In a repo holding
+               many services this is what stops one service's commit from re-tagging — and
+               therefore restarting — the other ten. Measured on the 11-service boutique:
+               a commit touching only .github/ still rolled all 11 Deployments.
+    """
+    multi = len(services) > 1
+    plan: dict[str, str] = {}
+    for svc in services:
+        svc_tag = tag
+        if strategy == "content":
+            rel = service_dir(app_dir, svc)
+            found = content_tag(app_dir, rel)
+            if found:
+                svc_tag = found
+            else:
+                warn(
+                    f"cannot read a content hash for {svc.workload} ({rel}) — the app dir is "
+                    f"probably not a git checkout. Falling back to {tag}."
+                )
+        plan[svc.workload] = image_ref(registry, image, svc, svc_tag, multi=multi)
+    return plan
+
+
+def rewrite_images(services: list[Service], plan: dict[str, str]) -> None:
+    """Pin each workload's container image in place, following `plan`.
 
     We rewrite the score files rather than pass --override-property because that flag only
     works when a SINGLE score file is given (see `score-k8s generate --help`), and
@@ -162,9 +222,8 @@ def rewrite_images(services: list[Service], registry: str, image: str, tag: str)
 
     This mutates app_dir, which is expected to be a disposable checkout.
     """
-    multi = len(services) > 1
     for svc in services:
-        ref = image_ref(registry, image, svc, tag, multi=multi)
+        ref = plan[svc.workload]
         spec = yaml.safe_load(svc.path.read_text())
         spec["containers"][svc.container]["image"] = ref
         svc.path.write_text(yaml.safe_dump(spec, sort_keys=False))
@@ -346,11 +405,26 @@ def strip_managed_by(docs: list[dict]) -> int:
     return stripped
 
 
+def sort_manifests(docs: list[dict]) -> list[dict]:
+    """Deterministic order, so a config repo diff shows what actually changed.
+
+    score-k8s does not promise a stable document order between runs. Two renders of the same
+    app came out with the workloads in different positions, turning a 22-line change into a
+    304-line diff — which makes the config repo's whole point (reviewing what a deploy did)
+    useless. Order carries no meaning for these resources, so imposing one costs nothing.
+    """
+    def key(doc: dict) -> tuple[str, str, str]:
+        meta = doc.get("metadata") or {}
+        return (doc.get("kind", ""), meta.get("namespace", "") or "", meta.get("name", ""))
+
+    return sorted(docs, key=key)
+
+
 def split_manifests(manifests: Path, work: Path) -> tuple[Path, Path]:
     """Partition generated manifests into secrets (cluster-only) and everything else (git)."""
     docs = load_all(manifests)
     secrets = [d for d in docs if d.get("kind") == "Secret"]
-    public = [d for d in docs if d.get("kind") != "Secret"]
+    public = sort_manifests([d for d in docs if d.get("kind") != "Secret"])
     n = strip_managed_by(public)
     if n:
         log(f"stripped managed-by label from {n} manifest(s) so Fleet sees no false drift")
@@ -371,7 +445,9 @@ def cmd_render(args) -> None:
     store.pull(work / ".score-k8s" / "state.yaml")
 
     services = discover(app_dir)
-    rewrite_images(services, args.registry, args.image, args.tag)
+    plan = plan_images(services, args.registry, args.image, args.tag, app_dir,
+                       getattr(args, "tag_strategy", "commit"))
+    rewrite_images(services, plan)
 
     provisioners = sorted(catalog.glob("provisioners/*.provisioners.yaml"))
     if not provisioners:
@@ -599,10 +675,69 @@ def retag(path: Path, image: str, tag: str) -> int:
     return changed
 
 
+def workload_images(path: Path, image: str) -> dict[tuple[str, str], str]:
+    """{(deployment name, container name): image ref} for this app's own containers.
+
+    Datastore images (a provisioner's postgres/redis) are skipped: they are decided by the
+    catalog, not by what the app built, so promoting must not touch them.
+    """
+    pattern = re.compile(rf"/{re.escape(image)}[:-]")
+    found = {}
+    for doc in load_all(path):
+        if doc.get("kind") != "Deployment":
+            continue
+        name = doc["metadata"]["name"]
+        for container in doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []) or []:
+            ref = container.get("image", "")
+            if pattern.search(ref):
+                found[(name, container.get("name", ""))] = ref
+    return found
+
+
+def copy_images(src: Path, dst: Path, image: str) -> int:
+    """Make dst run exactly the images src is running. Returns how many changed.
+
+    This is what promoting a MULTI-WORKLOAD app means once each service carries its own
+    content-derived tag: there is no single "version" to move prod to, there is a SET of
+    eleven image references, and prod should run precisely the set staging was verified on.
+    """
+    wanted = workload_images(src, image)
+    docs = load_all(dst)
+    changed = 0
+    for doc in docs:
+        if doc.get("kind") != "Deployment":
+            continue
+        name = doc["metadata"]["name"]
+        for container in doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []) or []:
+            ref = wanted.get((name, container.get("name", "")))
+            if ref and container.get("image") != ref:
+                container["image"] = ref
+                changed += 1
+    dump_all(docs, dst)
+    log(f"copied {changed} image(s) from {src} into {dst}")
+    return changed
+
+
 def cmd_promote(args) -> None:
-    target = Path(args.config_dir) / "prod" / "manifests.yaml"
+    config = Path(args.config_dir)
+    target = config / "prod" / "manifests.yaml"
+
+    if args.mode == "from-staging":
+        # Prod runs exactly what staging runs. The only mode that is correct when each
+        # service has its own tag, because then "promote to version X" is not a single value.
+        source = config / "staging" / "manifests.yaml"
+        if not source.is_file():
+            raise SystemExit(f"{source} missing — nothing has been deployed to staging yet")
+        if not target.is_file():
+            raise SystemExit(f"{target} missing — run --mode re-render first")
+        if not copy_images(source, target, args.image):
+            log("prod already runs the same images as staging")
+        return
+
     if args.mode == "tag-only":
-        # Rewrites the existing manifest in place; needs no catalog, app checkout or cluster.
+        # Every workload moved to ONE tag. Correct for a single-workload app; for a repo of
+        # many services use from-staging instead, or this will point them all at a tag only
+        # one of them actually has.
         if not target.is_file():
             raise SystemExit(f"{target} missing — run --mode re-render first")
         if not retag(target, args.image, args.tag):
@@ -621,6 +756,19 @@ def cmd_promote(args) -> None:
 # --------------------------------------------------------------------------------------
 # preflight
 # --------------------------------------------------------------------------------------
+def cmd_image_plan(args) -> None:
+    """Print {workload: image ref} as JSON, for an app's CI to build against.
+
+    The naming rule lives here and nowhere else. An app's CI asks what to build instead of
+    reimplementing the rule, because a mismatch between the two is invisible until Fleet
+    applies a manifest referencing an image that was never pushed.
+    """
+    app_dir = Path(args.app_dir)
+    services = discover(app_dir)
+    plan = plan_images(services, args.registry, args.image, args.tag, app_dir, args.tag_strategy)
+    print(json.dumps(plan, indent=2, sort_keys=True))
+
+
 def cmd_preflight(args) -> None:
     missing = [t for t in ("score-k8s", "kubectl", "git") if not shutil.which(t)]
     if missing:
@@ -659,6 +807,11 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--image", help="Harbor image name; defaults to --app")
         p.add_argument("--tag", required=True, help="image tag, normally the commit SHA")
         p.add_argument("--registry", default="registry.staging.internal.dev/platform-images")
+        p.add_argument(
+            "--tag-strategy", choices=("commit", "content"), default="commit",
+            help="commit: every workload gets --tag. content: each workload gets the hash of "
+                 "its own directory, so one service's commit does not re-tag the others",
+        )
         # Optional for `promote --mode tag-only`, which rewrites an existing manifest and
         # needs no catalog, app checkout or scratch dir.
         p.add_argument("--catalog", required=paths_required, help="checkout of the idp catalog")
@@ -666,6 +819,15 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--work", required=paths_required, help="scratch dir for this render")
         p.add_argument("--kubeconfig")
         add_state_flags(p)
+
+    p = sub.add_parser("image-plan", help="print the workload -> image map this app renders to")
+    p.add_argument("--app", required=True)
+    p.add_argument("--image", help="image name; defaults to --app")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--registry", required=True)
+    p.add_argument("--app-dir", required=True)
+    p.add_argument("--tag-strategy", choices=("commit", "content"), default="commit")
+    p.set_defaults(func=cmd_image_plan)
 
     p = sub.add_parser("preflight")
     p.add_argument("--require-cluster", action="store_true")
@@ -699,7 +861,8 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("promote")
     add_render_flags(p, paths_required=False)
-    p.add_argument("--mode", required=True, choices=("tag-only", "re-render"))
+    p.add_argument("--mode", required=True,
+                   choices=("from-staging", "tag-only", "re-render"))
     p.add_argument("--config-dir", required=True)
     p.set_defaults(func=cmd_promote)
 

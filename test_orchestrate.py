@@ -95,7 +95,8 @@ def test_rewrite_images_pins_every_workload(tmp_path):
     write(tmp_path / "score-frontend.yaml", score_spec("frontend", "frontend"))
     write(tmp_path / "score-cart.yaml", score_spec("cart", "cart"))
     services = orc.discover(tmp_path)
-    orc.rewrite_images(services, "r.io/p", "shop", "sha1")
+    plan = orc.plan_images(services, "r.io/p", "shop", "sha1", tmp_path, "commit")
+    orc.rewrite_images(services, plan)
     images = {
         s.workload: yaml.safe_load(s.path.read_text())["containers"][s.container]["image"]
         for s in services
@@ -576,3 +577,114 @@ def test_state_push_first_write_uses_create(tmp_path, monkeypatch):
 
     assert seen["verb"] == "create"
     assert "resourceVersion" not in seen["body"]["metadata"]
+
+
+# ------------------------------------------------- per-service tagging & stable ordering
+def git_app_repo(tmp_path: Path) -> Path:
+    """Two services in one repo, each in its own directory — the boutique shape."""
+    repo = tmp_path / "app"
+    for svc in ("frontend", "cart"):
+        write(repo / svc / "score.yaml", score_spec(svc, svc))
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "t@t")
+    git(repo, "config", "user.name", "t")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "one")
+    return repo
+
+
+def test_content_tags_change_only_for_the_service_that_changed(tmp_path):
+    """The whole point: a commit touching `cart` must NOT re-tag `frontend`.
+
+    With the repo commit SHA as the tag, every workload gets a new image reference on every
+    commit, every Deployment changes, and every pod restarts — measured on the 11-service
+    boutique, where a commit touching only .github/ rolled all eleven.
+    """
+    repo = git_app_repo(tmp_path)
+    services = orc.discover(repo)
+    before = orc.plan_images(services, "r.io/p", "ob", "ignored", repo, "content")
+
+    (repo / "cart" / "extra.txt").write_text("changed\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "touch cart only")
+    after = orc.plan_images(orc.discover(repo), "r.io/p", "ob", "ignored", repo, "content")
+
+    assert after["cart"] != before["cart"], "cart changed, its tag must change"
+    assert after["frontend"] == before["frontend"], "frontend untouched, its tag must not move"
+
+
+def test_commit_strategy_moves_every_tag(tmp_path):
+    """Proves the test above is not vacuous: the old behaviour really did re-tag everything."""
+    repo = git_app_repo(tmp_path)
+    services = orc.discover(repo)
+    a = orc.plan_images(services, "r.io/p", "ob", "sha1", repo, "commit")
+    b = orc.plan_images(services, "r.io/p", "ob", "sha2", repo, "commit")
+    assert a["frontend"] != b["frontend"]
+    assert a["cart"] != b["cart"]
+
+
+def test_content_strategy_falls_back_outside_git(tmp_path):
+    """No git checkout -> no content hash. Warn and use --tag rather than fail the deploy."""
+    write(tmp_path / "score.yaml", score_spec("solo"))
+    services = orc.discover(tmp_path)
+    plan = orc.plan_images(services, "r.io/p", "solo", "sha1", tmp_path, "content")
+    assert plan["solo"] == "r.io/p/solo:sha1"
+
+
+def test_sort_manifests_is_stable_regardless_of_input_order():
+    docs = [
+        {"kind": "Service", "metadata": {"name": "b"}},
+        {"kind": "Deployment", "metadata": {"name": "b"}},
+        {"kind": "Deployment", "metadata": {"name": "a"}},
+        {"kind": "HTTPRoute", "metadata": {"name": "r"}},
+    ]
+    order = lambda ds: [(d["kind"], d["metadata"]["name"]) for d in orc.sort_manifests(ds)]
+    assert order(docs) == order(list(reversed(docs)))
+    assert order(docs)[0] == ("Deployment", "a")
+
+
+# ------------------------------------------------------------------- promote from-staging
+def manifest_with(path: Path, entries: list[tuple[str, str]]) -> None:
+    """entries: (deployment name, image)."""
+    docs = [
+        {"kind": "Deployment", "metadata": {"name": name},
+         "spec": {"template": {"spec": {"containers": [{"name": "main", "image": img}]}}}}
+        for name, img in entries
+    ]
+    orc.dump_all(docs, path)
+
+
+def test_promote_from_staging_copies_the_whole_image_set(tmp_path):
+    """Once each service carries its own tag there is no single version to promote to —
+    prod must be given exactly the set staging was verified on."""
+    config = tmp_path / "config"
+    manifest_with(config / "staging" / "manifests.yaml", [
+        ("frontend", "r.io/p/ob-frontend:aaa"),
+        ("cart", "r.io/p/ob-cart:bbb"),
+    ])
+    manifest_with(config / "prod" / "manifests.yaml", [
+        ("frontend", "r.io/p/ob-frontend:old"),
+        ("cart", "r.io/p/ob-cart:old"),
+    ])
+    orc.cmd_promote(orc.argparse.Namespace(
+        mode="from-staging", config_dir=str(config), image="ob", tag="ignored"))
+
+    got = {d["metadata"]["name"]: d["spec"]["template"]["spec"]["containers"][0]["image"]
+           for d in orc.load_all(config / "prod" / "manifests.yaml")}
+    assert got == {"frontend": "r.io/p/ob-frontend:aaa", "cart": "r.io/p/ob-cart:bbb"}
+
+
+def test_promote_from_staging_leaves_datastore_images_alone(tmp_path):
+    """A provisioner's postgres image is decided by the catalog, not by what the app built."""
+    config = tmp_path / "config"
+    manifest_with(config / "staging" / "manifests.yaml", [("frontend", "r.io/p/ob-frontend:aaa")])
+    manifest_with(config / "prod" / "manifests.yaml", [
+        ("frontend", "r.io/p/ob-frontend:old"),
+        ("pg-x", "r.io/p/postgres:17-alpine"),
+    ])
+    orc.cmd_promote(orc.argparse.Namespace(
+        mode="from-staging", config_dir=str(config), image="ob", tag="ignored"))
+
+    got = {d["metadata"]["name"]: d["spec"]["template"]["spec"]["containers"][0]["image"]
+           for d in orc.load_all(config / "prod" / "manifests.yaml")}
+    assert got["pg-x"] == "r.io/p/postgres:17-alpine"

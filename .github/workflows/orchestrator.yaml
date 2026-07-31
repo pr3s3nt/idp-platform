@@ -18,7 +18,12 @@
 #
 # Events (client_payload):
 #   deploy-request : { app, repo, sha, image? }
-#   promote-request: { app, repo, tag, mode: "tag-only" | "re-render", image? }
+#   promote-request: { app, repo, tag, mode: "from-staging" | "tag-only" | "re-render", image? }
+#
+#   `tag_strategy` is OPTIONAL on both, default "commit". Send "content" from a repo
+#           holding several services so each one is tagged by ITS OWN directory hash;
+#           otherwise one service's commit re-tags and restarts all the others.
+#           With "content" a promote must use mode "from-staging", not "tag-only".
 #
 #   `app`   drives the config repo name and the namespaces (<app>-staging / <app>-prod).
 #   `image` is OPTIONAL, defaulting to `app`. Send it when the Harbor image name differs
@@ -86,6 +91,10 @@ jobs:
       APP_REPO: ${{ github.event.client_payload.repo || inputs.repo }}
       SHA: ${{ github.event.client_payload.sha || inputs.sha }}
       IMAGE: ${{ github.event.client_payload.image || inputs.image || github.event.client_payload.app || inputs.app }}
+      # How each workload's image tag is chosen. Default `commit` keeps every existing app
+      # working unchanged. A repo holding several services should send `content`, so one
+      # service's commit stops re-tagging — and therefore restarting — all the others.
+      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || 'commit' }}
     steps:
       - name: Checkout platform@main (renderer + workflow)
         uses: actions/checkout@v4
@@ -148,7 +157,7 @@ jobs:
         run: |
           python3 platform/orchestrate.py render \
             --app "$APP" --image "$IMAGE" --tag "$SHA" --env staging \
-            --registry "$REGISTRY" \
+            --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
             --catalog catalog --app-dir app --work work-staging \
             --out config/staging/manifests.yaml \
             --kubeconfig cluster-config-staging
@@ -163,7 +172,7 @@ jobs:
           fi
           python3 platform/orchestrate.py render \
             --app "$APP" --image "$IMAGE" --tag "$SHA" --env prod \
-            --registry "$REGISTRY" \
+            --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
             --catalog catalog --app-dir app --work work-prod \
             --out config/prod/manifests.yaml \
             --kubeconfig cluster-config-prod
@@ -266,6 +275,7 @@ jobs:
       TAG: ${{ github.event.client_payload.tag }}
       MODE: ${{ github.event.client_payload.mode }}
       IMAGE: ${{ github.event.client_payload.image || github.event.client_payload.app }}
+      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || 'commit' }}
     steps:
       - name: Checkout platform@main (renderer)
         uses: actions/checkout@v4
@@ -320,6 +330,16 @@ jobs:
           umask 077
           echo "$PROD_B64" | base64 -d > cluster-config-prod
 
+      # The right mode for a repo of several services: once each one carries a tag derived
+      # from its own directory, "promote to version X" is not a single value any more — it
+      # is the SET of image references staging was verified running. Copy that set across.
+      - name: Promote (from-staging)
+        if: github.event.client_payload.mode == 'from-staging'
+        run: |
+          python3 platform/orchestrate.py promote \
+            --app "$APP" --image "$IMAGE" --tag "$TAG" --mode from-staging \
+            --config-dir config
+
       # tag-only rewrites the existing manifest and needs no catalog to render, so the
       # catalog flags are only passed for re-render.
       - name: Promote (tag-only)
@@ -334,7 +354,7 @@ jobs:
         run: |
           python3 platform/orchestrate.py promote \
             --app "$APP" --image "$IMAGE" --tag "$TAG" --mode re-render \
-            --registry "$REGISTRY" --config-dir config \
+            --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" --config-dir config \
             --catalog catalog --app-dir app --work work-prod \
             --kubeconfig cluster-config-prod
 
