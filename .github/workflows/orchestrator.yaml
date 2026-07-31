@@ -219,9 +219,17 @@ jobs:
   promote:
     if: github.event.action == 'promote-request'
     runs-on: [self-hosted, platform-orchestrator]
-    # Same queue as deploy — a promote never cuts into a render, and never races the state Secret.
+    # SEPARATE queue from deploy, on purpose. GitHub keeps only ONE run pending per
+    # concurrency group: queueing a third run CANCELS the one already waiting. Sharing the
+    # deploy queue therefore meant a burst of pushes could silently cancel a queued
+    # promotion — a production change lost, and reported as "cancelled" rather than failed.
+    #
+    # Running promote alongside deploy is safe because the two things they share are both
+    # guarded independently of this queue: the state Secret is written under an optimistic
+    # resourceVersion precondition, and the config repo push re-checks deploy ordering
+    # against the remote before every rebase.
     concurrency:
-      group: app-${{ github.event.client_payload.app }}
+      group: promote-${{ github.event.client_payload.app }}
       cancel-in-progress: false
     env:
       APP: ${{ github.event.client_payload.app }}
@@ -245,8 +253,12 @@ jobs:
           token: ${{ secrets.CONFIG_REPO_TOKEN }}
           path: config
 
-      - name: Checkout app repo (re-render only)
-        if: github.event.client_payload.mode == 're-render'
+      # Checked out for BOTH modes. tag-only needs no source to render — it rewrites the
+      # existing manifest — but `commit` needs the git history to answer "is the tag I am
+      # promoting older than what prod already runs?". Without it prod has no ordering guard
+      # at all and an out-of-order promote rolls production backwards in silence. One
+      # checkout is a cheap price for that.
+      - name: Checkout app repo (ordering guard + re-render source)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.APP_REPO }}
@@ -279,8 +291,8 @@ jobs:
           umask 077
           echo "$PROD_B64" | base64 -d > cluster-config-prod
 
-      # tag-only rewrites the existing manifest and needs no catalog/app checkout, so those
-      # flags are only passed for re-render.
+      # tag-only rewrites the existing manifest and needs no catalog to render, so the
+      # catalog flags are only passed for re-render.
       - name: Promote (tag-only)
         if: github.event.client_payload.mode == 'tag-only'
         run: |
@@ -307,10 +319,12 @@ jobs:
             --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
             --kubeconfig cluster-config-prod
 
+      # --app-dir is what arms the ordering guard: without it `commit` cannot tell whether
+      # this tag is older than what prod already runs, and promotes silently roll back.
       - name: Commit & push config repo
         run: |
           python3 platform/orchestrate.py commit \
-            --config-dir config --app "$APP" --env prod --sha "$TAG"
+            --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app
 
       - name: Scrub kubeconfig
         if: always()

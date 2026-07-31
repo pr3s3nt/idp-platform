@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import re
 import shutil
 import subprocess
@@ -222,39 +223,91 @@ class FileStateStore(StateStore):
         log(f"saved state to {self.path}")
 
 
+class StateConflict(SystemExit):
+    """Another run wrote this (app, env) state while we were rendering."""
+
+
 class SecretStateStore(StateStore):
-    """State in a cluster Secret, one per (app, env). The production path."""
+    """State in a cluster Secret, one per (app, env). The production path.
+
+    Writes are OPTIMISTICALLY LOCKED. `kubectl apply` is last-write-wins, so two renders of
+    the same (app, env) overlapping would silently discard one side's state — and that state
+    is exactly the resource GUIDs and generated Postgres password, so losing it renames the
+    StatefulSet and orphans the PVC. That is the failure this whole class exists to prevent,
+    so it must not be reintroduced by a race.
+
+    The read captures the Secret's resourceVersion and the write sends it back as a
+    precondition: `replace` is rejected by the API server if anyone else wrote in between.
+    A first write uses `create`, where AlreadyExists carries the same meaning.
+
+    Runs of one app are normally serialized by the workflow's concurrency group, but that is
+    a convention one workflow edit away from being wrong, and the runner is also meant to be
+    used for hand-replay of a failed step. The precondition does not depend on either.
+    """
 
     def __init__(self, app: str, env: str, kubeconfig: str | None):
         self.name = f"{app}-{env}-score-state"
         self.kubeconfig = kubeconfig
+        # None means "we did not observe an existing Secret", which selects `create`.
+        self.resource_version: str | None = None
 
     def pull(self, dest: Path) -> bool:
         cp = kubectl(
-            ["get", "secret", self.name, "-n", STATE_NAMESPACE,
-             "-o", "jsonpath={.data.state\\.yaml}"],
+            ["get", "secret", self.name, "-n", STATE_NAMESPACE, "-o", "json"],
             kubeconfig=self.kubeconfig, check=False, capture=True,
         )
-        if cp.returncode != 0 or not cp.stdout.strip():
-            if "NotFound" in (cp.stderr or "") or cp.returncode == 0:
+        if cp.returncode != 0:
+            if "NotFound" in (cp.stderr or ""):
                 log(f"no prior state Secret {self.name} -> first deploy")
                 return False
             raise SystemExit(f"reading state Secret {self.name} failed: {cp.stderr.strip()}")
+
+        obj = json.loads(cp.stdout)
+        # Captured even when the payload is empty: the Secret exists, so our write is still
+        # a checked replace rather than a create.
+        self.resource_version = (obj.get("metadata") or {}).get("resourceVersion")
+        payload = (obj.get("data") or {}).get("state.yaml")
+        if not payload:
+            log(f"state Secret {self.name} carries no state.yaml -> treating as first deploy")
+            return False
+
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(base64.b64decode(cp.stdout))
-        log(f"restored state from Secret {STATE_NAMESPACE}/{self.name}")
+        dest.write_bytes(base64.b64decode(payload))
+        log(f"restored state from Secret {STATE_NAMESPACE}/{self.name}"
+            f" (resourceVersion {self.resource_version})")
         return True
 
     def push(self, src: Path) -> None:
         ensure_namespace(STATE_NAMESPACE, self.kubeconfig)
-        # Upsert: unlike app secrets, state MUST be overwritten with the newest version.
-        rendered = kubectl(
-            ["create", "secret", "generic", self.name, "-n", STATE_NAMESPACE,
-             f"--from-file=state.yaml={src}", "--dry-run=client", "-o", "yaml"],
-            kubeconfig=self.kubeconfig, capture=True,
-        ).stdout
-        kubectl(["apply", "-f", "-"], kubeconfig=self.kubeconfig, stdin=rendered)
-        log(f"saved state to Secret {STATE_NAMESPACE}/{self.name}")
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "type": "Opaque",
+            "metadata": {"name": self.name, "namespace": STATE_NAMESPACE},
+            "data": {"state.yaml": base64.b64encode(src.read_bytes()).decode()},
+        }
+        if self.resource_version is None:
+            verb, expected = "create", "no Secret existed when this render started"
+        else:
+            body["metadata"]["resourceVersion"] = self.resource_version
+            verb, expected = "replace", f"resourceVersion {self.resource_version}"
+
+        cp = kubectl([verb, "-f", "-"], kubeconfig=self.kubeconfig,
+                     stdin=yaml.safe_dump(body), check=False, capture=True)
+        if cp.returncode == 0:
+            log(f"saved state to Secret {STATE_NAMESPACE}/{self.name} ({verb})")
+            return
+
+        err = (cp.stderr or "") + (cp.stdout or "")
+        if any(s in err for s in ("AlreadyExists", "the object has been modified",
+                                  "Operation cannot be fulfilled", "Conflict")):
+            raise StateConflict(
+                f"state Secret {STATE_NAMESPACE}/{self.name} changed while this render was "
+                f"running (expected {expected}). Another deploy of {self.name} overlapped "
+                "this one. Nothing was written — re-run this deploy so it renders from the "
+                "current state instead of overwriting it."
+            )
+        raise SystemExit(f"writing state Secret {self.name} failed: {err.strip()}")
 
 
 def make_state_store(args) -> StateStore:
@@ -422,29 +475,57 @@ def is_ancestor(app_dir: Path, maybe_ancestor: str, descendant: str) -> bool | N
     return None
 
 
+class OutOfOrder(SystemExit):
+    """The commit being deployed is older than what is already deployed."""
+
+
+def guard_ordering(deployed: str, sha: str, app_dir: Path | None, env: str) -> None:
+    """Refuse to move `env` backwards.
+
+    Build durations differ, so a later commit can dispatch BEFORE an earlier one: the
+    concurrency group serializes runs but does not reorder them. Without this, the older
+    render simply wins and the environment silently regresses.
+
+    `deployed` is whatever the config repo currently records — read it from the version we
+    are actually about to write on top of, not from a checkout taken minutes ago.
+    """
+    if not deployed or not app_dir:
+        return
+    if deployed == sha:
+        log(f"{env} already at {sha}")
+        return
+    anc = is_ancestor(app_dir, sha, deployed)
+    if anc is True:
+        raise OutOfOrder(
+            f"refusing to deploy {sha} to {env}: it is an ancestor of the already-deployed "
+            f"{deployed} (out-of-order dispatch)"
+        )
+    if anc is None:
+        warn(
+            f"cannot determine ancestry between {sha} and {deployed} — the app checkout is "
+            "probably shallow (needs fetch-depth: 0), or the ref is a tag that was never "
+            "fetched. Proceeding."
+        )
+
+
+def upstream_record(config: Path, env: str) -> str:
+    """The deploy record as it exists on the remote RIGHT NOW ('' if absent).
+
+    Read after a fetch, so it reflects writers that landed since this job cloned the repo.
+    """
+    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                 cwd=config, capture=True).stdout.strip()
+    cp = run(["git", "show", f"origin/{branch}:{SHA_RECORD_DIR}/{env}.sha"],
+             cwd=config, check=False, capture=True)
+    return cp.stdout.strip() if cp.returncode == 0 else ""
+
+
 def cmd_commit(args) -> None:
     config, app_dir = Path(args.config_dir), Path(args.app_dir) if args.app_dir else None
     record = config / SHA_RECORD_DIR / f"{args.env}.sha"
 
-    # Ordering guard. Build durations differ, so a later commit can dispatch BEFORE an
-    # earlier one; the concurrency group serializes runs but does not reorder them, and the
-    # rebase-retry below would happily let the older render win.
-    if record.is_file() and app_dir:
-        previous = record.read_text().strip()
-        if previous == args.sha:
-            log(f"{args.env} already at {args.sha}")
-        elif previous:
-            anc = is_ancestor(app_dir, args.sha, previous)
-            if anc is True:
-                raise SystemExit(
-                    f"refusing to deploy {args.sha}: it is an ancestor of the already-deployed "
-                    f"{previous} (out-of-order dispatch)"
-                )
-            if anc is None:
-                warn(
-                    f"cannot determine ancestry between {args.sha} and {previous} — "
-                    "the app checkout is probably shallow (needs fetch-depth: 0). Proceeding."
-                )
+    if record.is_file():
+        guard_ordering(record.read_text().strip(), args.sha, app_dir, args.env)
 
     record.parent.mkdir(parents=True, exist_ok=True)
     record.write_text(args.sha + "\n")
@@ -468,6 +549,15 @@ def cmd_commit(args) -> None:
         if attempt == 3:
             raise SystemExit("push failed after 3 attempts")
         warn(f"push rejected (new commits upstream) -> pull --rebase, retry ({attempt}/3)")
+
+        # RE-CHECK BEFORE REBASING. Somebody landed commits since this job cloned, and a
+        # rebase replays OUR commit on top of theirs — including our deploy record. If what
+        # they pushed is newer than what we are holding, rebasing would quietly roll the
+        # environment back. The guard only ran against the stale clone, so run it again
+        # against what is actually on the remote now.
+        run(["git", "fetch", "origin"], cwd=config)
+        guard_ordering(upstream_record(config, args.env), args.sha, app_dir, args.env)
+
         rebase = run(["git", "pull", "--rebase"], cwd=config, check=False, capture=True)
         if rebase.returncode != 0:
             # Usually a genuine conflict, or a branch with no upstream. Either way the

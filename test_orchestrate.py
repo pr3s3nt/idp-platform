@@ -415,3 +415,164 @@ def test_rendered_config_repo_output_has_no_managed_by(tmp_path):
     orc.cmd_render(args)
     for doc in orc.load_all(Path(args.out)):
         assert "app.kubernetes.io/managed-by" not in (doc.get("metadata") or {}).get("labels", {})
+
+
+# ------------------------------------------------------------------ concurrency / ordering
+def clone_of(tmp_path: Path, name: str) -> Path:
+    """A second, independent working copy of the same config repo — i.e. another runner."""
+    other = tmp_path / name
+    subprocess.run(["git", "clone", "-q", str(tmp_path / "remote.git"), str(other)], check=True)
+    git(other, "config", "user.email", "t@t")
+    git(other, "config", "user.name", "t")
+    return other
+
+
+def branch_of(repo: Path) -> str:
+    """Tests must not assume main vs master — `git init` defaults differ per git version."""
+    return git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+
+
+def record_deploy(repo: Path, env: str, sha: str, msg: str) -> None:
+    rec = repo / orc.SHA_RECORD_DIR / f"{env}.sha"
+    rec.parent.mkdir(parents=True, exist_ok=True)
+    rec.write_text(sha + "\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", msg)
+
+
+def test_commit_refuses_stale_render_after_remote_moved_ahead(tmp_path, repo_with_two_commits):
+    """The rebase hole: the guard used to run ONCE, against the clone taken at job start.
+
+    Another writer lands a newer deploy while we render. Our push is rejected, and the
+    rebase-retry replays OUR older commit on top of theirs — including our deploy record —
+    so the environment silently rolls back. The re-check before rebasing must catch it.
+    """
+    app, old, new = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+
+    # Another runner deploys the NEWER commit while we are still rendering the older one.
+    other = clone_of(tmp_path, "other")
+    record_deploy(other, "staging", new, "deploy new")
+    git(other, "push", "-q")
+
+    # Our stale clone knows nothing about that and tries to commit the OLDER sha.
+    (config / "staging" / "manifests.yaml").write_text("stale render\n")
+    args = orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="staging", sha=old,
+        app_dir=str(app), catalog_ref=None,
+    )
+    with pytest.raises(orc.OutOfOrder, match="ancestor of the already-deployed"):
+        orc.cmd_commit(args)
+
+    # And the remote still holds the newer deploy — nothing was rolled back.
+    up = f"origin/{branch_of(other)}"
+    assert git(other, "show", f"{up}:{orc.SHA_RECORD_DIR}/staging.sha").strip() == new
+
+
+def test_commit_rebases_when_concurrent_change_is_unrelated(tmp_path, repo_with_two_commits):
+    """The same race, but the other writer touched something else (a human editing
+    fleet.yaml). Rebasing is correct here and must still happen."""
+    app, old, new = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+
+    other = clone_of(tmp_path, "other")
+    (other / "staging" / "fleet.yaml").write_text("namespace: a-staging\n")
+    git(other, "add", ".")
+    git(other, "commit", "-qm", "human edit")
+    git(other, "push", "-q")
+
+    (config / "staging" / "manifests.yaml").write_text("fresh render\n")
+    args = orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="staging", sha=new,
+        app_dir=str(app), catalog_ref=None,
+    )
+    orc.cmd_commit(args)
+
+    # Both changes survived.
+    git(config, "fetch", "-q", "origin")
+    up = f"origin/{branch_of(config)}"
+    assert git(config, "show", f"{up}:{orc.SHA_RECORD_DIR}/staging.sha").strip() == new
+    assert "namespace" in git(config, "show", f"{up}:staging/fleet.yaml")
+
+
+def test_guard_is_inert_without_app_dir():
+    """Documents why the workflow MUST pass --app-dir on promote too: with no checkout there
+    is no history to compare against, so the guard cannot fire at all."""
+    orc.guard_ordering("deadbeef", "cafe1234", None, "prod")  # must not raise
+
+
+# --------------------------------------------------------------- state Secret optimistic lock
+class FakeKubectl:
+    """Records kubectl invocations and replays canned results."""
+
+    def __init__(self, results):
+        self.results = results
+        self.calls = []
+
+    def __call__(self, args, *, kubeconfig=None, **kw):
+        self.calls.append(args)
+        rc, err = self.results.get(args[0], (0, ""))
+        return subprocess.CompletedProcess(args, rc, stdout="", stderr=err)
+
+
+def test_state_push_sends_resource_version_precondition(tmp_path, monkeypatch):
+    """A replace carrying the observed resourceVersion is what makes the write checked."""
+    src = tmp_path / "state.yaml"
+    src.write_text("guid: abc\n")
+    store = orc.SecretStateStore("a", "staging", None)
+    store.resource_version = "4242"
+
+    sent = {}
+
+    def fake_kubectl(args, *, kubeconfig=None, stdin=None, **kw):
+        sent["verb"] = args[0]
+        sent["body"] = yaml.safe_load(stdin) if stdin else None
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    monkeypatch.setattr(orc, "ensure_namespace", lambda *a, **k: None)
+    store.push(src)
+
+    assert sent["verb"] == "replace"
+    assert sent["body"]["metadata"]["resourceVersion"] == "4242"
+
+
+def test_state_push_raises_on_concurrent_write(tmp_path, monkeypatch):
+    """The API server rejects the replace when another render wrote in between. That must
+    surface as a clear conflict, not a silent overwrite of someone else's GUIDs/password."""
+    src = tmp_path / "state.yaml"
+    src.write_text("guid: abc\n")
+    store = orc.SecretStateStore("a", "staging", None)
+    store.resource_version = "1"
+
+    def fake_kubectl(args, *, kubeconfig=None, stdin=None, **kw):
+        return subprocess.CompletedProcess(
+            args, 1, stdout="",
+            stderr='Operation cannot be fulfilled on secrets "a-staging-score-state": '
+                   "the object has been modified; please apply your changes to the latest version",
+        )
+
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    monkeypatch.setattr(orc, "ensure_namespace", lambda *a, **k: None)
+    with pytest.raises(orc.StateConflict, match="changed while this render was running"):
+        store.push(src)
+
+
+def test_state_push_first_write_uses_create(tmp_path, monkeypatch):
+    """No Secret observed -> create, so a racing first deploy hits AlreadyExists."""
+    src = tmp_path / "state.yaml"
+    src.write_text("guid: abc\n")
+    store = orc.SecretStateStore("a", "staging", None)
+    seen = {}
+
+    def fake_kubectl(args, *, kubeconfig=None, stdin=None, **kw):
+        seen["verb"] = args[0]
+        seen["body"] = yaml.safe_load(stdin) if stdin else None
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    monkeypatch.setattr(orc, "ensure_namespace", lambda *a, **k: None)
+    store.push(src)
+
+    assert seen["verb"] == "create"
+    assert "resourceVersion" not in seen["body"]["metadata"]
