@@ -1,0 +1,6 @@
+# Fleet Bundle — prod.
+# Fleet treats each directory containing a fleet.yaml as its own Bundle, so staging
+# and prod reconcile (and roll back) independently from the same GitRepo.
+# Replace <app> with the app name, e.g. sample-nginx.
+namespace: <app>-prod
+defaultNamespace: <app>-prod

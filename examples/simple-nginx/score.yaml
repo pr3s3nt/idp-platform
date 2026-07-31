@@ -1,0 +1,19 @@
+# Single-workload app, the shape sample-nginx uses: one score.yaml at the repo root.
+# Used by test_patch_changes_still_apply_across_state_restore to prove a staging render
+# followed by a prod render still switches replicas 1 -> 3 across a state restore.
+apiVersion: score.dev/v1b1
+
+metadata:
+  name: nginx
+
+containers:
+  web:
+    # The orchestrator rewrites this to <registry>/<image>:<tag> before rendering,
+    # so the placeholder here never reaches a cluster.
+    image: .
+
+service:
+  ports:
+    http:
+      port: 80
+      targetPort: 80

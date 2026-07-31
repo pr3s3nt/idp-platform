@@ -1,0 +1,36 @@
+# `service` resource type — cross-workload service discovery.
+#
+# Lets one workload reference another's Service name, which is how multi-workload apps wire
+# themselves together:
+#
+#   resources:
+#     cart: { type: service }
+#   containers:
+#     frontend:
+#       variables:
+#         CART_SERVICE_ADDR: "${resources.cart.name}:7070"
+#
+# VENDORED verbatim from score-spec/community-provisioners@main
+#   service/score-k8s/10-service.provisioners.yaml
+# Kept in-tree rather than fetched by URL at render time so renders stay reproducible and
+# work on an air-gapped runner.
+#
+# IMPORTANT: the `fail "unknown workload"` below is why orchestrate.py generates every
+# workload in a SINGLE `score-k8s generate` invocation. WorkloadServices is built from the
+# project state, so a workload referencing a peer that hasn't been generated yet errors out.
+#
+# `redis`, `postgres`, `mysql`, `mongodb`, `s3` and friends are already built into score-k8s
+# as default provisioners and need no vendoring.
+- uri: template://community-provisioners/static-service
+  type: service
+  description: Outputs the name of the Workload dependency if it exists in the list of Workloads.
+  init: |
+    name: {{ splitList "." .Id | last }}
+  outputs: |
+    {{ $w := (index .WorkloadServices .Init.name) }}
+    {{ if or (not $w) (not $w.ServiceName) }}{{ fail "unknown workload" }}{{ end }}
+    name: {{ $w.ServiceName | quote }}
+    url: http://{{ $w.ServiceName }}
+  expected_outputs:
+    - name
+    - url

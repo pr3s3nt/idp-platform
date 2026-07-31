@@ -1,0 +1,30 @@
+# App claiming a `postgres` resource, served by provisioners/local.provisioners.yaml.
+# Used by the state-stability tests: the provisioner derives the StatefulSet name from the
+# resource GUID and generates the password once, so two renders sharing state must produce
+# an identical StatefulSet name, Secret name and password.
+apiVersion: score.dev/v1b1
+
+metadata:
+  name: pgapp
+
+containers:
+  main:
+    image: .
+    variables:
+      PGHOST: "${resources.db.host}"
+      PGPORT: "${resources.db.port}"
+      PGDATABASE: "${resources.db.database}"
+      PGUSER: "${resources.db.username}"
+      # Resolves to a secretKeyRef via encodeSecretRef — the password never lands in the
+      # config repo, only in the Secret the orchestrator applies straight to the cluster.
+      PGPASSWORD: "${resources.db.password}"
+
+service:
+  ports:
+    http:
+      port: 8080
+      targetPort: 8080
+
+resources:
+  db:
+    type: postgres

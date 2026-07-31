@@ -1,0 +1,6 @@
+# PLATFORM.LOCK — the catalog's own reference marker.
+# Apps copy this file into their repo and pin the ref they want to render against.
+# Value: a tag (recommended, e.g. catalog/v1), a branch, or a SHA of this repo.
+# The orchestrator renders each app with EXACTLY the ref its lock file names, so
+# changes landed on main never affect a running app until it bumps its lock via PR.
+main

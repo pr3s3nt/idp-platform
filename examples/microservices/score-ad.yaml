@@ -1,0 +1,16 @@
+# Multi-workload app, flat layout (score-*.yaml side by side in the repo root).
+# `ad` deliberately declares NO container resources, so patches/staging.tpl fills them in.
+apiVersion: score.dev/v1b1
+
+metadata:
+  name: ad
+
+containers:
+  main:
+    image: .
+
+service:
+  ports:
+    grpc:
+      port: 9555
+      targetPort: 9555

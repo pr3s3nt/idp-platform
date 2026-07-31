@@ -1,0 +1,29 @@
+# `cart` declares its own container resources, which the patch template must NOT overwrite,
+# and claims a `redis` datastore (a score-k8s built-in provisioner) whose generated Secret
+# must be split out of the config repo by the renderer.
+apiVersion: score.dev/v1b1
+
+metadata:
+  name: cart
+
+containers:
+  main:
+    image: .
+    variables:
+      REDIS_ADDR: "${resources.cache.host}:${resources.cache.port}"
+    resources:
+      requests:
+        cpu: "200m"
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+
+service:
+  ports:
+    grpc:
+      port: 7070
+      targetPort: 7070
+
+resources:
+  cache:
+    type: redis

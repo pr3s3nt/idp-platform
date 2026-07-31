@@ -1,0 +1,312 @@
+# =============================================================================
+# ORCHESTRATOR — the platform's deploy brain. Runs in the idp platform repo.
+#
+# An app's CI ONLY builds and pushes an image, then "calls" the platform via
+# repository_dispatch. Everything downstream lives here, written once for all apps.
+# The logic itself is in orchestrate.py — this file only translates the dispatch payload
+# into CLI flags and supplies credentials. Keeping it thin is deliberate: you can replay
+# any failed step by hand on the runner by copying the logged command.
+#
+# CATALOG VERSION PINNING (platform.lock):
+#   Each app repo holds a platform.lock naming a ref (tag/branch/SHA) of THIS repo.
+#   Provisioners and patches are checked out at exactly that ref, so editing them on main
+#   does not affect running apps; an app upgrades by bumping its lock via PR.
+#
+#   The RENDERER (orchestrate.py) deliberately does NOT follow platform.lock. GitHub always
+#   runs repository_dispatch workflows from the default branch, so a pinned script would
+#   drift out of sync with the flags this file passes it. platform.lock pins DATA, not CODE.
+#
+# Events (client_payload):
+#   deploy-request : { app, repo, sha, image? }
+#   promote-request: { app, repo, tag, mode: "tag-only" | "re-render", image? }
+#
+#   `app`   drives the config repo name and the namespaces (<app>-staging / <app>-prod).
+#   `image` is OPTIONAL, defaulting to `app`. Send it when the Harbor image name differs
+#           from the app name (e.g. app=sample-nginx but the image is called nginx).
+#           Multi-workload repos render each workload as <image>-<workload>.
+#
+# Required secrets:
+#   APP_REPOS_TOKEN            read the app repos in the org
+#   CONFIG_REPO_TOKEN          push to the <app>-config repos
+#   KUBECONFIG_STAGING  base64 kubeconfig for the staging cluster
+#   KUBECONFIG_PROD     base64 kubeconfig for the prod cluster
+#   REGISTRY_HOST / REGISTRY_USER / REGISTRY_PASS   pull-only robot account
+#
+# RUNNERS: the platform-orchestrator label is required, not cosmetic. The job needs score-k8s,
+# kubectl, git, python3 + pyyaml, and cluster access. Bare `self-hosted` would let the job
+# land on any runner and fail mid-render; the preflight step catches that up front.
+# =============================================================================
+name: orchestrator
+
+on:
+  repository_dispatch:
+    types: [deploy-request, promote-request]
+  # Manual trigger, for debugging and for re-running a deploy without a new push.
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "App name (drives config repo + namespaces), e.g. sample-nginx"
+        required: true
+      repo:
+        description: "App repo, e.g. org-team/platform-sample-app"
+        required: true
+      sha:
+        description: "Commit SHA to deploy (also the image tag)"
+        required: true
+      image:
+        description: "Harbor image name (defaults to app)"
+        required: false
+
+env:
+  ORG: org-team
+  # Repos in this org are all platform-prefixed (platform-sample-app, platform-sample-app-config),
+  # while `app` stays unprefixed (sample-nginx) so namespaces read sample-nginx-staging.
+  CONFIG_PREFIX: platform-
+  # Harbor project holding the app images. Matches the Postgres image path already used by
+  # provisioners/local.provisioners.yaml.
+  REGISTRY: registry.staging.internal.dev/platform-images
+
+jobs:
+  # ===========================================================================
+  # DEPLOY: render staging (and bootstrap prod once) then commit to the config repo
+  # ===========================================================================
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.action == 'deploy-request'
+    runs-on: [self-hosted, platform-orchestrator]
+    # CONCURRENCY: every run touching the SAME APP queues sequentially. This does two jobs:
+    # it stops two quick commits rendering in parallel and writing the config repo out of
+    # order, and it serializes the read-modify-write of that app's state Secret. Different
+    # apps still run in parallel across runners.
+    concurrency:
+      group: app-${{ github.event.client_payload.app || inputs.app }}
+      cancel-in-progress: false
+    env:
+      APP: ${{ github.event.client_payload.app || inputs.app }}
+      APP_REPO: ${{ github.event.client_payload.repo || inputs.repo }}
+      SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+      IMAGE: ${{ github.event.client_payload.image || inputs.image || github.event.client_payload.app || inputs.app }}
+    steps:
+      - name: Checkout platform@main (renderer + workflow)
+        uses: actions/checkout@v4
+        with:
+          path: platform
+
+      - name: Preflight
+        run: python3 platform/orchestrate.py preflight --require-cluster
+        env:
+          KUBECONFIG: ${{ github.workspace }}/cluster-config-staging
+
+      - name: Checkout app repo at the exact commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.SHA }}
+          token: ${{ secrets.APP_REPOS_TOKEN }}
+          path: app
+          # Full history is REQUIRED by the ancestry guard in `commit`: with the default
+          # shallow clone, `git merge-base` cannot compare against the deployed SHA and the
+          # out-of-order protection silently degrades to a warning.
+          fetch-depth: 0
+
+      - name: Resolve catalog version (platform.lock)
+        id: lock
+        run: |
+          REF=$(grep -v '^#' app/platform.lock 2>/dev/null | head -1 | tr -d '[:space:]')
+          [ -n "$REF" ] || REF=main
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "==> app=${APP} pinned catalog: $REF"
+
+      - name: Checkout catalog (provisioners + patches) at the pinned ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.lock.outputs.ref }}
+          path: catalog
+
+      - name: Checkout config repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ORG }}/${{ env.CONFIG_PREFIX }}${{ env.APP }}-config
+          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          path: config
+
+      - name: Write kubeconfigs
+        env:
+          STAGING_B64: ${{ secrets.KUBECONFIG_STAGING }}
+          PROD_B64: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "$STAGING_B64" | base64 -d > cluster-config-staging
+          echo "$PROD_B64"    | base64 -d > cluster-config-prod
+
+      - name: Render staging
+        run: |
+          python3 platform/orchestrate.py render \
+            --app "$APP" --image "$IMAGE" --tag "$SHA" --env staging \
+            --registry "$REGISTRY" \
+            --catalog catalog --app-dir app --work work-staging \
+            --out config/staging/manifests.yaml \
+            --kubeconfig cluster-config-staging
+
+      # Bootstrap prod once so its Fleet bundle exists; afterwards prod only moves through an
+      # explicit promote-request.
+      - name: Bootstrap prod (first deploy only)
+        run: |
+          if [ -f config/prod/manifests.yaml ]; then
+            echo "==> prod already bootstrapped, leaving it alone"
+            exit 0
+          fi
+          python3 platform/orchestrate.py render \
+            --app "$APP" --image "$IMAGE" --tag "$SHA" --env prod \
+            --registry "$REGISTRY" \
+            --catalog catalog --app-dir app --work work-prod \
+            --out config/prod/manifests.yaml \
+            --kubeconfig cluster-config-prod
+
+      - name: Apply secrets (staging)
+        run: |
+          python3 platform/orchestrate.py apply-secrets \
+            --app "$APP" --env staging --secrets work-staging/secrets.yaml \
+            --harbor-host "${{ secrets.REGISTRY_HOST }}" \
+            --harbor-user "${{ secrets.REGISTRY_USER }}" \
+            --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
+            --kubeconfig cluster-config-staging
+
+      - name: Apply secrets (prod, if bootstrapped this run)
+        run: |
+          [ -d work-prod ] || { echo "==> prod not rendered this run"; exit 0; }
+          python3 platform/orchestrate.py apply-secrets \
+            --app "$APP" --env prod --secrets work-prod/secrets.yaml \
+            --harbor-host "${{ secrets.REGISTRY_HOST }}" \
+            --harbor-user "${{ secrets.REGISTRY_USER }}" \
+            --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
+            --kubeconfig cluster-config-prod
+
+      - name: Commit & push config repo
+        run: |
+          python3 platform/orchestrate.py commit \
+            --config-dir config --app "$APP" --env staging --sha "$SHA" \
+            --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### \`${APP}\` -> staging"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| commit | \`${SHA}\` |"
+            echo "| image | \`${REGISTRY}/${IMAGE}:${SHA}\` |"
+            echo "| catalog | \`${{ steps.lock.outputs.ref }}\` |"
+            echo "| namespace | \`${APP}-staging\` |"
+            echo "| config repo | \`${ORG}/${CONFIG_PREFIX}${APP}-config\` |"
+            echo "| runner | \`${RUNNER_NAME}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Scrub kubeconfigs
+        if: always()
+        run: rm -f cluster-config-staging cluster-config-prod
+
+  # ===========================================================================
+  # PROMOTE: move prod to a tag (tag-only) or re-render prod from that commit
+  # ===========================================================================
+  promote:
+    if: github.event.action == 'promote-request'
+    runs-on: [self-hosted, platform-orchestrator]
+    # Same queue as deploy — a promote never cuts into a render, and never races the state Secret.
+    concurrency:
+      group: app-${{ github.event.client_payload.app }}
+      cancel-in-progress: false
+    env:
+      APP: ${{ github.event.client_payload.app }}
+      APP_REPO: ${{ github.event.client_payload.repo }}
+      TAG: ${{ github.event.client_payload.tag }}
+      MODE: ${{ github.event.client_payload.mode }}
+      IMAGE: ${{ github.event.client_payload.image || github.event.client_payload.app }}
+    steps:
+      - name: Checkout platform@main (renderer)
+        uses: actions/checkout@v4
+        with:
+          path: platform
+
+      - name: Preflight
+        run: python3 platform/orchestrate.py preflight
+
+      - name: Checkout config repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ORG }}/${{ env.CONFIG_PREFIX }}${{ env.APP }}-config
+          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          path: config
+
+      - name: Checkout app repo (re-render only)
+        if: github.event.client_payload.mode == 're-render'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.TAG }}
+          token: ${{ secrets.APP_REPOS_TOKEN }}
+          path: app
+          fetch-depth: 0
+
+      # A re-render uses the catalog the app pinned AT THAT COMMIT, so history is reproducible.
+      - name: Resolve catalog version (re-render only)
+        if: github.event.client_payload.mode == 're-render'
+        id: lock
+        run: |
+          REF=$(grep -v '^#' app/platform.lock 2>/dev/null | head -1 | tr -d '[:space:]')
+          [ -n "$REF" ] || REF=main
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout catalog (re-render only)
+        if: github.event.client_payload.mode == 're-render'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.lock.outputs.ref }}
+          path: catalog
+
+      - name: Write prod kubeconfig
+        env:
+          PROD_B64: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "$PROD_B64" | base64 -d > cluster-config-prod
+
+      # tag-only rewrites the existing manifest and needs no catalog/app checkout, so those
+      # flags are only passed for re-render.
+      - name: Promote (tag-only)
+        if: github.event.client_payload.mode == 'tag-only'
+        run: |
+          python3 platform/orchestrate.py promote \
+            --app "$APP" --image "$IMAGE" --tag "$TAG" --mode tag-only \
+            --config-dir config
+
+      - name: Promote (re-render)
+        if: github.event.client_payload.mode == 're-render'
+        run: |
+          python3 platform/orchestrate.py promote \
+            --app "$APP" --image "$IMAGE" --tag "$TAG" --mode re-render \
+            --registry "$REGISTRY" --config-dir config \
+            --catalog catalog --app-dir app --work work-prod \
+            --kubeconfig cluster-config-prod
+
+      - name: Apply secrets (re-render only)
+        if: github.event.client_payload.mode == 're-render'
+        run: |
+          python3 platform/orchestrate.py apply-secrets \
+            --app "$APP" --env prod --secrets work-prod/secrets.yaml \
+            --harbor-host "${{ secrets.REGISTRY_HOST }}" \
+            --harbor-user "${{ secrets.REGISTRY_USER }}" \
+            --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
+            --kubeconfig cluster-config-prod
+
+      - name: Commit & push config repo
+        run: |
+          python3 platform/orchestrate.py commit \
+            --config-dir config --app "$APP" --env prod --sha "$TAG"
+
+      - name: Scrub kubeconfig
+        if: always()
+        run: rm -f cluster-config-prod

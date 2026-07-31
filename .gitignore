@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# score-k8s scratch. .score-k8s in particular holds raw secrets (generated DB passwords)
+# and must never be committed — the orchestrator keeps that state in a cluster Secret instead.
+.score-k8s/
+work-*/
+manifests.yaml
+kubeconfig-*
