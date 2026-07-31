@@ -33,13 +33,134 @@ from pathlib import Path
 
 import yaml
 
-# Namespace holding one Secret per (app, env) with that project's score-k8s state.
-STATE_NAMESPACE = "cluster-state"
-# Image pull secret injected by the patch templates; created here if missing.
-PULL_SECRET = "registry-pull"
-# Where the deployed SHA is recorded in the config repo. Kept at the repo root, OUTSIDE
-# staging/ and prod/, so Fleet never tries to parse it as a manifest.
-SHA_RECORD_DIR = ".platform"
+# --------------------------------------------------------------------------------------
+# environment config
+# --------------------------------------------------------------------------------------
+# Every infrastructure-dependent value lives in platform.env.yaml, never in code. Moving
+# this platform to another company's cluster must be a config edit, not a patch.
+#
+# The DEFAULTS below are the sandbox's values and exist only so the tool still runs with no
+# config file — tests and hand-replay on a runner. Anything real passes --env-config.
+DEFAULTS: dict = {
+    "git": {"org": "", "config_repo_pattern": "{app}-config", "default_branch": "main"},
+    "registry": {"host": "", "path": "", "pull_secret": "registry-pull"},
+    "kubernetes": {
+        "state_namespace": "cluster-state",
+        "namespace_pattern": "{app}-{env}",
+        "storage_class": "",
+        "sha_record_dir": ".platform",
+    },
+    "ingress": {"gateway_name": "", "gateway_namespace": ""},
+    "images": {},
+    "environments": {},
+}
+
+# Placeholder syntax for provisioners and patch templates. Deliberately NOT {{ }} — those
+# files are Go templates owned by score-k8s, and NOT ${ } — that is score's own resource
+# reference syntax. %% %% collides with neither and greps cleanly.
+PLACEHOLDER = re.compile(r"%%([a-zA-Z0-9_.]+)%%")
+
+
+class EnvConfig:
+    """platform.env.yaml, with dotted lookup."""
+
+    def __init__(self, data: dict | None = None):
+        self.data = _deep_merge(DEFAULTS, data or {})
+
+    @classmethod
+    def load(cls, path: str | None) -> EnvConfig:
+        if not path:
+            return cls()
+        p = Path(path)
+        if not p.is_file():
+            raise SystemExit(f"env config not found: {p}")
+        log(f"loaded environment config from {p}")
+        return cls(yaml.safe_load(p.read_text()) or {})
+
+    def get(self, dotted: str, default=None):
+        node = self.data
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    def require(self, dotted: str):
+        value = self.get(dotted)
+        if value in (None, ""):
+            raise SystemExit(
+                f"platform.env.yaml is missing '{dotted}'. Every infrastructure value must "
+                "come from that file — nothing is hardcoded in the renderer."
+            )
+        return value
+
+    def for_env(self, env: str) -> dict:
+        """Flat {dotted key: value}, with the chosen environment exposed under `env.`."""
+        flat: dict[str, object] = {}
+
+        def walk(node, prefix=""):
+            for key, value in (node or {}).items():
+                if key == "environments":
+                    continue
+                path = f"{prefix}{key}"
+                if isinstance(value, dict):
+                    walk(value, f"{path}.")
+                else:
+                    flat[path] = value
+
+        walk(self.data)
+        for key, value in (self.get(f"environments.{env}") or {}).items():
+            flat[f"env.{key}"] = value
+        return flat
+
+    def render(self, text: str, env: str, *, where: str) -> str:
+        """Substitute %%key%% placeholders. An unknown key is fatal, never silent.
+
+        Silence is how this whole project's worst bugs behaved — a wrong gateway name or a
+        wrong storage class produces no error anywhere, just a route that never attaches or
+        a volume that never binds. A typo'd placeholder must not join that club.
+        """
+        table = self.for_env(env)
+
+        def replace(match: re.Match) -> str:
+            key = match.group(1)
+            if key not in table:
+                known = ", ".join(sorted(table)[:8])
+                raise SystemExit(
+                    f"{where}: unknown placeholder %%{key}%%. "
+                    f"Add it to platform.env.yaml. Known keys include: {known}…"
+                )
+            return str(table[key])
+
+        return PLACEHOLDER.sub(replace, text)
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+# Set from --env-config at startup; the defaults keep everything runnable without one.
+CONFIG = EnvConfig()
+
+
+# Small accessors instead of module constants: the values now come from platform.env.yaml,
+# which is loaded after import, so they cannot be frozen at module level.
+def state_ns() -> str:
+    return CONFIG.get("kubernetes.state_namespace")
+
+
+def pull_secret() -> str:
+    return CONFIG.get("registry.pull_secret")
+
+
+def sha_record_dir() -> str:
+    return CONFIG.get("kubernetes.sha_record_dir")
 
 
 # --------------------------------------------------------------------------------------
@@ -312,7 +433,7 @@ class SecretStateStore(StateStore):
 
     def pull(self, dest: Path) -> bool:
         cp = kubectl(
-            ["get", "secret", self.name, "-n", STATE_NAMESPACE, "-o", "json"],
+            ["get", "secret", self.name, "-n", state_ns(), "-o", "json"],
             kubeconfig=self.kubeconfig, check=False, capture=True,
         )
         if cp.returncode != 0:
@@ -332,17 +453,17 @@ class SecretStateStore(StateStore):
 
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(base64.b64decode(payload))
-        log(f"restored state from Secret {STATE_NAMESPACE}/{self.name}"
+        log(f"restored state from Secret {CONFIG.get('kubernetes.state_namespace')}/{self.name}"
             f" (resourceVersion {self.resource_version})")
         return True
 
     def push(self, src: Path) -> None:
-        ensure_namespace(STATE_NAMESPACE, self.kubeconfig)
+        ensure_namespace(state_ns(), self.kubeconfig)
         body = {
             "apiVersion": "v1",
             "kind": "Secret",
             "type": "Opaque",
-            "metadata": {"name": self.name, "namespace": STATE_NAMESPACE},
+            "metadata": {"name": self.name, "namespace": state_ns()},
             "data": {"state.yaml": base64.b64encode(src.read_bytes()).decode()},
         }
         if self.resource_version is None:
@@ -354,14 +475,14 @@ class SecretStateStore(StateStore):
         cp = kubectl([verb, "-f", "-"], kubeconfig=self.kubeconfig,
                      stdin=yaml.safe_dump(body), check=False, capture=True)
         if cp.returncode == 0:
-            log(f"saved state to Secret {STATE_NAMESPACE}/{self.name} ({verb})")
+            log(f"saved state to Secret {state_ns()}/{self.name} ({verb})")
             return
 
         err = (cp.stderr or "") + (cp.stdout or "")
         if any(s in err for s in ("AlreadyExists", "the object has been modified",
                                   "Operation cannot be fulfilled", "Conflict")):
             raise StateConflict(
-                f"state Secret {STATE_NAMESPACE}/{self.name} changed while this render was "
+                f"state Secret {state_ns()}/{self.name} changed while this render was "
                 f"running (expected {expected}). Another deploy of {self.name} overlapped "
                 "this one. Nothing was written — re-run this deploy so it renders from the "
                 "current state instead of overwriting it."
@@ -435,6 +556,27 @@ def split_manifests(manifests: Path, work: Path) -> tuple[Path, Path]:
     return sec_path, pub_path
 
 
+def materialise_catalog(
+    provisioners: list[Path], patch: Path, dest: Path, env: str,
+) -> dict[str, object]:
+    """Copy the catalog into `dest` with every %%placeholder%% resolved for `env`.
+
+    The originals are never modified — the catalog checkout is shared and pinned. Writing
+    the resolved copies to disk (rather than piping them) is deliberate: when a render goes
+    wrong, the exact files score-k8s was handed are still sitting in the work directory.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    out_provisioners = []
+    for src in provisioners:
+        target = dest / src.name
+        target.write_text(CONFIG.render(src.read_text(), env, where=str(src)))
+        out_provisioners.append(target)
+    out_patch = dest / patch.name
+    out_patch.write_text(CONFIG.render(patch.read_text(), env, where=str(patch)))
+    log(f"resolved {len(out_provisioners)} provisioner(s) + patch for env={env} -> {dest}")
+    return {"provisioners": out_provisioners, "patch": out_patch}
+
+
 def cmd_render(args) -> None:
     work, catalog, app_dir = Path(args.work), Path(args.catalog), Path(args.app_dir)
     if work.exists():
@@ -456,10 +598,16 @@ def cmd_render(args) -> None:
     if not patch.is_file():
         raise SystemExit(f"missing patch template {patch}")
 
+    # Resolve %%placeholders%% into a scratch copy before score-k8s ever sees these files.
+    # The catalog stores the SHAPE of a resource (a route becomes an HTTPRoute); this fills
+    # in the COORDINATES of the cluster it is being rendered for (which gateway, which
+    # storage class). Keeping the two apart is what lets one catalog serve every environment.
+    resolved = materialise_catalog(provisioners, patch, work / "catalog", args.env)
+
     init = ["score-k8s", "init", "--no-sample"]
-    for p in provisioners:
+    for p in resolved["provisioners"]:
         init += ["--provisioners", str(p.resolve())]
-    init += ["--patch-templates", str(patch.resolve())]
+    init += ["--patch-templates", str(resolved["patch"].resolve())]
     run(init, cwd=work)
 
     # One invocation for every workload: cross-workload ${resources.x.name} references only
@@ -514,16 +662,16 @@ def cmd_apply_secrets(args) -> None:
     if args.harbor_host:
         _tolerate_exists(
             kubectl(
-                ["create", "secret", "docker-registry", PULL_SECRET, "-n", ns,
+                ["create", "secret", "docker-registry", pull_secret(), "-n", ns,
                  f"--docker-server={args.harbor_host}",
                  f"--docker-username={args.harbor_user}",
                  f"--docker-password={args.harbor_pass}"],
                 kubeconfig=args.kubeconfig, check=False, capture=True,
             ),
-            f"{PULL_SECRET} in {ns}",
+            f"{pull_secret()} in {ns}",
         )
     else:
-        warn(f"no --harbor-host given: skipping {PULL_SECRET} in {ns}")
+        warn(f"no --harbor-host given: skipping {pull_secret()} in {ns}")
 
     secrets = Path(args.secrets)
     if not secrets.is_file() or not secrets.stat().st_size:
@@ -591,14 +739,14 @@ def upstream_record(config: Path, env: str) -> str:
     """
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
                  cwd=config, capture=True).stdout.strip()
-    cp = run(["git", "show", f"origin/{branch}:{SHA_RECORD_DIR}/{env}.sha"],
+    cp = run(["git", "show", f"origin/{branch}:{sha_record_dir()}/{env}.sha"],
              cwd=config, check=False, capture=True)
     return cp.stdout.strip() if cp.returncode == 0 else ""
 
 
 def cmd_commit(args) -> None:
     config, app_dir = Path(args.config_dir), Path(args.app_dir) if args.app_dir else None
-    record = config / SHA_RECORD_DIR / f"{args.env}.sha"
+    record = config / sha_record_dir() / f"{args.env}.sha"
 
     if record.is_file():
         guard_ordering(record.read_text().strip(), args.sha, app_dir, args.env)
@@ -756,6 +904,32 @@ def cmd_promote(args) -> None:
 # --------------------------------------------------------------------------------------
 # preflight
 # --------------------------------------------------------------------------------------
+def cmd_config(args) -> None:
+    """Expose platform.env.yaml to the workflow, so the YAML holds no infrastructure value.
+
+    `--export` prints KEY=value lines the workflow appends to $GITHUB_ENV. The one thing
+    that CANNOT come from here is `runs-on`: GitHub resolves it before any step executes,
+    so runner labels have to be a repository variable. That is still configuration rather
+    than code, but it is a second place to edit and the docs must say so.
+    """
+    if args.get:
+        value = CONFIG.get(args.get)
+        if value is None:
+            raise SystemExit(f"no such key in platform.env.yaml: {args.get}")
+        print(value)
+        return
+    if args.export:
+        table = CONFIG.for_env(args.env)
+        for key in ("git.org", "registry.host", "registry.path", "registry.pull_secret",
+                    "kubernetes.state_namespace", "ingress.gateway_name"):
+            if key in table:
+                print(f"{key.replace('.', '_').upper()}={table[key]}")
+        pattern = CONFIG.get("git.config_repo_pattern", "{app}-config")
+        print(f"CONFIG_REPO_PATTERN={pattern}")
+        return
+    print(json.dumps(CONFIG.data, indent=2, sort_keys=True))
+
+
 def cmd_image_plan(args) -> None:
     """Print {workload: image ref} as JSON, for an app's CI to build against.
 
@@ -795,6 +969,9 @@ def cmd_preflight(args) -> None:
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Global: every subcommand may need an infrastructure value, and none of them should
+    # ever have one baked in.
+    ap.add_argument("--env-config", help="path to platform.env.yaml")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_state_flags(p):
@@ -806,7 +983,10 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--app", required=True)
         p.add_argument("--image", help="Harbor image name; defaults to --app")
         p.add_argument("--tag", required=True, help="image tag, normally the commit SHA")
-        p.add_argument("--registry", default="registry.staging.internal.dev/platform-images")
+        # No default: the registry is infrastructure, so it comes from platform.env.yaml
+        # via the workflow. A hardcoded fallback here is exactly how a deploy ends up
+        # pushing to the wrong company's registry.
+        p.add_argument("--registry", required=True)
         p.add_argument(
             "--tag-strategy", choices=("commit", "content"), default="commit",
             help="commit: every workload gets --tag. content: each workload gets the hash of "
@@ -819,6 +999,13 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--work", required=paths_required, help="scratch dir for this render")
         p.add_argument("--kubeconfig")
         add_state_flags(p)
+
+    p = sub.add_parser("config", help="read platform.env.yaml (for the workflow to consume)")
+    p.add_argument("--get", help="dotted key, e.g. registry.path")
+    p.add_argument("--export", action="store_true",
+                   help="print KEY=value lines for $GITHUB_ENV")
+    p.add_argument("--env", default="staging")
+    p.set_defaults(func=cmd_config)
 
     p = sub.add_parser("image-plan", help="print the workload -> image map this app renders to")
     p.add_argument("--app", required=True)
@@ -867,6 +1054,8 @@ def main(argv: list[str] | None = None) -> None:
     p.set_defaults(func=cmd_promote)
 
     args = ap.parse_args(argv)
+    global CONFIG
+    CONFIG = EnvConfig.load(args.env_config)
     if getattr(args, "image", None) is None and hasattr(args, "app"):
         args.image = args.app
     args.func(args)

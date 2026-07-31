@@ -1,7 +1,7 @@
 - uri: template://custom/dns
   type: dns
   outputs: |
-    host: {{ .SourceWorkload }}.staging.internal.dev
+    host: {{ .SourceWorkload }}.%%env.domain%%
 - uri: template://custom/route-traefik
   type: route
   init: |
@@ -29,8 +29,8 @@
           app.kubernetes.io/name: {{ .State.routeName }}
       spec:
         parentRefs:
-        - name: ingress-gateway      # <-- gateway thật của cụm bạn
-          namespace: traefik
+        - name: %%ingress.gateway_name%%
+          namespace: %%ingress.gateway_namespace%%
         hostnames:
         - {{ .Params.host | quote }}
         rules:
@@ -114,7 +114,7 @@
             automountServiceAccountToken: false
             containers:
             - name: postgres-db
-              image:  ghcr.io/pr3s3nt/postgres:17-alpine   # <-- SANDBOX: mirror GHCR thay image Harbor
+              image:  %%images.postgres%%
               ports:
               - name: postgres
                 containerPort: 5432
@@ -167,7 +167,7 @@
               app.kubernetes.io/instance: {{ .State.service }}
           spec:
             accessModes: ["ReadWriteOnce"]
-            storageClassName:  storage-class
+            storageClassName:  %%kubernetes.storage_class%%
             resources:
               requests:
                 storage: 1Gi

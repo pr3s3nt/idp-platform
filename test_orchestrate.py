@@ -17,6 +17,9 @@ import yaml
 import orchestrate as orc
 
 CATALOG = Path(__file__).parent
+# Tests render the real catalog, which now carries %%placeholders%%. Load the repo's own
+# environment config so substitution has values — same file the workflow passes in.
+orc.CONFIG = orc.EnvConfig.load(str(CATALOG / "platform.env.yaml"))
 HAS_SCORE_K8S = shutil.which("score-k8s") is not None
 needs_score_k8s = pytest.mark.skipif(not HAS_SCORE_K8S, reason="score-k8s not installed")
 
@@ -202,7 +205,7 @@ def test_commit_refuses_out_of_order_deploy(tmp_path, repo_with_two_commits):
     Without this guard the config repo silently regresses to the older SHA."""
     app, old, new = repo_with_two_commits
     config = make_config_repo(tmp_path)
-    record = config / orc.SHA_RECORD_DIR / "staging.sha"
+    record = config / orc.sha_record_dir() / "staging.sha"
     record.parent.mkdir(parents=True)
     record.write_text(new + "\n")
 
@@ -217,7 +220,7 @@ def test_commit_refuses_out_of_order_deploy(tmp_path, repo_with_two_commits):
 def test_commit_allows_newer_deploy(tmp_path, repo_with_two_commits):
     app, old, new = repo_with_two_commits
     config = make_config_repo(tmp_path)
-    record = config / orc.SHA_RECORD_DIR / "staging.sha"
+    record = config / orc.sha_record_dir() / "staging.sha"
     record.parent.mkdir(parents=True)
     record.write_text(old + "\n")
 
@@ -434,7 +437,7 @@ def branch_of(repo: Path) -> str:
 
 
 def record_deploy(repo: Path, env: str, sha: str, msg: str) -> None:
-    rec = repo / orc.SHA_RECORD_DIR / f"{env}.sha"
+    rec = repo / orc.sha_record_dir() / f"{env}.sha"
     rec.parent.mkdir(parents=True, exist_ok=True)
     rec.write_text(sha + "\n")
     git(repo, "add", ".")
@@ -467,7 +470,7 @@ def test_commit_refuses_stale_render_after_remote_moved_ahead(tmp_path, repo_wit
 
     # And the remote still holds the newer deploy — nothing was rolled back.
     up = f"origin/{branch_of(other)}"
-    assert git(other, "show", f"{up}:{orc.SHA_RECORD_DIR}/staging.sha").strip() == new
+    assert git(other, "show", f"{up}:{orc.sha_record_dir()}/staging.sha").strip() == new
 
 
 def test_commit_rebases_when_concurrent_change_is_unrelated(tmp_path, repo_with_two_commits):
@@ -492,7 +495,7 @@ def test_commit_rebases_when_concurrent_change_is_unrelated(tmp_path, repo_with_
     # Both changes survived.
     git(config, "fetch", "-q", "origin")
     up = f"origin/{branch_of(config)}"
-    assert git(config, "show", f"{up}:{orc.SHA_RECORD_DIR}/staging.sha").strip() == new
+    assert git(config, "show", f"{up}:{orc.sha_record_dir()}/staging.sha").strip() == new
     assert "namespace" in git(config, "show", f"{up}:staging/fleet.yaml")
 
 
@@ -688,3 +691,57 @@ def test_promote_from_staging_leaves_datastore_images_alone(tmp_path):
     got = {d["metadata"]["name"]: d["spec"]["template"]["spec"]["containers"][0]["image"]
            for d in orc.load_all(config / "prod" / "manifests.yaml")}
     assert got["pg-x"] == "r.io/p/postgres:17-alpine"
+
+
+# ------------------------------------------------------------------- environment config
+def cfg(**over) -> orc.EnvConfig:
+    base = {
+        "ingress": {"gateway_name": "gw", "gateway_namespace": "ns"},
+        "kubernetes": {"storage_class": "sc"},
+        "environments": {"staging": {"replicas": 1, "domain": "stg.example"},
+                         "prod": {"replicas": 3, "domain": "prod.example"}},
+    }
+    return orc.EnvConfig(orc._deep_merge(base, over))
+
+
+def test_config_exposes_the_chosen_environment_under_env_prefix():
+    c = cfg()
+    assert c.for_env("staging")["env.replicas"] == 1
+    assert c.for_env("prod")["env.replicas"] == 3
+    # shared values are visible in both
+    assert c.for_env("prod")["ingress.gateway_name"] == "gw"
+
+
+def test_config_substitutes_placeholders_per_environment():
+    c = cfg()
+    text = "gw=%%ingress.gateway_name%% n=%%env.replicas%% d=%%env.domain%%"
+    assert c.render(text, "staging", where="t") == "gw=gw n=1 d=stg.example"
+    assert c.render(text, "prod", where="t") == "gw=gw n=3 d=prod.example"
+
+
+def test_config_leaves_go_templates_alone():
+    """Provisioners are Go templates owned by score-k8s. The substitution must not touch
+    {{ }} or ${ }, or it would corrupt the very files it is preparing."""
+    text = "{{ .SourceWorkload }}.%%env.domain%% and ${resources.db.host}"
+    assert cfg().render(text, "staging", where="t") == "{{ .SourceWorkload }}.stg.example and ${resources.db.host}"
+
+
+def test_unknown_placeholder_is_fatal_not_silent():
+    """A typo'd key must not render as empty text. Every infrastructure mistake in this
+    project failed silently — a wrong gateway name simply never attaches a route."""
+    with pytest.raises(SystemExit, match="unknown placeholder"):
+        cfg().render("%%ingress.gatway_name%%", "staging", where="provisioners/x.yaml")
+
+
+def test_config_file_overrides_defaults_without_dropping_them(tmp_path):
+    f = tmp_path / "platform.env.yaml"
+    f.write_text("registry:\n  path: r.io/team\n")
+    c = orc.EnvConfig.load(str(f))
+    assert c.get("registry.path") == "r.io/team"
+    # untouched default survives the merge
+    assert c.get("kubernetes.sha_record_dir") == ".platform"
+
+
+def test_missing_config_file_is_fatal():
+    with pytest.raises(SystemExit, match="env config not found"):
+        orc.EnvConfig.load("/nope/platform.env.yaml")

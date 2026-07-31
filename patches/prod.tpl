@@ -4,14 +4,14 @@
   Same rules as staging.tpl: skip datastores, only set resources when the container
   doesn't already declare them, pull secret configured via $pullSecret (CronJobs too).
 */}}
-{{ $pullSecret := "registry-pull" }}{{/* <-- CONFIG: pull secret name for prod */}}
+{{ $pullSecret := "%%registry.pull_secret%%" }}{{/* <-- CONFIG: pull secret name for prod */}}
 {{ range $i, $m := .Manifests }}
 {{- $component := "" }}
 {{- if $m.metadata }}{{ if $m.metadata.labels }}{{ with index $m.metadata.labels "app.kubernetes.io/component" }}{{ $component = . }}{{ end }}{{ end }}{{ end }}
 {{ if and (eq $m.kind "Deployment") (ne $component "datastore") }}
 - op: set
   path: {{ $i }}.spec.replicas
-  value: 3
+  value: %%env.replicas%%
 - op: set
   path: {{ $i }}.metadata.labels.env
   value: prod
@@ -26,8 +26,8 @@
 - op: set
   path: {{ $i }}.spec.template.spec.containers.{{ $ci }}.resources
   value:
-    requests: { cpu: 100m, memory: 128Mi }
-    limits: { memory: 512Mi }
+    requests: { cpu: %%env.cpu_request%%, memory: %%env.memory_request%% }
+    limits: { memory: %%env.memory_limit%% }
 {{- end }}
 {{ end }}
 {{ end }}

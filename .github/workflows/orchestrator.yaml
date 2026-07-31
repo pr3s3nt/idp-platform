@@ -62,15 +62,15 @@ on:
         description: "Harbor image name (defaults to app)"
         required: false
 
+# NO INFRASTRUCTURE VALUES HERE. Everything below is read from platform.env.yaml by the
+# "Load environment config" step and exported into the job environment. Moving this
+# platform to another cluster is a config edit, never a workflow edit.
+#
+# The ONE exception is `runs-on`: GitHub resolves it before any step runs, so it cannot
+# come from a file. It reads a repository variable instead — still configuration rather
+# than code, but a second place to set. Settings > Actions > Variables > RUNNER_LABEL.
 env:
-  # SANDBOX: a personal github.com account stands in for the GitHub Enterprise org.
-  ORG: pr3s3nt
-  # Repos in this org are all idp-prefixed (idp-sample-nginx, idp-sample-nginx-config),
-  # while `app` stays unprefixed (sample-nginx) so namespaces read sample-nginx-staging.
-  CONFIG_PREFIX: idp-
-  # SANDBOX: GHCR stands in for Harbor. Matches the Postgres image path already used by
-  # provisioners/local.provisioners.yaml.
-  REGISTRY: ghcr.io/pr3s3nt
+  ENV_CONFIG: platform/platform.env.yaml
 
 jobs:
   # ===========================================================================
@@ -78,7 +78,7 @@ jobs:
   # ===========================================================================
   deploy:
     if: github.event_name == 'workflow_dispatch' || github.event.action == 'deploy-request'
-    runs-on: [self-hosted, platform-orchestrator]
+    runs-on: [self-hosted, "${{ vars.RUNNER_LABEL || 'platform-orchestrator' }}"]
     # CONCURRENCY: every run touching the SAME APP queues sequentially. This does two jobs:
     # it stops two quick commits rendering in parallel and writing the config repo out of
     # order, and it serializes the read-modify-write of that app's state Secret. Different
@@ -101,6 +101,16 @@ jobs:
         with:
           path: platform
 
+      - name: Load environment config
+        run: |
+          set -euo pipefail
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
+          echo "REGISTRY=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get registry.path)" >> "$GITHUB_ENV"
+          echo "ORG=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
+          # Tên repo cấu hình suy ra từ mẫu trong platform.env.yaml, không gắn cứng tiền tố.
+          PATTERN=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
+          echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
+
       # PHẢI đứng trước Preflight: preflight --require-cluster đọc chính file này. Nếu ghi
       # sau, trên runner sạch file chưa tồn tại nên kubectl bỏ qua KUBECONFIG và rơi về
       # localhost:8080; còn trên runner đã chạy rồi thì nó lặng lẽ dùng kubeconfig CŨ còn
@@ -116,7 +126,7 @@ jobs:
           echo "$PROD_B64"    | base64 -d > cluster-config-prod
 
       - name: Preflight
-        run: python3 platform/orchestrate.py preflight --require-cluster
+        run: python3 platform/orchestrate.py --env-config "$ENV_CONFIG" preflight --require-cluster
         env:
           KUBECONFIG: ${{ github.workspace }}/cluster-config-staging
 
@@ -149,13 +159,13 @@ jobs:
       - name: Checkout config repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.ORG }}/${{ env.CONFIG_PREFIX }}${{ env.APP }}-config
+          repository: ${{ env.ORG }}/${{ env.CONFIG_REPO_NAME }}
           token: ${{ secrets.CONFIG_REPO_TOKEN }}
           path: config
 
       - name: Render staging
         run: |
-          python3 platform/orchestrate.py render \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" render \
             --app "$APP" --image "$IMAGE" --tag "$SHA" --env staging \
             --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
             --catalog catalog --app-dir app --work work-staging \
@@ -170,7 +180,7 @@ jobs:
             echo "==> prod already bootstrapped, leaving it alone"
             exit 0
           fi
-          python3 platform/orchestrate.py render \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" render \
             --app "$APP" --image "$IMAGE" --tag "$SHA" --env prod \
             --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
             --catalog catalog --app-dir app --work work-prod \
@@ -179,7 +189,7 @@ jobs:
 
       - name: Apply secrets (staging)
         run: |
-          python3 platform/orchestrate.py apply-secrets \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" apply-secrets \
             --app "$APP" --env staging --secrets work-staging/secrets.yaml \
             --harbor-host "${{ secrets.REGISTRY_HOST }}" \
             --harbor-user "${{ secrets.REGISTRY_USER }}" \
@@ -189,7 +199,7 @@ jobs:
       - name: Apply secrets (prod, if bootstrapped this run)
         run: |
           [ -d work-prod ] || { echo "==> prod not rendered this run"; exit 0; }
-          python3 platform/orchestrate.py apply-secrets \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" apply-secrets \
             --app "$APP" --env prod --secrets work-prod/secrets.yaml \
             --harbor-host "${{ secrets.REGISTRY_HOST }}" \
             --harbor-user "${{ secrets.REGISTRY_USER }}" \
@@ -198,7 +208,7 @@ jobs:
 
       - name: Commit & push config repo
         run: |
-          python3 platform/orchestrate.py commit \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env staging --sha "$SHA" \
             --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}"
 
@@ -256,7 +266,7 @@ jobs:
   # ===========================================================================
   promote:
     if: github.event.action == 'promote-request'
-    runs-on: [self-hosted, platform-orchestrator]
+    runs-on: [self-hosted, "${{ vars.RUNNER_LABEL || 'platform-orchestrator' }}"]
     # SEPARATE queue from deploy, on purpose. GitHub keeps only ONE run pending per
     # concurrency group: queueing a third run CANCELS the one already waiting. Sharing the
     # deploy queue therefore meant a burst of pushes could silently cancel a queued
@@ -282,13 +292,23 @@ jobs:
         with:
           path: platform
 
+      - name: Load environment config
+        run: |
+          set -euo pipefail
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
+          echo "REGISTRY=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get registry.path)" >> "$GITHUB_ENV"
+          echo "ORG=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
+          # Tên repo cấu hình suy ra từ mẫu trong platform.env.yaml, không gắn cứng tiền tố.
+          PATTERN=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
+          echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
+
       - name: Preflight
-        run: python3 platform/orchestrate.py preflight
+        run: python3 platform/orchestrate.py --env-config "$ENV_CONFIG" preflight
 
       - name: Checkout config repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.ORG }}/${{ env.CONFIG_PREFIX }}${{ env.APP }}-config
+          repository: ${{ env.ORG }}/${{ env.CONFIG_REPO_NAME }}
           token: ${{ secrets.CONFIG_REPO_TOKEN }}
           path: config
 
@@ -336,7 +356,7 @@ jobs:
       - name: Promote (from-staging)
         if: github.event.client_payload.mode == 'from-staging'
         run: |
-          python3 platform/orchestrate.py promote \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" promote \
             --app "$APP" --image "$IMAGE" --tag "$TAG" --mode from-staging \
             --config-dir config
 
@@ -345,14 +365,14 @@ jobs:
       - name: Promote (tag-only)
         if: github.event.client_payload.mode == 'tag-only'
         run: |
-          python3 platform/orchestrate.py promote \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" promote \
             --app "$APP" --image "$IMAGE" --tag "$TAG" --mode tag-only \
             --config-dir config
 
       - name: Promote (re-render)
         if: github.event.client_payload.mode == 're-render'
         run: |
-          python3 platform/orchestrate.py promote \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" promote \
             --app "$APP" --image "$IMAGE" --tag "$TAG" --mode re-render \
             --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" --config-dir config \
             --catalog catalog --app-dir app --work work-prod \
@@ -361,7 +381,7 @@ jobs:
       - name: Apply secrets (re-render only)
         if: github.event.client_payload.mode == 're-render'
         run: |
-          python3 platform/orchestrate.py apply-secrets \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" apply-secrets \
             --app "$APP" --env prod --secrets work-prod/secrets.yaml \
             --harbor-host "${{ secrets.REGISTRY_HOST }}" \
             --harbor-user "${{ secrets.REGISTRY_USER }}" \
@@ -372,7 +392,7 @@ jobs:
       # this tag is older than what prod already runs, and promotes silently roll back.
       - name: Commit & push config repo
         run: |
-          python3 platform/orchestrate.py commit \
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app
 
       - name: Scrub kubeconfig

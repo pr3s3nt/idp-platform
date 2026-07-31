@@ -15,14 +15,14 @@
     (staging.tpl and prod.tpl are separate files). The orchestrator creates that secret
     create-if-missing in each namespace.
 */}}
-{{ $pullSecret := "registry-pull" }}{{/* <-- CONFIG: pull secret name for staging */}}
+{{ $pullSecret := "%%registry.pull_secret%%" }}{{/* <-- CONFIG: pull secret name for staging */}}
 {{ range $i, $m := .Manifests }}
 {{- $component := "" }}
 {{- if $m.metadata }}{{ if $m.metadata.labels }}{{ with index $m.metadata.labels "app.kubernetes.io/component" }}{{ $component = . }}{{ end }}{{ end }}{{ end }}
 {{ if and (eq $m.kind "Deployment") (ne $component "datastore") }}
 - op: set
   path: {{ $i }}.spec.replicas
-  value: 1
+  value: %%env.replicas%%
 - op: set
   path: {{ $i }}.metadata.labels.env
   value: staging
@@ -37,8 +37,8 @@
 - op: set
   path: {{ $i }}.spec.template.spec.containers.{{ $ci }}.resources
   value:
-    requests: { cpu: 50m, memory: 64Mi }
-    limits: { memory: 256Mi }
+    requests: { cpu: %%env.cpu_request%%, memory: %%env.memory_request%% }
+    limits: { memory: %%env.memory_limit%% }
 {{- end }}
 {{ end }}
 {{ end }}
