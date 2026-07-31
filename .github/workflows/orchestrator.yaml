@@ -92,6 +92,20 @@ jobs:
         with:
           path: platform
 
+      # PHẢI đứng trước Preflight: preflight --require-cluster đọc chính file này. Nếu ghi
+      # sau, trên runner sạch file chưa tồn tại nên kubectl bỏ qua KUBECONFIG và rơi về
+      # localhost:8080; còn trên runner đã chạy rồi thì nó lặng lẽ dùng kubeconfig CŨ còn
+      # sót trong workspace — preflight xanh nhưng đang kiểm tra nhầm cụm.
+      - name: Write kubeconfigs
+        env:
+          STAGING_B64: ${{ secrets.KUBECONFIG_STAGING }}
+          PROD_B64: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "$STAGING_B64" | base64 -d > cluster-config-staging
+          echo "$PROD_B64"    | base64 -d > cluster-config-prod
+
       - name: Preflight
         run: python3 platform/orchestrate.py preflight --require-cluster
         env:
@@ -129,16 +143,6 @@ jobs:
           repository: ${{ env.ORG }}/${{ env.CONFIG_PREFIX }}${{ env.APP }}-config
           token: ${{ secrets.CONFIG_REPO_TOKEN }}
           path: config
-
-      - name: Write kubeconfigs
-        env:
-          STAGING_B64: ${{ secrets.KUBECONFIG_STAGING }}
-          PROD_B64: ${{ secrets.KUBECONFIG_PROD }}
-        run: |
-          set -euo pipefail
-          umask 077
-          echo "$STAGING_B64" | base64 -d > cluster-config-staging
-          echo "$PROD_B64"    | base64 -d > cluster-config-prod
 
       - name: Render staging
         run: |
