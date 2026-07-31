@@ -964,3 +964,51 @@ def test_committer_identity_never_uses_github_noreply(tmp_path, repo_with_two_co
     email = git(config, "log", "-1", "--format=%ae")
     assert "users.noreply.github.com" not in email, (
         f"committer email {email} would be attributed to a real GitHub account")
+
+
+# ------------------------------------------------------------------ app-owned secrets
+@needs_score_k8s
+def test_secret_resource_becomes_a_reference_never_a_value(tmp_path):
+    """Platform-generated secrets (a Postgres password) were already safe. An app's OWN
+    secret — a third-party API key — had no mechanism at all, so the only option was
+    writing it into score.yaml, which puts it in the app's git AND in the config repo as
+    plaintext. `type: secret` closes that: score names the Secret and key, the renderer
+    emits a secretKeyRef, and the value never touches the platform."""
+    app = tmp_path / "app"
+    write(app / "score.yaml", {
+        "apiVersion": "score.dev/v1b1",
+        "metadata": {"name": "payapp"},
+        "containers": {"web": {"image": ".", "variables": {
+            "LOG_LEVEL": "info",
+            "STRIPE_API_KEY": "${resources.stripe.value}"}}},
+        "service": {"ports": {"http": {"port": 80, "targetPort": 80}}},
+        "resources": {"stripe": {"type": "secret",
+                                 "params": {"name": "stripe-credentials", "key": "api_key"}}},
+    })
+    docs = render_app(tmp_path, app, "staging", name="payapp")
+    dep = next(d for d in docs if d["kind"] == "Deployment")
+    env = {e["name"]: e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+    # Non-secret config stays a plain value — it belongs in git and is reviewable.
+    assert env["LOG_LEVEL"]["value"] == "info"
+    # The secret is a reference, with no value anywhere in what git will hold.
+    assert env["STRIPE_API_KEY"]["valueFrom"]["secretKeyRef"] == {
+        "name": "stripe-credentials", "key": "api_key"}
+    assert "value" not in env["STRIPE_API_KEY"]
+    assert "stripe-credentials" in yaml.safe_dump(docs)   # only the NAME travels
+
+
+@needs_score_k8s
+def test_secret_resource_requires_name_and_key(tmp_path):
+    """A missing key must fail at render. Rendering a half-formed reference would surface
+    much later as a pod stuck in CreateContainerConfigError."""
+    app = tmp_path / "app"
+    write(app / "score.yaml", {
+        "apiVersion": "score.dev/v1b1",
+        "metadata": {"name": "payapp"},
+        "containers": {"web": {"image": ".", "variables": {"K": "${resources.s.value}"}}},
+        "service": {"ports": {"http": {"port": 80, "targetPort": 80}}},
+        "resources": {"s": {"type": "secret", "params": {"name": "only-name"}}},
+    })
+    with pytest.raises(subprocess.CalledProcessError):
+        render_app(tmp_path, app, "staging", name="payapp")
