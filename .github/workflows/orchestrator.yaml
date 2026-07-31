@@ -193,6 +193,30 @@ jobs:
             --config-dir config --app "$APP" --env staging --sha "$SHA" \
             --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}"
 
+      # CONVERGENCE CHECK. GitHub keeps only one run pending per concurrency group, so a
+      # burst of pushes can leave the newest commit's run CANCELLED — and a cancelled run
+      # is not a failed one, so nothing anywhere goes red while staging quietly sits an
+      # older commit behind main. The app repos collapse bursts before dispatching, but
+      # that is their workflow, not ours; this is the platform noticing for itself.
+      # Deliberately a warning, not a failure: this deploy did exactly what it was asked to.
+      - name: Check staging reached the tip of the app branch
+        id: converged
+        run: |
+          set -euo pipefail
+          TIP=$(git -C app ls-remote origin HEAD | cut -f1)
+          echo "tip=$TIP" >> "$GITHUB_OUTPUT"
+          if [ -z "$TIP" ] || [ "$TIP" = "$SHA" ]; then
+            echo "==> staging is at the tip of the app branch"
+            exit 0
+          fi
+          git -C app fetch -q origin "$TIP" 2>/dev/null || true
+          if git -C app merge-base --is-ancestor "$SHA" "$TIP" 2>/dev/null; then
+            echo "::warning::staging deployed ${SHA} but ${APP} is now at ${TIP}. A newer run was most likely superseded in the concurrency queue — re-dispatch that commit to catch up."
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "==> ${TIP} is not a descendant of ${SHA} (branch moved sideways) — nothing to report"
+          fi
+
       - name: Summary
         if: always()
         run: |
@@ -207,6 +231,11 @@ jobs:
             echo "| namespace | \`${APP}-staging\` |"
             echo "| config repo | \`${ORG}/${CONFIG_PREFIX}${APP}-config\` |"
             echo "| runner | \`${RUNNER_NAME}\` |"
+            if [ "${{ steps.converged.outputs.behind }}" = "true" ]; then
+              echo ""
+              echo "> ⚠️ **staging is behind \`${APP}\`'s branch tip** (\`${{ steps.converged.outputs.tip }}\`)."
+              echo "> A newer deploy was superseded in the concurrency queue. Re-dispatch that commit."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Scrub kubeconfigs
