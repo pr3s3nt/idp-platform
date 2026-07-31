@@ -776,18 +776,6 @@ def cmd_commit(args) -> None:
     record.parent.mkdir(parents=True, exist_ok=True)
     record.write_text(args.sha + "\n")
 
-    run(["git", "config", "user.name", "platform-orchestrator"], cwd=config)
-    run(["git", "config", "user.email", "ci-bot@users.noreply.github.com"], cwd=config)
-    run(["git", "add", "."], cwd=config)
-    if run(["git", "diff", "--cached", "--quiet"], cwd=config, check=False).returncode == 0:
-        log("no manifest changes")
-        return
-
-    msg = f"deploy({args.app}): {args.env} {args.sha}"
-    if args.catalog_ref:
-        msg += f" (catalog: {args.catalog_ref})"
-    run(["git", "commit", "-m", msg], cwd=config)
-
     # Branch and review requirement come from platform.env.yaml, read HERE rather than
     # compared as strings in the workflow YAML. `require_pr: "true"` written as a string
     # instead of a boolean would silently fail a YAML string comparison and push straight
@@ -809,6 +797,34 @@ def cmd_commit(args) -> None:
         )
     via_pr = getattr(args, "via_pr", False) or bool(
         CONFIG.get(f"environments.{args.env}.require_pr", False))
+
+    run(["git", "config", "user.name", "platform-orchestrator"], cwd=config)
+    run(["git", "config", "user.email", "ci-bot@users.noreply.github.com"], cwd=config)
+    run(["git", "add", "."], cwd=config)
+    nothing_staged = run(["git", "diff", "--cached", "--quiet"],
+                         cwd=config, check=False).returncode == 0
+
+    # "Nothing new to stage" is NOT the same as "nothing to do". A previous attempt may have
+    # committed and then failed to push; returning here would leave that commit stranded and
+    # report success, so re-running a broken deploy would fix nothing. Check for unpushed
+    # work before giving up.
+    run(["git", "fetch", "origin", base], cwd=config, check=False)
+    unpushed = run(["git", "rev-list", "--count", f"origin/{base}..HEAD"],
+                   cwd=config, check=False, capture=True)
+    ahead = unpushed.returncode == 0 and unpushed.stdout.strip() not in ("", "0")
+
+    if nothing_staged and not ahead:
+        log("no manifest changes")
+        return
+    if not nothing_staged:
+        msg = f"deploy({args.app}): {args.env} {args.sha}"
+        if args.catalog_ref:
+            msg += f" (catalog: {args.catalog_ref})"
+        run(["git", "commit", "-m", msg], cwd=config)
+    else:
+        msg = f"deploy({args.app}): {args.env} {args.sha}"
+        log(f"nothing new to commit, but {unpushed.stdout.strip()} commit(s) never reached "
+            f"origin/{base} -> pushing those")
 
     # Environments whose branch requires review never get a direct push. The bot puts the
     # change on its own branch and opens a PR; a person reads the manifest diff and merges.
@@ -832,9 +848,15 @@ def cmd_commit(args) -> None:
         print(url)
         return
 
+    # Push EXPLICITLY to the branch we validated, never a bare `git push`. A bare push
+    # depends on tracking configuration: a branch checked out without an upstream fails
+    # with "no upstream branch", which the retry below then misreads as "somebody pushed
+    # first" and sends into a rebase that cannot work. Naming the target also removes any
+    # chance of publishing to whatever branch tracking happens to point at.
     for attempt in (1, 2, 3):
-        if run(["git", "push"], cwd=config, check=False).returncode == 0:
-            log("pushed")
+        if run(["git", "push", "origin", f"HEAD:{base}"],
+               cwd=config, check=False).returncode == 0:
+            log(f"pushed to {base}")
             return
         if attempt == 3:
             raise SystemExit("push failed after 3 attempts")
@@ -848,7 +870,8 @@ def cmd_commit(args) -> None:
         run(["git", "fetch", "origin"], cwd=config)
         guard_ordering(upstream_record(config, args.env, base), args.sha, app_dir, args.env)
 
-        rebase = run(["git", "pull", "--rebase"], cwd=config, check=False, capture=True)
+        rebase = run(["git", "pull", "--rebase", "origin", base],
+                     cwd=config, check=False, capture=True)
         if rebase.returncode != 0:
             # Usually a genuine conflict, or a branch with no upstream. Either way the
             # retry loop cannot make progress, so fail with the reason rather than a traceback.

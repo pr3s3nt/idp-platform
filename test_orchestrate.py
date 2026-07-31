@@ -860,3 +860,26 @@ def test_branch_mismatch_between_checkout_and_config_is_fatal(tmp_path, repo_wit
             config_dir=str(config), app="a", env="staging", sha=new,
             app_dir=str(app), catalog_ref=None,
         ))
+
+
+def test_rerun_pushes_a_commit_stranded_by_an_earlier_failed_push(tmp_path, repo_with_two_commits, no_branch_config):
+    """Found while testing for real: a push failed, leaving a local commit behind. The
+    re-run staged nothing new, hit the "no manifest changes" early return, and did nothing
+    — so re-running a broken deploy could never fix it. Hand-replay is a design goal, so
+    unpushed work must still reach the remote."""
+    app, _old, new = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+    base = branch_of(config)
+
+    # Simulate the aftermath of a failed push: committed locally, remote untouched.
+    (config / "staging" / "manifests.yaml").write_text("rendered\n")
+    git(config, "add", ".")
+    git(config, "commit", "-qm", "deploy(a): staging " + new)
+    before = git(config, "rev-parse", f"origin/{base}")
+
+    # Nothing new to stage this time.
+    orc.cmd_commit(orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="staging", sha=new,
+        app_dir=str(app), catalog_ref=None,
+    ))
+    assert git(config, "rev-parse", f"origin/{base}") != before, "stranded commit never pushed"
