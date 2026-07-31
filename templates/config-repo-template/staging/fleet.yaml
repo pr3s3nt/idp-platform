@@ -4,3 +4,22 @@
 # Replace <app> with the app name, e.g. sample-nginx.
 namespace: <app>-staging
 defaultNamespace: <app>-staging
+# Fleet deploy Bundle dưới dạng Helm release, và Helm LUÔN đóng dấu
+# app.kubernetes.io/managed-by=Helm lên object nó apply. score-k8s lại ghi
+# managed-by=score-k8s vào manifest, nên live và desired lệch nhau đúng một label này
+# VĨNH VIỄN: Bundle đứng ở Modified, không bao giờ Ready — xảy ra với mọi app.
+# Bỏ qua label đó khi so sánh là cách sửa; không có gì khác thực sự drift.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    operations:
+    - {op: remove, path: /metadata/labels/app.kubernetes.io~1managed-by}
+  - apiVersion: apps/v1
+    kind: StatefulSet
+    operations:
+    - {op: remove, path: /metadata/labels/app.kubernetes.io~1managed-by}
+  - apiVersion: v1
+    kind: Service
+    operations:
+    - {op: remove, path: /metadata/labels/app.kubernetes.io~1managed-by}
