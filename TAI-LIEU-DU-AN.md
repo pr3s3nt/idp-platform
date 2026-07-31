@@ -210,7 +210,8 @@ Hai chế độ thăng cấp:
 
 | Chế độ | Làm gì | Khi nào dùng |
 |---|---|---|
-| `tag-only` | Chỉ đổi số phiên bản image trên manifest hiện có | Nhanh, dùng cho hầu hết trường hợp |
+| `from-staging` | Sao chép đúng tập ảnh staging đang chạy sang production | **Ứng dụng nhiều service** — xem mục 6.6 |
+| `tag-only` | Đổi mọi ảnh sang cùng một nhãn | Ứng dụng một service |
 | `re-render` | Sinh lại toàn bộ từ commit đó, theo đúng chuẩn commit đó ghim | Khi cần dựng lại chính xác lịch sử |
 
 ### 5.7. Fleet kéo, không đẩy
@@ -327,7 +328,51 @@ hơn 4 người push cách nhau vài giây.** Cùng lúc thì Git từ chối 3 
 thắng gộp cả 4 commit thành một lần triển khai. Cách nhau vài giây mới sinh ra 4 lần triển
 khai riêng và kích hoạt cơ chế huỷ hàng đợi.
 
-### 6.6. Xây bản OnlineBoutique từ mã nguồn
+### 6.6. Một service đổi thì cả 11 service build lại và khởi động lại
+
+Phát hiện khi rà soát: commit gần nhất của kho boutique **chỉ sửa file cấu hình CI**, không
+đụng một dòng mã service nào. Kết quả đo được:
+
+| Hiện tượng | Số đo |
+|---|---|
+| Số service build lại | **11/11** (~13 phút máy chủ) |
+| Số ứng dụng khởi động lại | **11/11**, kể cả trên production |
+| Số dòng thay đổi trong file cấu hình | 304 dòng — trong đó chỉ 22 dòng có ý nghĩa |
+
+Nguyên nhân nằm ở một dòng: **nhãn phiên bản của ảnh (image tag) lấy theo mã commit của cả
+kho**. Kho có commit mới → mọi service đổi nhãn → mọi file cấu hình đổi → Kubernetes coi như
+mọi service đều đổi và khởi động lại tất cả.
+
+Còn 304 dòng thay đổi là do **thứ tự các mục trong file không ổn định** giữa hai lần sinh —
+lần này `currency` đứng đầu, lần sau `ad` đứng đầu. Không đọc nổi lần triển khai đã đổi gì.
+
+Đã sửa ba chỗ:
+
+**(a) Đánh nhãn theo nội dung từng service.** Git vốn đã lưu sẵn một mã băm cho mỗi thư mục,
+và mã đó chỉ đổi khi nội dung bên trong thư mục đổi. Dùng nó làm nhãn:
+
+```
+                     commit này        commit trước (chỉ sửa CI)
+frontend     0851cf67c90ec297...      0851cf67c90ec297...   ← giống nhau
+cart         d6c7892ff616c912...      d6c7892ff616c912...   ← giống nhau
+```
+
+Nội dung không đổi → nhãn không đổi → **ảnh đã có sẵn nên khỏi build**, và **file cấu hình y
+hệt nên ứng dụng không khởi động lại**.
+
+**(b) Sắp xếp cố định** các mục trong file cấu hình, để đọc được lần triển khai đã đổi gì.
+
+**(c) Thêm chế độ thăng cấp `from-staging`.** Khi mỗi service mang một nhãn riêng thì "đưa
+production lên phiên bản X" không còn là một con số — nó là **một tập 11 nhãn**. Chế độ mới
+sao chép đúng tập ảnh mà staging đang chạy sang production. Chế độ cũ vẫn giữ cho ứng dụng
+một service.
+
+Một chi tiết về cách triển khai đáng ghi lại: quy tắc đặt tên ảnh **chỉ được viết ở một chỗ**
+(trong bộ não platform). CI của ứng dụng *hỏi* platform xem phải build ảnh tên gì, thay vì tự
+tính lại. Nếu hai bên tự tính riêng rồi lệch nhau, hệ thống sẽ triển khai một cấu hình trỏ tới
+ảnh chưa ai xây — và chỉ phát hiện được khi ứng dụng chết trên cụm.
+
+### 6.7. Xây bản OnlineBoutique từ mã nguồn
 
 Yêu cầu cuối: mỗi service một Dockerfile, một `score.yaml`, và **build thật** chứ không dùng
 image dựng sẵn.
