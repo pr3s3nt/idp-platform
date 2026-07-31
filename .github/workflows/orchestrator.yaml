@@ -95,6 +95,9 @@ jobs:
       # working unchanged. A repo holding several services should send `content`, so one
       # service's commit stops re-tagging — and therefore restarting — all the others.
       TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || 'commit' }}
+      # Môi trường đích. Mặc định staging: push lên nhánh phát triển của app chỉ đụng
+      # staging. Gửi env=prod khi app merge sang nhánh production.
+      DEPLOY_ENV: ${{ github.event.client_payload.env || 'staging' }}
     steps:
       - name: Checkout platform@main (renderer + workflow)
         uses: actions/checkout@v4
@@ -110,6 +113,16 @@ jobs:
           # Tên repo cấu hình suy ra từ mẫu trong platform.env.yaml, không gắn cứng tiền tố.
           PATTERN=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
           echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
+          # Nhánh của repo cấu hình mà môi trường này ghi vào, và có phải đi qua PR không.
+          # Branch protection là chuyện của tổ chức, nên nó nằm trong cấu hình chứ không
+          # phải trong workflow.
+          ENVNAME="${DEPLOY_ENV:-prod}"
+          BR=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.config_branch" 2>/dev/null \
+               || python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.default_branch)
+          echo "CONFIG_BRANCH=$BR" >> "$GITHUB_ENV"
+          RP=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.require_pr" 2>/dev/null || echo False)
+          echo "REQUIRE_PR=$RP" >> "$GITHUB_ENV"
+          echo "==> $ENVNAME -> nhánh $BR, cần PR: $RP"
 
       # PHẢI đứng trước Preflight: preflight --require-cluster đọc chính file này. Nếu ghi
       # sau, trên runner sạch file chưa tồn tại nên kubectl bỏ qua KUBECONFIG và rơi về
@@ -160,22 +173,35 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.ORG }}/${{ env.CONFIG_REPO_NAME }}
+          ref: ${{ env.CONFIG_BRANCH }}
           token: ${{ secrets.CONFIG_REPO_TOKEN }}
           path: config
 
-      - name: Render staging
+      - name: Render ${{ env.DEPLOY_ENV }}
         run: |
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" render \
-            --app "$APP" --image "$IMAGE" --tag "$SHA" --env staging \
+            --app "$APP" --image "$IMAGE" --tag "$SHA" --env "$DEPLOY_ENV" \
             --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
             --catalog catalog --app-dir app --work work-staging \
-            --out config/staging/manifests.yaml \
-            --kubeconfig cluster-config-staging
+            --out "config/$DEPLOY_ENV/manifests.yaml" \
+            --kubeconfig "cluster-config-$DEPLOY_ENV"
 
       # Bootstrap prod once so its Fleet bundle exists; afterwards prod only moves through an
       # explicit promote-request.
+      # Chỉ có ý nghĩa khi prod dùng CHUNG nhánh repo cấu hình với môi trường đang deploy.
+      # Khi mỗi môi trường một nhánh (mô hình dev/main), manifest prod nằm ở nhánh khác nên
+      # không thể ghi từ đây — prod đi qua một lần deploy env=prod riêng, có duyệt.
       - name: Bootstrap prod (first deploy only)
         run: |
+          PROD_BRANCH=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get environments.prod.config_branch 2>/dev/null || echo "$CONFIG_BRANCH")
+          if [ "$PROD_BRANCH" != "$CONFIG_BRANCH" ]; then
+            echo "==> prod nằm ở nhánh $PROD_BRANCH, không phải $CONFIG_BRANCH -> bỏ qua, prod deploy riêng"
+            exit 0
+          fi
+          if [ "$DEPLOY_ENV" != "staging" ]; then
+            echo "==> đang deploy $DEPLOY_ENV, không phải staging -> không bootstrap"
+            exit 0
+          fi
           if [ -f config/prod/manifests.yaml ]; then
             echo "==> prod already bootstrapped, leaving it alone"
             exit 0
@@ -187,14 +213,14 @@ jobs:
             --out config/prod/manifests.yaml \
             --kubeconfig cluster-config-prod
 
-      - name: Apply secrets (staging)
+      - name: Apply secrets (${{ env.DEPLOY_ENV }})
         run: |
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" apply-secrets \
-            --app "$APP" --env staging --secrets work-staging/secrets.yaml \
+            --app "$APP" --env "$DEPLOY_ENV" --secrets work-staging/secrets.yaml \
             --harbor-host "${{ secrets.REGISTRY_HOST }}" \
             --harbor-user "${{ secrets.REGISTRY_USER }}" \
             --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
-            --kubeconfig cluster-config-staging
+            --kubeconfig "cluster-config-$DEPLOY_ENV"
 
       - name: Apply secrets (prod, if bootstrapped this run)
         run: |
@@ -209,8 +235,10 @@ jobs:
       - name: Commit & push config repo
         run: |
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
-            --config-dir config --app "$APP" --env staging --sha "$SHA" \
-            --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}"
+            --config-dir config --app "$APP" --env "$DEPLOY_ENV" --sha "$SHA" \
+            --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}" \
+            --branch "$CONFIG_BRANCH" \
+            ${{ env.REQUIRE_PR == 'True' && '--via-pr' || '' }}
 
       # CONVERGENCE CHECK. GitHub keeps only one run pending per concurrency group, so a
       # burst of pushes can leave the newest commit's run CANCELLED — and a cancelled run
@@ -301,6 +329,16 @@ jobs:
           # Tên repo cấu hình suy ra từ mẫu trong platform.env.yaml, không gắn cứng tiền tố.
           PATTERN=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
           echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
+          # Nhánh của repo cấu hình mà môi trường này ghi vào, và có phải đi qua PR không.
+          # Branch protection là chuyện của tổ chức, nên nó nằm trong cấu hình chứ không
+          # phải trong workflow.
+          ENVNAME="${DEPLOY_ENV:-prod}"
+          BR=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.config_branch" 2>/dev/null \
+               || python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.default_branch)
+          echo "CONFIG_BRANCH=$BR" >> "$GITHUB_ENV"
+          RP=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.require_pr" 2>/dev/null || echo False)
+          echo "REQUIRE_PR=$RP" >> "$GITHUB_ENV"
+          echo "==> $ENVNAME -> nhánh $BR, cần PR: $RP"
 
       - name: Preflight
         run: python3 platform/orchestrate.py --env-config "$ENV_CONFIG" preflight
@@ -309,6 +347,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.ORG }}/${{ env.CONFIG_REPO_NAME }}
+          ref: ${{ env.CONFIG_BRANCH }}
           token: ${{ secrets.CONFIG_REPO_TOKEN }}
           path: config
 
@@ -393,7 +432,9 @@ jobs:
       - name: Commit & push config repo
         run: |
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
-            --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app
+            --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app \
+            --branch "$CONFIG_BRANCH" \
+            ${{ env.REQUIRE_PR == 'True' && '--via-pr' || '' }}
 
       - name: Scrub kubeconfig
         if: always()
