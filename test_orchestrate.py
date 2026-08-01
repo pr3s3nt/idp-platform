@@ -1063,10 +1063,22 @@ def fake_kubectl_returning(objs: dict):
     return _k
 
 
-def live(image: str, avail: int = 1, replicas: int = 1) -> dict:
-    return {"spec": {"replicas": replicas,
+def live(image: str, avail: int = 1, replicas: int = 1,
+         updated: int | None = None, total: int | None = None,
+         generation: int = 1, observed: int | None = None) -> dict:
+    """Một Deployment như cụm trả về.
+
+    Mặc định mô tả trạng thái ĐÃ TRIỂN KHAI XONG: mọi bản sao đều là bản mới. Truyền
+    `updated`/`total` khi cần dựng cảnh triển khai đang dở — đó là hình dạng của một lần
+    triển khai hỏng mà bản kiểm cũ không nhìn thấy.
+    """
+    return {"metadata": {"generation": generation},
+            "spec": {"replicas": replicas,
                      "template": {"spec": {"containers": [{"image": image}]}}},
-            "status": {"availableReplicas": avail}}
+            "status": {"availableReplicas": avail,
+                       "updatedReplicas": replicas if updated is None else updated,
+                       "replicas": replicas if total is None else total,
+                       "observedGeneration": generation if observed is None else observed}}
 
 
 def test_verify_passes_when_cluster_matches(tmp_path, monkeypatch):
@@ -1104,6 +1116,49 @@ def test_verify_fails_while_replicas_not_available(tmp_path, monkeypatch):
     orc.dump_all([deploy_doc("app", "r.io/app:v2", replicas=3)], m)
     monkeypatch.setattr(orc, "kubectl",
                         fake_kubectl_returning({"app": live("r.io/app:v2", avail=1, replicas=3)}))
+    with pytest.raises(SystemExit, match="KHÔNG chạy đúng"):
+        orc.cmd_verify(orc.argparse.Namespace(
+            app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))
+
+
+def test_verify_fails_when_old_pods_still_serve(tmp_path, monkeypatch):
+    """Bản mới không lên được nhưng bản CŨ vẫn phục vụ đủ — bản kiểm cũ báo xanh ở đây.
+
+    Đo trực tiếp trên cụm thật: đặt nhãn ảnh không tồn tại vào production thì Kubernetes
+    tạo pod mới, pod đó ImagePullBackOff, còn 3 pod cũ chạy nguyên. Deployment báo
+    availableReplicas=3/3 nên phép kiểm "đủ bản sao sẵn sàng" đạt — trong khi thứ vừa
+    render THỰC SỰ chưa hề chạy. Đúng loại sự cố mà cmd_verify sinh ra để bắt, và nó đã
+    bỏ lọt cho tới lần thử này.
+    """
+    m = tmp_path / "m.yaml"
+    orc.dump_all([deploy_doc("app", "r.io/app:khong-ton-tai", replicas=3)], m)
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl_returning({
+        # Ảnh trong spec ĐÚNG bằng manifest (Fleet đã áp), 3 bản sao sẵn sàng — nhưng cả
+        # 3 đều là bản cũ, chỉ 1 bản mới được tạo và nó không khởi động được.
+        "app": live("r.io/app:khong-ton-tai", avail=3, replicas=3, updated=1, total=4)}))
+    with pytest.raises(SystemExit, match="KHÔNG chạy đúng"):
+        orc.cmd_verify(orc.argparse.Namespace(
+            app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))
+
+
+def test_verify_fails_when_old_replicas_not_reclaimed(tmp_path, monkeypatch):
+    """Bản mới đã đủ nhưng bản cũ chưa bị thu hồi — triển khai chưa xong."""
+    m = tmp_path / "m.yaml"
+    orc.dump_all([deploy_doc("app", "r.io/app:v2", replicas=2)], m)
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl_returning({
+        "app": live("r.io/app:v2", avail=2, replicas=2, updated=2, total=3)}))
+    with pytest.raises(SystemExit, match="KHÔNG chạy đúng"):
+        orc.cmd_verify(orc.argparse.Namespace(
+            app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))
+
+
+def test_verify_waits_until_kubernetes_has_seen_the_edit(tmp_path, monkeypatch):
+    """observedGeneration còn cũ: Kubernetes chưa xử lý bản sửa, trạng thái đang nói về
+    phiên bản TRƯỚC. Tin vào nó là tin một câu trả lời lỗi thời."""
+    m = tmp_path / "m.yaml"
+    orc.dump_all([deploy_doc("app", "r.io/app:v2")], m)
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl_returning({
+        "app": live("r.io/app:v2", generation=7, observed=6)}))
     with pytest.raises(SystemExit, match="KHÔNG chạy đúng"):
         orc.cmd_verify(orc.argparse.Namespace(
             app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))

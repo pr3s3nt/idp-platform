@@ -1087,9 +1087,29 @@ def cmd_verify(args) -> None:
             if live != images:
                 pending.append(f"{name}: đang chạy {live}, cần {images}")
                 continue
-            avail = (obj.get("status") or {}).get("availableReplicas", 0) or 0
+            # Đủ pod sẵn sàng KHÔNG có nghĩa là bản mới đã lên. Đo được từ một lần thử
+            # cố ý: đặt nhãn ảnh không tồn tại thì Kubernetes tạo pod mới, pod đó
+            # ImagePullBackOff, còn 3 pod CŨ vẫn chạy nguyên. availableReplicas vẫn là
+            # 3/3 nên phép kiểm cũ báo xanh — đúng cái sự cố mà bước này sinh ra để bắt.
+            # Phải hỏi "bản mới đã thay xong bản cũ chưa", tức đúng câu hỏi mà
+            # `kubectl rollout status` hỏi:
+            st = obj.get("status") or {}
             need = (obj.get("spec") or {}).get("replicas", 1) or 1
-            if avail < need:
+            gen = (obj.get("metadata") or {}).get("generation", 0) or 0
+            observed = st.get("observedGeneration", 0) or 0
+            updated = st.get("updatedReplicas", 0) or 0
+            avail = st.get("availableReplicas", 0) or 0
+            total = st.get("replicas", 0) or 0
+            if observed < gen:
+                pending.append(f"{name}: Kubernetes chưa xử lý bản sửa mới nhất")
+            elif updated < need:
+                pending.append(
+                    f"{name}: mới {updated}/{need} bản sao chạy phiên bản MỚI "
+                    f"(còn {total - updated} bản sao cũ đang phục vụ)")
+            elif total > updated:
+                pending.append(
+                    f"{name}: bản cũ chưa được thu hồi ({total - updated} bản sao thừa)")
+            elif avail < need:
                 pending.append(f"{name}: mới {avail}/{need} bản sao sẵn sàng")
         if not pending:
             log(f"tất cả {len(want)} Deployment trong {ns} đã chạy đúng ảnh vừa render")
