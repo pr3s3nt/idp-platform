@@ -572,6 +572,36 @@ tự khoá. Nay truyền tường minh.
 | Fleet đọc kho cấu hình | **Khoá triển khai chỉ-đọc** — token App hết hạn sau một giờ mà Fleet kiểm tra 15 giây một lần và không tự làm mới được |
 | Đẩy/kéo ảnh | Tài khoản máy của kho ảnh |
 
+### 6.14. Đổi mặc định nhãn ảnh làm hỏng 5 ứng dụng cùng lúc
+
+Sau khi chuyển nhãn ảnh sang **theo nội dung** làm mặc định, năm ứng dụng lập tức
+`ImagePullBackOff`. Nguyên nhân rất rõ:
+
+| Bên | Tính tên ảnh thế nào |
+|---|---|
+| Bộ sinh manifest | mã băm **nội dung thư mục** (mặc định mới) |
+| CI của ứng dụng | gắn cứng **mã commit** |
+
+Hai bên tính ra hai cái tên khác nhau → manifest trỏ tới một ảnh **chưa ai xây**.
+
+Điều đáng nói: ứng dụng `boutique` là cái **duy nhất không hỏng**, vì CI của nó **hỏi**
+platform tên ảnh thay vì tự tính — đúng nguyên tắc đã ghi trong chính file đó từ trước:
+
+> *"Quy tắc đặt tên ảnh do bộ sinh manifest quyết định, KHÔNG chép lại ở đây. Nếu hai bên
+> tự tính riêng rồi lệch nhau thì hệ thống sẽ triển khai một cấu hình trỏ tới ảnh chưa ai
+> xây, và chỉ phát hiện được khi ứng dụng chết."*
+
+Nguyên tắc đã viết ra, nhưng chỉ áp cho một ứng dụng. Bốn ứng dụng còn lại vẫn tự tính, và
+chúng hỏng đúng theo kịch bản đã được cảnh báo.
+
+Đã sửa: **mọi** CI đều hỏi platform tên ảnh. Bài học không phải "chọn nhãn nào", mà là
+**một nguyên tắc chỉ áp dụng cho một phần hệ thống thì không phải là nguyên tắc** — nó chỉ
+là một ghi chú, và ghi chú không ngăn được lỗi.
+
+Cũng đáng ghi lại về cách lỗi biểu hiện: triển khai vẫn báo **thành công** ở mọi bước,
+cấu hình vẫn được ghi đúng, chỉ có ứng dụng là không chạy. Lại thêm một lỗi im lặng ở tầng
+điều phối, chỉ ồn ào ở tầng cụm.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
