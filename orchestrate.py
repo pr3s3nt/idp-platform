@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1044,6 +1045,72 @@ def cmd_promote(args) -> None:
 # --------------------------------------------------------------------------------------
 # preflight
 # --------------------------------------------------------------------------------------
+def cmd_verify(args) -> None:
+    """Chờ tới khi cụm THỰC SỰ chạy đúng thứ vừa render. Hết giờ là fail kèm chẩn đoán.
+
+    Lý do có bước này, đo từ một sự cố thật: đổi cách đặt tên ảnh làm 5 app cùng
+    ImagePullBackOff, mà TOÀN BỘ pipeline vẫn báo thành công — CI xanh, orchestrator xanh,
+    manifest ghi đúng vào config repo, Fleet apply không lỗi. Chỉ pod là chết. Không ai
+    phát hiện cho tới khi có người mở trang web.
+
+    Bước đối chiếu trước đó chỉ so SHA giữa config repo và nhánh app — nó không nhìn vào
+    cụm, nên không thể bắt được loại lỗi này. Đây là chỗ duy nhất trong toàn luồng thực sự
+    hỏi "ứng dụng có chạy không".
+    """
+    ns = (CONFIG.get("kubernetes.namespace_pattern", "{app}-{env}")
+          .replace("{app}", args.app).replace("{env}", args.env))
+    want: dict[str, list[str]] = {}
+    for doc in load_all(Path(args.manifests)):
+        if doc.get("kind") != "Deployment":
+            continue
+        containers = doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+        want[doc["metadata"]["name"]] = [c.get("image") for c in containers]
+
+    if not want:
+        log("không có Deployment nào để kiểm — bỏ qua")
+        return
+
+    log(f"chờ {len(want)} Deployment trong {ns} chạy đúng ảnh vừa render "
+        f"(tối đa {args.timeout}s)")
+    deadline = time.time() + args.timeout
+    while True:
+        pending = []
+        for name, images in sorted(want.items()):
+            cp = kubectl(["get", "deploy", name, "-n", ns, "-o", "json"],
+                         kubeconfig=args.kubeconfig, check=False, capture=True)
+            if cp.returncode != 0:
+                pending.append(f"{name}: chưa tồn tại trên cụm")
+                continue
+            obj = json.loads(cp.stdout)
+            live = [c.get("image") for c in
+                    obj["spec"]["template"]["spec"].get("containers", [])]
+            if live != images:
+                pending.append(f"{name}: đang chạy {live}, cần {images}")
+                continue
+            avail = (obj.get("status") or {}).get("availableReplicas", 0) or 0
+            need = (obj.get("spec") or {}).get("replicas", 1) or 1
+            if avail < need:
+                pending.append(f"{name}: mới {avail}/{need} bản sao sẵn sàng")
+        if not pending:
+            log(f"tất cả {len(want)} Deployment trong {ns} đã chạy đúng ảnh vừa render")
+            return
+        if time.time() >= deadline:
+            break
+        time.sleep(10)
+
+    # Hết giờ: in đúng thứ cần để hiểu vì sao, ngay tại chỗ.
+    warn(f"sau {args.timeout}s vẫn chưa đạt trạng thái mong muốn trong {ns}")
+    for line in pending:
+        print(f"::error::{line}", file=sys.stderr, flush=True)
+    kubectl(["get", "pods", "-n", ns], kubeconfig=args.kubeconfig, check=False)
+    kubectl(["get", "events", "-n", ns, "--sort-by=.lastTimestamp"],
+            kubeconfig=args.kubeconfig, check=False)
+    raise SystemExit(
+        f"{args.app}/{args.env}: manifest đã ghi và Fleet đã đồng bộ, nhưng cụm KHÔNG "
+        "chạy đúng thứ vừa render. Xem danh sách pod và event ở trên."
+    )
+
+
 def cmd_config(args) -> None:
     """Expose platform.env.yaml to the workflow, so the YAML holds no infrastructure value.
 
@@ -1140,6 +1207,14 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--work", required=paths_required, help="scratch dir for this render")
         p.add_argument("--kubeconfig")
         add_state_flags(p)
+
+    p = sub.add_parser("verify", help="chờ cụm thực sự chạy đúng thứ vừa render")
+    p.add_argument("--app", required=True)
+    p.add_argument("--env", required=True, choices=("staging", "prod"))
+    p.add_argument("--manifests", required=True)
+    p.add_argument("--kubeconfig")
+    p.add_argument("--timeout", type=int, default=300)
+    p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("config", help="read platform.env.yaml (for the workflow to consume)")
     p.add_argument("--get", help="dotted key, e.g. registry.path")

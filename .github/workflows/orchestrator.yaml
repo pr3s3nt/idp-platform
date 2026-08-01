@@ -254,15 +254,36 @@ jobs:
             --kubeconfig cluster-config-prod
 
       - name: Commit & push config repo
+        id: commit
         env:
           # Bắt buộc: `gh pr create` bên trong orchestrate.py phải chạy bằng token App.
           # Không đặt thì nó rơi về gh auth có sẵn trên runner — tức tài khoản người, và
           # pull request sẽ mang tên người đó thay vì App.
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
+          set -euo pipefail
+          OUT=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env "$DEPLOY_ENV" --sha "$SHA" \
-            --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}"
+            --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}")
+          echo "$OUT"
+          # commit chỉ in URL ra stdout khi nó MỞ pull request. Có PR nghĩa là manifest
+          # chưa được merge, Fleet chưa thấy gì — kiểm cụm lúc này chắc chắn sai.
+          if echo "$OUT" | grep -q "^https://.*/pull/"; then
+            echo "pending_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # CHỖ DUY NHẤT trong toàn luồng thực sự hỏi "ứng dụng có chạy không".
+      # Có bước này vì một sự cố thật: đổi cách đặt tên ảnh làm 5 app cùng
+      # ImagePullBackOff mà mọi bước đều báo xanh — manifest ghi đúng, Fleet đồng bộ
+      # không lỗi, chỉ pod là chết. Bước đối chiếu SHA phía dưới không nhìn vào cụm nên
+      # không thể bắt được.
+      - name: Kiểm cụm thực sự chạy đúng thứ vừa render
+        if: steps.commit.outputs.pending_pr != 'true'
+        run: |
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" verify \
+            --app "$APP" --env "$DEPLOY_ENV" \
+            --manifests "config/$DEPLOY_ENV/manifests.yaml" \
+            --kubeconfig "cluster-config-$DEPLOY_ENV" --timeout 420
 
 
       # CONVERGENCE CHECK. GitHub keeps only one run pending per concurrency group, so a

@@ -7,6 +7,7 @@ with the catalog in this repo (provisioners/ + patches/).
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -1041,3 +1042,76 @@ def test_secret_resource_requires_name_and_key(tmp_path):
     })
     with pytest.raises(subprocess.CalledProcessError):
         render_app(tmp_path, app, "staging", name="payapp")
+
+
+# ------------------------------------------------------------- kiểm cụm sau khi triển khai
+def deploy_doc(name: str, image: str, replicas: int = 1) -> dict:
+    return {"kind": "Deployment", "metadata": {"name": name},
+            "spec": {"replicas": replicas,
+                     "template": {"spec": {"containers": [{"name": "c", "image": image}]}}}}
+
+
+def fake_kubectl_returning(objs: dict):
+    """objs: {tên deployment: object trả về} — thiếu tên nào thì coi như chưa tồn tại."""
+    def _k(args, *, kubeconfig=None, **kw):
+        if args[:2] == ["get", "deploy"]:
+            name = args[2]
+            if name not in objs:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="NotFound")
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(objs[name]), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    return _k
+
+
+def live(image: str, avail: int = 1, replicas: int = 1) -> dict:
+    return {"spec": {"replicas": replicas,
+                     "template": {"spec": {"containers": [{"image": image}]}}},
+            "status": {"availableReplicas": avail}}
+
+
+def test_verify_passes_when_cluster_matches(tmp_path, monkeypatch):
+    m = tmp_path / "m.yaml"
+    orc.dump_all([deploy_doc("app", "r.io/app:v2")], m)
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl_returning({"app": live("r.io/app:v2")}))
+    orc.cmd_verify(orc.argparse.Namespace(
+        app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))
+
+
+def test_verify_fails_when_cluster_runs_a_different_image(tmp_path, monkeypatch):
+    """Đúng sự cố đã xảy ra: manifest ghi đúng, Fleet đồng bộ không lỗi, nhưng cụm chạy
+    ảnh cũ vì ảnh mới chưa từng được đẩy lên. Mọi bước khác đều báo xanh."""
+    m = tmp_path / "m.yaml"
+    orc.dump_all([deploy_doc("app", "r.io/app:khong-ton-tai")], m)
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl_returning({"app": live("r.io/app:cu")}))
+    with pytest.raises(SystemExit, match="KHÔNG chạy đúng thứ vừa render"):
+        orc.cmd_verify(orc.argparse.Namespace(
+            app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))
+
+
+def test_verify_fails_when_deployment_never_appears(tmp_path, monkeypatch):
+    """Quên tạo GitRepo của Fleet: manifest nằm trong repo cấu hình mà cụm trống trơn."""
+    m = tmp_path / "m.yaml"
+    orc.dump_all([deploy_doc("app", "r.io/app:v2")], m)
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl_returning({}))
+    with pytest.raises(SystemExit, match="KHÔNG chạy đúng"):
+        orc.cmd_verify(orc.argparse.Namespace(
+            app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))
+
+
+def test_verify_fails_while_replicas_not_available(tmp_path, monkeypatch):
+    """Ảnh đúng nhưng pod chưa lên đủ — vẫn chưa được coi là thành công."""
+    m = tmp_path / "m.yaml"
+    orc.dump_all([deploy_doc("app", "r.io/app:v2", replicas=3)], m)
+    monkeypatch.setattr(orc, "kubectl",
+                        fake_kubectl_returning({"app": live("r.io/app:v2", avail=1, replicas=3)}))
+    with pytest.raises(SystemExit, match="KHÔNG chạy đúng"):
+        orc.cmd_verify(orc.argparse.Namespace(
+            app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))
+
+
+def test_verify_skips_when_there_is_nothing_to_check(tmp_path, monkeypatch):
+    m = tmp_path / "m.yaml"
+    orc.dump_all([{"kind": "Service", "metadata": {"name": "s"}}], m)
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl_returning({}))
+    orc.cmd_verify(orc.argparse.Namespace(
+        app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))
