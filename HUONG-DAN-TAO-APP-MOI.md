@@ -88,13 +88,28 @@ Một dòng, là ref của repo platform mà app render theo.
 
 ### A4. `.github/workflows/ci.yaml`
 
-Sao chép từ một app có sẵn (`idp-helloworld`), chỉ đổi 2 dòng:
+Sao chép từ một app có sẵn, **nhưng chọn đúng mẫu theo số service trong repo** — đây là chỗ
+sai dễ mắc, và nó hỏng ngay ở bước build:
+
+| Repo có | Chép từ | Vì sao |
+|---|---|---|
+| **một** service | `idp-helloworld` | Build từ gốc repo, một ảnh |
+| **nhiều** service | `idp-boutique` | Build từng thư mục service, lấy danh sách động từ platform |
+
+Chép nhầm mẫu một-service cho repo nhiều service sẽ ra:
+`failed to read dockerfile: open Dockerfile: no such file or directory`.
+
+Sau khi chép, đổi 3 dòng:
 
 ```yaml
 env:
-  APP: demo             # tên app
-  IMAGE_NAME: demo      # tên ảnh, có thể khác tên app
+  APP: demo                              # tên app
+  IMAGE_NAME: demo                       # tên ảnh, có thể khác tên app
+  PLATFORM_REPO: <org>/idp-platform      # ĐÚNG repo platform của bản cài này
 ```
+
+Quên dòng thứ ba thì CI gọi sang platform khác — **vẫn chạy thành công**, chỉ là triển khai
+lên nhầm hạ tầng.
 
 ---
 
