@@ -877,6 +877,94 @@ Bài học rút ra, và nó áp dụng cho mọi phép kiểm chứ không riên
 từng báo đỏ thì chưa phải là một phép kiểm.** Nó mới chỉ là một dòng chữ màu xanh khiến người
 ta yên tâm.
 
+### 6.21. Siết lại quyền, và một chỗ dự án tự mâu thuẫn với chính mình
+
+Đưa file CI của một ứng dụng cho một mô hình khác đọc và nhận xét. Phần lớn góp ý là do
+đọc một file mà không có ngữ cảnh cả kho, nhưng **có một điểm đúng và sắc** — nó tìm ra chỗ
+dự án làm ngược lại nguyên tắc do chính mình đặt ra.
+
+#### Nhãn ảnh được tính bằng hai phiên bản code khác nhau
+
+Header của orchestrator ghi rõ: *"platform.lock ghim DỮ LIỆU, không ghim CODE"*. Lý do là
+GitHub luôn chạy workflow từ nhánh mặc định, nên ghim script sẽ khiến nó lệch với các tham
+số mà workflow truyền vào.
+
+Nhưng CI của ứng dụng lại đang dùng `platform.lock` để ghim **chính `orchestrate.py`** khi
+chạy `image-plan`:
+
+```yaml
+ref: ${{ steps.lock.outputs.ref }}      # CI tính nhãn bằng phiên bản BỊ GHIM
+```
+
+Trong khi orchestrator render bằng phiên bản ở nhánh mặc định. Hai bên tính tên ảnh bằng
+hai bản code khác nhau.
+
+Hôm nay chưa nổ, và lý do khiến nó chưa nổ mới là điều đáng lo: **mọi `platform.lock` đều
+đang ghi `main`**, nên hai phiên bản tình cờ trùng nhau. Đúng cái ngày ai đó ghim một phiên
+bản thật — tức là dùng `platform.lock` đúng như mục đích của nó — là ngày CI đẩy nhãn cũ
+còn manifest đòi nhãn mới.
+
+Tệ hơn ở kho nhiều service: bước kiểm "ảnh đã tồn tại chưa" cũng đọc kế hoạch sinh từ phiên
+bản cũ, nên nó kiểm nhãn cũ, thấy có, và **bỏ qua build**. Cơ chế phòng vệ quay sang củng cố
+cho cái sai.
+
+Đã sửa: CI lấy `orchestrate.py` ở nhánh mặc định, còn `platform.lock` vẫn dùng cho catalog
+đúng như thiết kế. Sửa ở cả 8 kho ứng dụng, cả hai nhánh.
+
+#### Bỏ PAT khỏi bước đẩy image — thử và thất bại
+
+Cái token cá nhân dùng chung đang nằm ở **22 chỗ**: 19 kho GitHub và 3 cụm Kubernetes (Fleet
+dùng nó để clone). Quyền của nó là đọc/ghi *mọi* kho riêng tư, cộng sửa được file workflow ở
+mọi kho — mà workflow thì chạy trên máy có kubeconfig của cả hai cụm.
+
+Việc đẩy một image không cần tới chừng đó quyền. GitHub Actions tự phát một token cho mỗi
+lần chạy, chết khi job kết thúc, và về lý thuyết đẩy được lên kho ảnh:
+
+```yaml
+permissions:
+  contents: read
+  packages: write
+```
+
+Thử thì bị từ chối:
+
+```
+denied: permission_denied: write_package
+```
+
+Lý do: các package hiện có đều do PAT tạo ra nên không thuộc về kho mã nào, và token của
+Actions chỉ ghi được vào package có liên kết. Thử cách nối bằng nhãn
+`org.opencontainers.image.source` trong Dockerfile rồi đẩy lại một lần bằng PAT — **vẫn bị
+từ chối**. Nhãn nối package với kho mã, nhưng không tự cấp quyền ghi.
+
+Kết luận: cần một thao tác tay trong cài đặt package trên GitHub, mỗi package một lần. Đã
+trả CI về trạng thái chạy được và ghi sẵn cách đổi trong chú thích, để lúc làm chỉ việc thay
+hai dòng.
+
+Phần dọn dẹp thì xong: `APP_REPOS_TOKEN` và `CONFIG_REPO_TOKEN` đã bị xoá — từ khi chuyển
+sang GitHub App thì không workflow nào còn tham chiếu tới chúng nữa.
+
+#### Một commit đẩy thẳng vào production, và hậu quả của nó
+
+Khi kiểm lại, phát hiện `helloworld` có nhãn ảnh ở hai môi trường **khác nhau**. Truy ra thì
+commit kiểm thử ở mục 6.20 đã được đẩy **thẳng vào nhánh production**, không đi qua nhánh
+phát triển. Kết quả: production mang một thay đổi mà staging không có.
+
+Đây đúng là loại trôi dạt mà cả nền tảng này sinh ra để chặn, và nó lọt qua vì thao tác đó
+làm bằng tay chứ không qua luồng thường. Đã kéo ngược nhánh production về nhánh phát triển;
+sau đó bốn ứng dụng đều chạy **cùng một nhãn ảnh** ở cả hai môi trường.
+
+Điều này nói lên một giới hạn thật: nền tảng bảo vệ được thứ đi qua nó, nhưng không ngăn
+được người ta đi vòng. Ở công ty, nơi mọi nhánh đều có bảo vệ, đường vòng đó không tồn tại.
+
+#### Còn một chỗ đỏ chưa ai để ý
+
+Trên cụm thứ hai, hai `GitRepo` production của `shop` và `smoke` đã **báo lỗi suốt nhiều
+giờ**: `no resource found at the following paths to deploy: [prod]`. Nguyên nhân vô hại —
+hai ứng dụng đó chưa từng lên production nên nhánh tương ứng chưa có thư mục manifest. Nhưng
+nó cho thấy hướng dẫn cài đặt đang bảo tạo `GitRepo` cho cả hai môi trường ngay từ đầu, và
+cái nào chưa dùng tới thì đỏ mãi. Đỏ thường trực thì chẳng mấy chốc không ai nhìn nữa.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
@@ -902,6 +990,8 @@ ba tình huống triển khai kẹt giữa chừng mà phép kiểm cũ bỏ l�
 | Cài lại từ đầu | Dựng một bản cài mới theo đúng tài liệu hướng dẫn — chạy được |
 | Dự án ba service dùng chung database | Bốn tình huống vận hành, database không khởi động lại lần nào |
 | Merge pull request production | Fleet nhận commit mới trong khoảng một phút và áp lên cụm, kho cấu hình báo về platform, platform kiểm cụm và trả kết quả (6.19, 6.20) |
+| **Nhãn ảnh trong manifest có thật không** | Đối chiếu toàn bộ 48 tham chiếu ảnh của 8 ứng dụng trên cả hai môi trường với kho ảnh: **48/48 tồn tại**, không cái nào trỏ vào khoảng không |
+| **Hai môi trường chạy cùng một ảnh** | Sau khi đồng bộ nhánh, bốn ứng dụng có nhãn ảnh production **trùng khớp** staging — production chạy đúng ảnh đã được kiểm, không phải bản xây lại |
 | **Phép kiểm có biết báo đỏ không** | Cố ý đặt nhãn ảnh không tồn tại vào production: lần đầu nó **báo xanh sai** vì pod cũ vẫn phục vụ; sau khi sửa thì bắt đúng, kèm chẩn đoán (6.20) |
 | Nhãn ảnh theo nội dung khi thăng cấp | Sau khi merge `dev` sang `main`, hai nhánh cùng nội dung nên cùng nhãn ảnh — production nhận **đúng ảnh** staging đang chạy, không phải bản xây lại |
 
@@ -924,7 +1014,7 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 | Hàng đợi triển khai vẫn có thể bỏ sót | Đã giảm mạnh và **đã có cảnh báo**, nhưng chưa loại trừ tuyệt đối | Cảnh báo hiện ra ở phần tóm tắt của lần chạy |
 | Commit trung gian không có image | Do gộp các lần push liên tiếp | Muốn thăng cấp đúng commit đó phải build lại |
 | **Không kiểm tra quyền sở hữu ứng dụng** | Tên ứng dụng và kho mã do bên gọi **tự khai**, không có bước xác thực nào. Bất kỳ ai gọi được vào platform đều có thể triển khai thay ứng dụng của đội khác | **Đã cân nhắc và tạm chấp nhận**: sandbox một người dùng, chưa có nhiều đội. Phải xử lý trước khi nhiều đội dùng chung |
-| Sandbox chưa có phân quyền | Mọi thứ dùng chung một token toàn quyền | Môi trường thật cần tách quyền theo từng repo |
+| **Một token cá nhân nằm ở 22 nơi** | 19 kho GitHub và 3 cụm Kubernetes. Quyền của nó: đọc/ghi mọi kho riêng tư, và sửa được file workflow ở mọi kho — mà workflow chạy trên máy có kubeconfig của cả hai cụm (6.21) | Đã dọn 2 secret thừa. Bước đẩy image thử chuyển sang token tự sinh nhưng bị kho ảnh từ chối, cần một thao tác tay cho mỗi package. Fleet vẫn dùng token này để clone, đúng ra chỉ cần khoá chỉ đọc |
 | Chỉ có một máy chủ chạy CI | Nhiều ứng dụng đẩy code cùng lúc thì phải xếp hàng nối đuôi. Đo thực tế: sáu ứng dụng cùng lúc mất khoảng 15 phút mới xong hết | Môi trường nhiều đội cần nhiều máy chủ, và nên chia theo đội để phân quyền cụm siết được |
 | Ứng dụng vẫn phải đăng ký thủ công | Tạo kho cấu hình, đăng ký với hệ thống đồng bộ, cấp khoá — đều làm tay | Có thể tự động hoá, chưa làm |
 | **Tắt bảo vệ nhánh thì platform im lặng chuyển sang ghi thẳng** | Platform hỏi GitHub xem nhánh có được bảo vệ không rồi làm theo. Nếu ai đó lỡ tay tắt bảo vệ, cổng duyệt production biến mất mà không có cảnh báo nào (6.19) | Đây là mặt trái của việc lấy GitHub làm nguồn sự thật duy nhất. Đổi lại thì không có chỗ nào khai trùng lặp để sai lệch |

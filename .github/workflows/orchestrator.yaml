@@ -31,8 +31,10 @@
 #           Multi-workload repos render each workload as <image>-<workload>.
 #
 # Required secrets:
-#   APP_REPOS_TOKEN            read the app repos in the org
-#   CONFIG_REPO_TOKEN          push to the <app>-config repos
+#   APP_ID / APP_PRIVATE_KEY   GitHub App — mint một token sống 1 giờ cho MỌI thao tác git
+#                              (đọc repo app, ghi repo cấu hình, mở pull request). Thay cho
+#                              APP_REPOS_TOKEN và CONFIG_REPO_TOKEN trước đây; hai secret đó
+#                              đã bị xoá vì không còn workflow nào tham chiếu tới.
 #   KUBECONFIG_STAGING  base64 kubeconfig for the staging cluster
 #   KUBECONFIG_PROD     base64 kubeconfig for the prod cluster
 #   REGISTRY_HOST / REGISTRY_USER / REGISTRY_PASS   pull-only robot account
