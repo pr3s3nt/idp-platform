@@ -45,7 +45,7 @@ name: orchestrator
 
 on:
   repository_dispatch:
-    types: [deploy-request, promote-request]
+    types: [deploy-request, promote-request, verify-request]
   # Manual trigger, for debugging and for re-running a deploy without a new push.
   workflow_dispatch:
     inputs:
@@ -504,3 +504,94 @@ jobs:
       - name: Scrub kubeconfig
         if: always()
         run: rm -f cluster-config-prod
+
+  # ===========================================================================
+  # VERIFY: kiểm cụm SAU khi manifest đã thực sự nằm trên nhánh của môi trường.
+  #
+  # Vì sao cần một job riêng thay vì dùng bước "Kiểm cụm" trong job deploy: khi triển khai
+  # phải đi qua pull request, bước đó bị bỏ qua — đúng, vì lúc ấy manifest chưa merge, Fleet
+  # chưa thấy gì, kiểm cụm chắc chắn sai. Nhưng sau khi có người merge thì lần chạy deploy
+  # đã kết thúc từ lâu và KHÔNG có gì chạy lại. Hệ quả đo được (mục 6.19 tài liệu dự án):
+  # production là môi trường DUY NHẤT không bao giờ được kiểm — càng siết bằng quy trình
+  # duyệt thì càng đẩy nó ra khỏi tầm kiểm tra.
+  #
+  # Ai gọi: một workflow nhỏ nằm trong CHÍNH kho cấu hình, chạy khi nhánh môi trường đổi.
+  # Kho cấu hình là nơi duy nhất biết chắc "manifest đã thật sự nằm trên nhánh" — dù nó tới
+  # bằng người merge pull request hay bằng platform ghi thẳng.
+  #
+  # Chạy lặp lại vô hại: verify chỉ ĐỌC cụm, không sửa gì. Với môi trường không qua pull
+  # request thì kiểm hai lần (một lần trong deploy, một lần ở đây) — chấp nhận được.
+  # ===========================================================================
+  verify:
+    if: github.event.action == 'verify-request'
+    runs-on: [self-hosted, "${{ vars.RUNNER_LABEL || 'platform-orchestrator' }}"]
+    # Cùng nhóm hàng đợi với deploy của chính app đó. Không có dòng này, một lần verify có
+    # thể chạy chen vào giữa lúc deploy đang render và báo đỏ oan vì cụm đang dở dang.
+    concurrency:
+      group: app-${{ github.event.client_payload.app }}
+      cancel-in-progress: false
+    env:
+      APP: ${{ github.event.client_payload.app }}
+      DEPLOY_ENV: ${{ github.event.client_payload.env || 'prod' }}
+    steps:
+      - name: Checkout platform@main (renderer + workflow)
+        uses: actions/checkout@v4
+        with:
+          path: platform
+
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Load environment config
+        run: |
+          set -euo pipefail
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
+          echo "ORG=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
+          PATTERN=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
+          echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
+          BR=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get "environments.$DEPLOY_ENV.config_branch" 2>/dev/null \
+               || python3 platform/orchestrate.py --env-config "$ENV_CONFIG" config --get git.default_branch)
+          echo "CONFIG_BRANCH=$BR" >> "$GITHUB_ENV"
+          echo "==> kiểm $APP ở môi trường $DEPLOY_ENV (nhánh cấu hình $BR)"
+
+      # Cùng lý do như trong job deploy: phải ghi TRƯỚC khi có bất kỳ lệnh kubectl nào, nếu
+      # không nó lặng lẽ dùng kubeconfig cũ còn sót trong workspace và kiểm nhầm cụm.
+      - name: Write kubeconfigs
+        env:
+          STAGING_B64: ${{ secrets.KUBECONFIG_STAGING }}
+          PROD_B64: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "$STAGING_B64" | base64 -d > cluster-config-staging
+          echo "$PROD_B64"    | base64 -d > cluster-config-prod
+
+      - name: Preflight
+        run: |
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" preflight \
+            --require-cluster "cluster-config-$DEPLOY_ENV"
+
+      # Lấy đúng nhánh môi trường, tức đúng thứ Fleet đang đồng bộ.
+      - name: Checkout config repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ORG }}/${{ env.CONFIG_REPO_NAME }}
+          ref: ${{ env.CONFIG_BRANCH }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: config
+
+      - name: Kiểm cụm thực sự chạy đúng thứ đang nằm trên nhánh
+        run: |
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" verify \
+            --app "$APP" --env "$DEPLOY_ENV" \
+            --manifests "config/$DEPLOY_ENV/manifests.yaml" \
+            --kubeconfig "cluster-config-$DEPLOY_ENV" --timeout 420
+
+      - name: Scrub kubeconfigs
+        if: always()
+        run: rm -f cluster-config-staging cluster-config-prod

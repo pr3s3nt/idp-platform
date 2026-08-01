@@ -1,0 +1,67 @@
+# =============================================================================
+# BÁO VỀ PLATFORM KHI NHÁNH MÔI TRƯỜNG ĐỔI — đặt trong KHO CẤU HÌNH của app.
+#
+# Vì sao cần: bước kiểm cụm trong orchestrator bị bỏ qua khi triển khai phải đi qua pull
+# request. Điều đó đúng — lúc ấy manifest chưa merge, Fleet chưa thấy gì. Nhưng sau khi có
+# người merge thì lần chạy orchestrator đã kết thúc, và không có gì chạy lại. Kết quả:
+# production là môi trường duy nhất không bao giờ được kiểm.
+#
+# Kho cấu hình là nơi DUY NHẤT biết chắc "manifest đã thật sự nằm trên nhánh", bất kể nó
+# tới bằng người merge hay bằng platform ghi thẳng. Nên nó là nơi hợp lý để phát tín hiệu.
+#
+# CÁCH CÀI (làm một lần cho mỗi kho cấu hình):
+#   1. Chép tệp này vào .github/workflows/verify.yaml của kho cấu hình
+#   2. Sửa APP cho khớp tên ứng dụng
+#   3. Cấp secret PLATFORM_DISPATCH_TOKEN — token có quyền ghi vào kho platform
+#        gh secret set PLATFORM_DISPATCH_TOKEN --repo <org>/<app>-config
+#
+#   Ở công ty: đặt PLATFORM_DISPATCH_TOKEN làm secret cấp tổ chức, cấp phát cho các kho
+#   cấu hình. Làm một lần, kho cấu hình mới tự có, không phải nhớ bước 3 nữa.
+#
+# GITHUB_TOKEN mặc định KHÔNG gọi được sang kho khác nên bắt buộc phải có token riêng.
+# =============================================================================
+name: verify
+
+on:
+  push:
+    # Chỉ những nhánh gắn với một môi trường. Nhánh khác đổi thì không có gì để kiểm.
+    branches: [main, dev]
+    # Chỉ khi manifest đổi. Sửa README hay chính tệp này thì không việc gì phải đụng cụm.
+    paths:
+      - "staging/**"
+      - "prod/**"
+  workflow_dispatch:
+
+# Nhiều lần merge sát nhau chỉ cần kiểm trạng thái CUỐI CÙNG. Không có dòng này thì mỗi
+# lần merge lại xếp thêm một lượt kiểm vào hàng đợi của platform, mà các lượt trước đã lỗi
+# thời ngay khi lượt sau tới.
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # SỬA CHO KHỚP tên ứng dụng — quyết định platform đi kiểm namespace nào.
+  APP: __APP__
+  PLATFORM_REPO: __PLATFORM_REPO__
+
+jobs:
+  ask-platform-to-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gọi platform kiểm cụm
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Nhánh quyết định môi trường, giống hệt quy ước bên kho mã ứng dụng.
+          case "$GITHUB_REF_NAME" in
+            main) ENVNAME=prod ;;
+            dev)  ENVNAME=staging ;;
+            *)    echo "nhánh $GITHUB_REF_NAME không gắn với môi trường nào, bỏ qua"; exit 0 ;;
+          esac
+          echo "==> $GITHUB_REF_NAME -> kiểm $APP ở $ENVNAME"
+          jq -n --arg app "$APP" --arg denv "$ENVNAME" \
+            '{event_type:"verify-request", client_payload:{app:$app, env:$denv}}' \
+          | tee /dev/stderr \
+          | gh api -X POST "/repos/${PLATFORM_REPO}/dispatches" --input -
+          echo "==> đã nhờ ${PLATFORM_REPO} kiểm giúp"
