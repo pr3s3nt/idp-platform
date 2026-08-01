@@ -784,22 +784,105 @@ một ảnh mới xây lại. Manifest đổi từ nhãn không tồn tại sang
 sau khi merge có cùng nội dung, chúng có cùng nhãn ảnh, nên **thứ lên production đúng là thứ
 đã chạy ở staging** — không phải "một bản xây lại từ cùng mã nguồn", mà đúng cái ảnh đó.
 
-#### Còn để lại
+#### Đồng bộ nốt 4 ứng dụng còn lại
 
-Hai việc chưa làm, cố ý để lại chờ quyết định vì mỗi việc đều kéo theo hệ quả:
+Bốn ứng dụng kia — `demo`, `sample-nginx`, `sample-pg`, `sample-boutique` — đều mang cùng cái
+bẫy trên nhánh `main`. Đưa bản sửa CI lên `main` cho cả bốn, mỗi lần đều kiểm lại. Sau đó
+nhãn ảnh của cả bốn trên production đều là mã nội dung, không còn cái nào là mã commit.
 
-- **Đồng bộ `main` với `dev` cho 4 ứng dụng còn lại.** Bản thân việc sửa là an toàn, nhưng nó
-  đồng nghĩa với 4 lần triển khai lên production.
-- **Bịt lỗ hổng "production không được kiểm".** Có hai hướng, đánh đổi khác nhau: đặt một
-  công việc canh chừng chạy định kỳ (đơn giản, nhưng phát hiện chậm và phụ thuộc máy chạy có
-  bật hay không), hoặc để kho cấu hình tự báo về platform ngay khi có người merge (phát hiện
-  tức thì, nhưng phải cấp thêm một khoá cho từng kho cấu hình).
+Nhân đây phát hiện thêm một chuyện đáng nói: **chỉ duy nhất `helloworld-config` thật sự có
+cổng duyệt production.** Bảy kho cấu hình còn lại là kho riêng tư trên gói miễn phí, mà
+GitHub không cho bật bảo vệ nhánh trên kho riêng tư ở gói đó. Nên bốn lần triển khai vừa rồi
+lên thẳng production, không qua pull request nào.
+
+Đây không phải lỗi của platform — nó đọc GitHub và trả lời đúng những gì GitHub nói. Chỉ là
+sandbox không có hàng rào để mà đọc. Ở công ty, nơi mọi nhánh đều được bảo vệ, kết quả sẽ
+ngược lại hoàn toàn: mọi ứng dụng đều phải qua duyệt. Nhưng nó cho thấy một điều nên nhớ khi
+mang vào công ty: **nếu ai đó lỡ tay tắt bảo vệ nhánh, platform sẽ im lặng chuyển sang ghi
+thẳng.** Không có cảnh báo nào cả.
+
+### 6.20. Bịt lỗ hổng, rồi phát hiện phép kiểm vốn đã hỏng sẵn
+
+Cách bịt đã chọn: **để kho cấu hình tự báo về platform.** Kho cấu hình là nơi duy nhất biết
+chắc "manifest đã thật sự nằm trên nhánh rồi", bất kể nó tới bằng người merge pull request
+hay bằng platform ghi thẳng. Nên nó là chỗ hợp lý để phát tín hiệu.
+
+Cụ thể: mỗi kho cấu hình có thêm một workflow nhỏ, chạy khi `main` hoặc `dev` đổi và có đụng
+tới thư mục manifest. Nó chỉ làm một việc — gọi platform và nói "kiểm giúp app này ở môi
+trường này". Platform có thêm một job `verify` nhận lời gọi đó, lấy manifest ở đúng nhánh môi
+trường rồi đối chiếu với cụm.
+
+Chọn hướng này thay vì canh chừng định kỳ vì hai lý do. Thứ nhất là **thời điểm**: nó chạy
+ngay lúc merge chứ không phải mười lăm phút sau. Thứ hai là **không phụ thuộc máy chạy CI có
+bật hay không** — canh chừng định kỳ mà máy tắt thì lịch chạy dồn lại, và cái im lặng đó lại
+là một điểm mù mới. Đổi lại phải cấp một khoá cho mỗi kho cấu hình; ở công ty thì đặt một
+khoá cấp tổ chức là xong một lần cho tất cả.
+
+#### Rồi phép thử cho ra kết quả không ai muốn
+
+Chạy thử đường sạch thì đúng: merge pull request → kho cấu hình báo về → platform kiểm → xanh.
+
+Nhưng một phép kiểm chỉ đáng tin khi nó biết **báo đỏ**. Nên tôi cố ý phá: đặt một nhãn ảnh
+toàn số không vào manifest production, merge, rồi xem.
+
+**Nó báo xanh.**
+
+Trong khi cụm lúc đó thế này:
+
+```
+helloworld-5c564ff559-5xnd8   Running            ← pod cũ
+helloworld-5c564ff559-8j9v5   Running            ← pod cũ
+helloworld-5c564ff559-wpzm5   Running            ← pod cũ
+helloworld-759787cf5b-cgmcg   ImagePullBackOff   ← pod mới, chết
+```
+
+Lý do nằm ở câu hỏi mà phép kiểm đặt ra. Nó hỏi *"có đủ bản sao sẵn sàng không?"* — và câu
+trả lời là **có**, vì ba pod **cũ** vẫn đang phục vụ bình thường. Kubernetes chỉ tạo một pod
+mới, pod đó chết, nên nó giữ nguyên ba pod cũ. Đứng từ góc nhìn "đủ bản sao" thì mọi thứ hoàn
+hảo.
+
+Điều trớ trêu là **đây đúng bằng hình dạng của sự cố ở mục 6.19** — ba pod cũ chạy, một pod
+mới ImagePullBackOff. Tức là bước kiểm cụm, thứ được thêm vào từ mục 6.14 chính vì loại sự cố
+này, **chưa bao giờ bắt được nó**. Nó chỉ bắt được trường hợp Deployment hoàn toàn chưa tồn
+tại hoặc ảnh trong manifest khác ảnh trên cụm — chứ không bắt được trường hợp triển khai kẹt
+giữa chừng.
+
+Nói cách khác: suốt từ mục 6.14 tới giờ, platform có một phép kiểm mà mọi người tin là nó
+đang canh — kể cả tôi khi viết tài liệu này. Chỉ khi cố tình phá mới lộ ra.
+
+#### Sửa
+
+Đổi câu hỏi. Thay vì *"có đủ bản sao sẵn sàng không"*, giờ hỏi đúng ba câu mà lệnh
+`kubectl rollout status` hỏi:
+
+1. Kubernetes đã xử lý bản sửa mới nhất chưa? (nếu chưa thì trạng thái đang nói về phiên bản
+   **trước**, tin vào nó là tin một câu trả lời lỗi thời)
+2. Tất cả bản sao đã là bản **mới** chưa?
+3. Bản **cũ** đã được thu hồi chưa?
+
+Chạy lại đúng phép thử đó: **báo đỏ**, kèm danh sách pod và sự kiện đủ để hiểu ngay chuyện gì
+xảy ra. Rồi hoàn tác nhãn ảnh, kiểm lại: xanh.
+
+Chuỗi năm lần kiểm liên tiếp là toàn bộ bằng chứng:
+
+| Kết quả | Chuyện gì |
+|---|---|
+| đỏ | lỗi của tôi ở bước chuẩn bị — truyền sai kiểu tham số |
+| xanh | sửa xong, cụm khoẻ thật |
+| xanh | **sai** — ảnh hỏng đã nằm trên production mà vẫn xanh |
+| đỏ | **đúng** — sau khi sửa phép kiểm thì bắt được |
+| xanh | hoàn tác xong, cụm khoẻ trở lại |
+
+Bài học rút ra, và nó áp dụng cho mọi phép kiểm chứ không riêng cái này: **một phép kiểm chưa
+từng báo đỏ thì chưa phải là một phép kiểm.** Nó mới chỉ là một dòng chữ màu xanh khiến người
+ta yên tâm.
 
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
-**61/61 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
-pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10) và bí mật của ứng dụng (6.11).
+**64/64 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
+pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10), bí mật của ứng dụng (6.11) và
+ba tình huống triển khai kẹt giữa chừng mà phép kiểm cũ bỏ lọt (6.20).
 
 ### Kiểm chứng chạy thật
 
@@ -818,7 +901,8 @@ pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10) và bí m
 | Phụ thuộc xuyên kho mã | Địa chỉ tự đổi theo môi trường, không cần hai ứng dụng biết nhau |
 | Cài lại từ đầu | Dựng một bản cài mới theo đúng tài liệu hướng dẫn — chạy được |
 | Dự án ba service dùng chung database | Bốn tình huống vận hành, database không khởi động lại lần nào |
-| Merge pull request production | Fleet nhận commit mới trong khoảng một phút và áp lên cụm — **nhưng không có bước nào kiểm lại kết quả** (6.19) |
+| Merge pull request production | Fleet nhận commit mới trong khoảng một phút và áp lên cụm, kho cấu hình báo về platform, platform kiểm cụm và trả kết quả (6.19, 6.20) |
+| **Phép kiểm có biết báo đỏ không** | Cố ý đặt nhãn ảnh không tồn tại vào production: lần đầu nó **báo xanh sai** vì pod cũ vẫn phục vụ; sau khi sửa thì bắt đúng, kèm chẩn đoán (6.20) |
 | Nhãn ảnh theo nội dung khi thăng cấp | Sau khi merge `dev` sang `main`, hai nhánh cùng nội dung nên cùng nhãn ảnh — production nhận **đúng ảnh** staging đang chạy, không phải bản xây lại |
 
 ### Quy mô hiện tại
@@ -843,8 +927,7 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 | Sandbox chưa có phân quyền | Mọi thứ dùng chung một token toàn quyền | Môi trường thật cần tách quyền theo từng repo |
 | Chỉ có một máy chủ chạy CI | Nhiều ứng dụng đẩy code cùng lúc thì phải xếp hàng nối đuôi. Đo thực tế: sáu ứng dụng cùng lúc mất khoảng 15 phút mới xong hết | Môi trường nhiều đội cần nhiều máy chủ, và nên chia theo đội để phân quyền cụm siết được |
 | Ứng dụng vẫn phải đăng ký thủ công | Tạo kho cấu hình, đăng ký với hệ thống đồng bộ, cấp khoá — đều làm tay | Có thể tự động hoá, chưa làm |
-| **Production không được kiểm sau khi merge** | Bước kiểm cụm bị bỏ qua khi triển khai phải đi qua pull request, và sau lúc người ta merge thì không có gì chạy lại. Càng siết production bằng quy trình duyệt thì càng đẩy nó ra khỏi tầm kiểm tra (6.19) | **Chưa bịt.** Hai hướng đã cân nhắc: canh chừng định kỳ, hoặc để kho cấu hình báo về platform khi có merge |
-| **Nhánh `main` của 4 ứng dụng còn mang CI cũ** | `demo`, `sample-nginx`, `sample-pg`, `sample-boutique`: bước xây ảnh gắn cứng mã commit trong khi bước gọi platform khai nhãn theo nội dung. Chưa hỏng chỉ vì chưa ai đẩy code lên `main` | Sửa bằng cách merge `dev` sang `main`, nhưng việc đó kéo theo 4 lần triển khai production nên đang chờ quyết định |
+| **Tắt bảo vệ nhánh thì platform im lặng chuyển sang ghi thẳng** | Platform hỏi GitHub xem nhánh có được bảo vệ không rồi làm theo. Nếu ai đó lỡ tay tắt bảo vệ, cổng duyệt production biến mất mà không có cảnh báo nào (6.19) | Đây là mặt trái của việc lấy GitHub làm nguồn sự thật duy nhất. Đổi lại thì không có chỗ nào khai trùng lặp để sai lệch |
 | Một kho cấu hình đang để công khai | `helloworld-config` được chuyển sang công khai để bật branch protection (bản miễn phí chỉ hỗ trợ kho công khai) | Đã soát toàn bộ lịch sử trước khi chuyển: **0 bí mật**, không có Secret nào. Kho mã ứng dụng vẫn riêng tư |
 
 ---
