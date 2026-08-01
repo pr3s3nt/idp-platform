@@ -2,6 +2,10 @@
 
 > Dựng toàn bộ platform trên một hạ tầng mới. Khoảng 45 phút.
 >
+> **Đã kiểm chứng**: tài liệu này được dùng để cài lại platform từ đầu trên một cụm mới
+> (`idp-platform-v2`). Kết quả: ứng dụng thử chạy, bundle Ready, gọi qua Gateway trả `200`.
+> Ba chỗ thiếu phát hiện trong quá trình đó đã được bổ sung vào phần G.
+>
 > Ví dụ dùng hậu tố `v2` và một cụm kind tên `v2`. Thay bằng tên của bạn.
 
 ---
@@ -99,6 +103,7 @@ nodes:
   - { containerPort: 30443, hostPort: 17443, protocol: TCP }
 EOF
 kind create cluster --name v2 --config /tmp/kind-v2.yaml
+mkdir -p ~/.kube                      # có thể chưa tồn tại trên máy mới
 kind get kubeconfig --name v2 > ~/.kube/v2.conf
 ```
 
@@ -333,6 +338,22 @@ Cài GitHub App vào repo platform mới (bỏ qua nếu App đang cài chế đ
 Làm theo `HUONG-DAN-TAO-APP-MOI.md`. Ngắn gọn: repo app 4 file, repo cấu hình 2 nhánh,
 2 `GitRepo` của Fleet, một secret cho CI.
 
+Ba chi tiết dễ vấp, phát hiện khi tự cài lại theo chính tài liệu này:
+
+**Đặt tên `GitRepo` bằng đúng tên app**, không thêm hậu tố môi trường. Fleet đặt tên bundle
+là `<tên-GitRepo>-<thư-mục>`, nên đặt `smoke-staging` sẽ ra bundle `smoke-staging-staging`.
+Không sai chức năng nhưng gây nhầm khi tra cứu.
+
+**Nhánh mặc định của repo app phải là `dev`**, vì CI kích hoạt theo nhánh và `main` là
+production:
+
+```bash
+gh api -X PATCH repos/<org>/<repo-app> -f default_branch=dev
+```
+
+**Sửa `PLATFORM_REPO` trong CI của app** trỏ đúng repo platform của bản cài này. Sao chép CI
+từ app cũ mà quên đổi thì nó gọi sang platform cũ, và triển khai chạy trên hạ tầng khác.
+
 Coi là **cài đặt thành công** khi:
 
 | Kiểm | Mong đợi |
@@ -343,6 +364,10 @@ Coi là **cài đặt thành công** khi:
 | `kubectl get bundle -n fleet-local` | `1/1` |
 | `kubectl get pods -n <app>-staging` | `Running` |
 | Gọi qua Gateway | `200` |
+
+> Bundle của **production sẽ chưa xuất hiện** sau lần triển khai đầu. Đúng thiết kế: hai môi
+> trường ở hai nhánh khác nhau, nên bước khởi tạo production tự bỏ qua. Production lên khi
+> có người merge `dev` → `main` ở repo app.
 
 ---
 
