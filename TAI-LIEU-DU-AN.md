@@ -602,6 +602,26 @@ Cũng đáng ghi lại về cách lỗi biểu hiện: triển khai vẫn báo *
 cấu hình vẫn được ghi đúng, chỉ có ứng dụng là không chạy. Lại thêm một lỗi im lặng ở tầng
 điều phối, chỉ ồn ào ở tầng cụm.
 
+**Và đó là lý do sinh ra bước kiểm cuối cùng.** Cả chuỗi phòng thủ trước đó — chốt thứ tự,
+khoá trạng thái, đối chiếu phiên bản, bảo vệ nhánh — đều chỉ canh **phần điều phối**. Không
+có chỗ nào hỏi câu quan trọng nhất: *ứng dụng có thực sự chạy không?*
+
+Đã bổ sung một bước chạy sau mỗi lần triển khai: chờ tới khi mọi thành phần trong cấu hình
+vừa sinh ra **thực sự tồn tại trên cụm, chạy đúng phiên bản ảnh đó, và đủ số bản sao**. Quá
+hạn thì báo lỗi kèm danh sách ứng dụng và sự kiện của namespace — đúng thứ cần để hiểu ngay
+tại chỗ, thay vì phải tự đi dò.
+
+Thông báo khi mô phỏng lại đúng sự cố trên:
+
+```
+lỗi: helloworld đang chạy ảnh ...:8a744dbf, cần ...:khong-ton-tai
+helloworld/staging: cấu hình đã ghi và đã được đồng bộ, nhưng cụm KHÔNG chạy
+đúng thứ vừa sinh ra.
+```
+
+Bước này **được bỏ qua khi lần triển khai đó mở pull request** — cấu hình chưa được duyệt
+thì chưa ai áp lên cụm, kiểm lúc đó chắc chắn sai.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
