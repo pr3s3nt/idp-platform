@@ -156,7 +156,7 @@ tay ở https://github.com/settings/installations
 ### C1. Lên staging
 
 ```bash
-git push origin main
+git push origin dev
 ```
 
 Xong. CI build ảnh → gọi platform → orchestrator render → ghi nhánh `dev` → Fleet apply.
@@ -171,22 +171,25 @@ kubectl --kubeconfig <staging> get pods -n demo-staging
 
 ### C2. Lên production
 
-**Không tự động.** Phải gửi tường minh:
+Merge `dev` → `main` ở **repo app**. Nhánh quyết định môi trường:
 
-```bash
-gh api -X POST /repos/<org>/idp-platform/dispatches --input - <<EOF
-{"event_type":"deploy-request",
- "client_payload":{"app":"demo","repo":"<org>/idp-demo",
-                   "sha":"$(git rev-parse HEAD)","image":"demo","env":"prod"}}
-EOF
+```
+push dev   → staging
+push main  → production
 ```
 
-Orchestrator sẽ **mở pull request** vào nhánh `main` của repo cấu hình, **không tự merge**.
+Sau đó platform tự chọn cách ghi, **dựa trên branch protection thật của repo cấu hình**:
 
-Người vào đọc diff → duyệt → merge → Fleet cụm prod apply.
+| Repo cấu hình | Hành vi |
+|---|---|
+| `main` **không** bảo vệ | ghi thẳng — dự án demo tự phục vụ hoàn toàn |
+| `main` **có** bảo vệ | mở pull request, người đọc diff rồi merge |
 
-> Nút *Run workflow* trên giao diện GitHub **chỉ chạy được staging** — `workflow_dispatch`
-> chưa khai input `env`.
+Không phải khai gì trong file cấu hình. Muốn siết thì bật branch protection, platform
+tự chuyển sang chế độ pull request ngay lần deploy sau.
+
+Vẫn chạy tay được từ giao diện GitHub: *Actions → orchestrator → Run workflow*, chọn
+`env: prod`.
 
 ---
 
