@@ -279,3 +279,49 @@ phiên bản đã chạy : eaabaaa    <- khớp, không bỏ sót commit nào
 
 **Ý nghĩa:** ba người làm việc song song, kết quả cuối cùng đúng bằng commit mới nhất.
 Cơ sở dữ liệu không bị khởi động lại lần nào trong suốt cả ba kịch bản.
+
+## Kịch bản D — triển khai sai thứ tự
+
+Tình huống thật: hai người đẩy gần nhau, người sau build xong trước, nên yêu cầu triển
+khai của commit **cũ** đến **sau**. Nếu không chặn, môi trường lùi về bản cũ trong im lặng.
+
+Mô phỏng bằng cách gửi lại yêu cầu triển khai cho một commit cũ hơn.
+
+```
+đang chạy:  eaabaaa
+gửi lại:    42b486d   (cũ hơn hai commit)
+
+kết quả: THẤT BẠI — và đó là điều đúng
+refusing to deploy 42b486d... to staging: it is an ancestor of the
+already-deployed eaabaaa... (out-of-order dispatch)
+
+phiên bản đang chạy sau đó: eaabaaa   (không lùi)
+trang vẫn trả về: multi-dev web
+```
+
+**Ý nghĩa:** hệ thống từ chối đi lùi, và **báo lỗi ồn ào** thay vì lặng lẽ ghi đè.
+
+---
+
+## Tổng kết
+
+| Kịch bản | Mong đợi | Kết quả |
+|---|---|---|
+| Đăng ký dự án 3 service + 1 database | Một database dùng chung, ba service chạy | ✅ 4 pod, ổ đĩa `Bound`, HTTP 200 |
+| A — sửa một service | Chỉ service đó build và khởi động lại | ✅ 1/3 build, 1/4 pod mới |
+| B — hoàn tác | Không build lại, quay về ảnh cũ | ✅ `build: skipped` |
+| C — ba người cùng đẩy | Gộp về commit mới nhất, không bỏ sót | ✅ 2 lần huỷ, kết quả = HEAD |
+| D — triển khai sai thứ tự | Từ chối, không lùi | ✅ báo lỗi rõ, giữ nguyên bản mới |
+
+**Cơ sở dữ liệu không bị khởi động lại một lần nào** trong suốt cả bốn kịch bản —
+pod `pg-api-0fde295b-0` giữ nguyên thời điểm khởi tạo `02:41:30` từ đầu tới cuối.
+
+### Hai lỗi tìm thấy trong tài liệu, đã sửa
+
+1. **Mẫu CI phụ thuộc số service trong repo** — chép mẫu một-service cho repo ba service
+   thì hỏng ngay ở bước build. Tài liệu không hề nói.
+2. **Tên `GitRepo` phải kèm tên môi trường khi một cụm phục vụ nhiều môi trường** —
+   đặt trùng tên thì cái sau ghi đè cái trước, môi trường kia lặng lẽ không được đồng bộ.
+
+Cả hai đều thuộc loại **hỏng im lặng hoặc hỏng khó hiểu**, và cả hai chỉ lộ ra khi thực
+sự làm chứ không phải khi đọc lại tài liệu.
