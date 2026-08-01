@@ -1170,3 +1170,70 @@ def test_verify_skips_when_there_is_nothing_to_check(tmp_path, monkeypatch):
     monkeypatch.setattr(orc, "kubectl", fake_kubectl_returning({}))
     orc.cmd_verify(orc.argparse.Namespace(
         app="app", env="staging", manifests=str(m), kubeconfig=None, timeout=1))
+
+
+# ======================================================================================
+# NAMESPACE — quyền hạn chế của một đội
+#
+# Cả hai lỗi dưới đây chỉ lộ ra khi namespace_pattern KHÁC mặc định, tức đúng lúc mang
+# nền tảng vào một đội chỉ được cấp sẵn vài namespace và không có quyền tự tạo.
+# ======================================================================================
+def test_apply_secrets_dùng_namespace_pattern_trong_cấu_hình(tmp_path, monkeypatch):
+    """apply-secrets từng ghi cứng "{app}-{env}" trong khi render và verify đọc cấu hình.
+
+    Hậu quả khi đổi pattern: manifest vào một namespace, secret vào namespace khác.
+    apply-secrets vẫn báo thành công, orchestrator vẫn xanh — chỉ pod là không kéo nổi
+    ảnh vì thiếu secret kéo ảnh.
+    """
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"kubernetes": {"namespace_pattern": "doi-thanh-toan-{env}"}}))
+    seen = []
+
+    def fake(args, *, kubeconfig=None, **kw):
+        seen.append(args)
+        if args[:2] == ["get", "namespace"]:
+            return subprocess.CompletedProcess(args, 0, stdout="namespace/x", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake)
+    empty = tmp_path / "secrets.yaml"; empty.write_text("")
+    orc.cmd_apply_secrets(orc.argparse.Namespace(
+        app="thanh-toan", env="staging", secrets=str(empty), kubeconfig=None,
+        harbor_host="h", harbor_user="u", harbor_pass="p"))
+
+    dùng = [a for a in seen if "doi-thanh-toan-staging" in a]
+    assert dùng, f"không dùng namespace theo cấu hình; đã gọi: {seen}"
+    assert not [a for a in seen if "thanh-toan-staging" in a], "vẫn còn dựng tên theo mặc định"
+
+
+def test_không_gọi_create_khi_namespace_đã_tồn_tại(monkeypatch):
+    """Đội không có quyền create thì Kubernetes trả Forbidden, KHÔNG phải AlreadyExists —
+    vì nó kiểm quyền trước khi kiểm tồn tại. Gọi create rồi mới tha lỗi là giết cả lần
+    deploy dù namespace đã nằm sẵn đó. Phải hỏi trước."""
+    gọi = []
+
+    def fake(args, *, kubeconfig=None, **kw):
+        gọi.append(args)
+        if args[:2] == ["get", "namespace"]:
+            return subprocess.CompletedProcess(args, 0, stdout="namespace/co-san", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake)
+    orc.ensure_namespace("co-san", None)
+    assert not [a for a in gọi if a[:2] == ["create", "namespace"]], \
+        "vẫn gọi create dù namespace đã tồn tại"
+
+
+def test_thiếu_quyền_tạo_namespace_thì_hỏng_ồn_ào(monkeypatch):
+    """Namespace CHƯA có và cũng không có quyền tạo: phải dừng kèm thông báo rõ, không
+    được đi tiếp rồi ghi secret vào hư không."""
+    def fake(args, *, kubeconfig=None, **kw):
+        if args[:2] == ["get", "namespace"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="NotFound")
+        return subprocess.CompletedProcess(
+            args, 1, stdout="",
+            stderr='namespaces is forbidden: User "u" cannot create resource "namespaces"')
+
+    monkeypatch.setattr(orc, "kubectl", fake)
+    with pytest.raises(SystemExit, match="forbidden"):
+        orc.ensure_namespace("chua-co", None)

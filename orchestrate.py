@@ -177,6 +177,20 @@ def sha_record_dir() -> str:
     return CONFIG.get("kubernetes.sha_record_dir")
 
 
+def app_namespace(app: str, env: str) -> str:
+    """Namespace của một app trong một môi trường — MỘT chỗ tính, mọi lệnh dùng chung.
+
+    Trước đây `render` và `verify` đọc namespace_pattern còn `apply-secrets` ghi cứng
+    "{app}-{env}". Chừng nào pattern còn để mặc định thì hai cách cho ra cùng kết quả nên
+    không ai thấy gì. Đổi pattern — việc bắt buộc phải làm khi một đội chỉ được cấp sẵn
+    vài namespace và không được tự tạo — thì manifest vào một namespace còn secret vào
+    namespace khác: apply-secrets vẫn báo thành công, orchestrator vẫn xanh, chỉ có pod
+    là không kéo nổi ảnh vì thiếu secret kéo ảnh.
+    """
+    pattern = CONFIG.get("kubernetes.namespace_pattern", "{app}-{env}") or "{app}-{env}"
+    return pattern.replace("{app}", app).replace("{env}", env)
+
+
 # --------------------------------------------------------------------------------------
 # plumbing
 # --------------------------------------------------------------------------------------
@@ -663,6 +677,21 @@ def _tolerate_exists(cp: subprocess.CompletedProcess, what: str) -> None:
 
 
 def ensure_namespace(ns: str, kubeconfig: str | None) -> None:
+    """Tạo namespace nếu chưa có — nhưng HỎI trước khi tạo.
+
+    Gọi thẳng `create` rồi tha lỗi "đã tồn tại" chỉ đúng khi mình có quyền tạo. Một đội
+    được cấp sẵn vài namespace và KHÔNG có quyền create thì Kubernetes trả Forbidden chứ
+    không phải AlreadyExists — vì nó kiểm quyền trước khi kiểm tồn tại. Khi đó
+    _tolerate_exists giết cả lần deploy dù namespace đã nằm sẵn đó.
+
+    Hỏi trước thì trường hợp phổ biến nhất ở công ty — namespace tạo sẵn, quyền tạo không
+    có — chạy bình thường, mà vẫn giữ nguyên tính chất "thiếu quyền thật thì hỏng ồn ào".
+    """
+    cp = kubectl(["get", "namespace", ns, "-o", "name"],
+                 kubeconfig=kubeconfig, check=False, capture=True)
+    if cp.returncode == 0:
+        log(f"namespace {ns} đã có -> không tạo")
+        return
     _tolerate_exists(
         kubectl(["create", "namespace", ns], kubeconfig=kubeconfig, check=False, capture=True),
         f"namespace {ns}",
@@ -670,7 +699,7 @@ def ensure_namespace(ns: str, kubeconfig: str | None) -> None:
 
 
 def cmd_apply_secrets(args) -> None:
-    ns = f"{args.app}-{args.env}"
+    ns = app_namespace(args.app, args.env)
     ensure_namespace(ns, args.kubeconfig)
 
     if args.harbor_host:
@@ -1057,8 +1086,7 @@ def cmd_verify(args) -> None:
     cụm, nên không thể bắt được loại lỗi này. Đây là chỗ duy nhất trong toàn luồng thực sự
     hỏi "ứng dụng có chạy không".
     """
-    ns = (CONFIG.get("kubernetes.namespace_pattern", "{app}-{env}")
-          .replace("{app}", args.app).replace("{env}", args.env))
+    ns = app_namespace(args.app, args.env)
     want: dict[str, list[str]] = {}
     for doc in load_all(Path(args.manifests)):
         if doc.get("kind") != "Deployment":
