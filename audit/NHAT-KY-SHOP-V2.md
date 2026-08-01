@@ -162,3 +162,120 @@ Trang trả về `v2 - chi sua web`.
 **Ý nghĩa:** trong một repo nhiều service, sửa một service **không** làm gián đoạn các
 service khác, và đặc biệt **không đụng tới cơ sở dữ liệu**. Nếu nhãn ảnh lấy theo mã
 commit của cả repo thì cả bốn pod đều bị khởi động lại.
+
+## Kịch bản A — sửa **một** service trong repo ba service
+
+Sửa nội dung của `web`, không đụng `api` và `worker`.
+
+### Nhãn ảnh trước và sau
+
+```
+api     21eff32b9119 -> 21eff32b9119   KHÔNG đổi
+web     4c26c55af180 -> 8ee35228f83d   đổi
+worker  d887e2ca123f -> d887e2ca123f   KHÔNG đổi
+```
+
+### Quyết định của CI
+
+```
+bỏ qua  api    — ảnh đã có
+cần build web
+bỏ qua  worker — ảnh đã có
+```
+
+**1/3 job build chạy.** Hai service không đổi không tốn một giây build nào.
+
+### Pod nào bị khởi động lại — 09:44:52
+
+```
+api-7597bd668f-2vqrk      2026-08-01T02:41:26Z
+pg-api-0fde295b-0         2026-08-01T02:41:30Z
+web-66b85d77b8-vmxsh      2026-08-01T02:44:14Z
+worker-5f5fbd6b74-jxng6   2026-08-01T02:41:26Z
+```
+
+## Kịch bản B — hoàn tác (revert)
+
+`git revert` commit vừa rồi của `web`, rồi đẩy lên.
+
+### Nhãn ảnh quay về đúng giá trị cũ
+
+```
+web  8ee35228f83d  ->  4c26c55af180   (đúng nhãn trước khi sửa)
+```
+
+Vì nhãn tính theo **nội dung thư mục**, hoàn tác nội dung thì nhãn cũng quay về —
+và ảnh đó **vẫn còn trên registry**.
+
+### CI không build lại gì cả
+
+```
+plan:     success
+build:    SKIPPED        <- không có service nào cần build
+dispatch: success
+
+bỏ qua api    — ảnh đã có
+bỏ qua web    — ảnh đã có     <- ảnh cũ được dùng lại
+bỏ qua worker — ảnh đã có
+```
+
+### Cụm quay về trạng thái cũ — 09:46:27
+
+```
+web-dbc96d574-bkxvj   02:46:04   pod mới, nhưng chạy ẢNH CŨ
+api / worker / pg     02:41:26   không đụng
+trang trả về: v1
+```
+
+**Ý nghĩa:** hoàn tác là thao tác **rẻ và nhanh** — không phải build lại, không phải chờ
+registry. Với nhãn theo mã commit thì revert tạo commit MỚI nên nhãn cũng mới, buộc phải
+build lại toàn bộ và chờ như một lần triển khai bình thường.
+
+## Kịch bản C — nhiều người cùng làm việc
+
+Ba người sửa ba service khác nhau, đẩy cách nhau 6 giây.
+
+```
+09:46:39  người sửa api    -> 42b486d
+09:46:45  người sửa worker -> 1cbce6f
+09:46:51  người sửa web    -> eaabaaa
+```
+
+### Hai lần chạy trung gian bị huỷ — có chủ ý
+
+```
+42b486d  cancelled
+1cbce6f  cancelled
+eaabaaa  success      <- chỉ commit mới nhất đi tiếp
+```
+
+Ba lần đẩy sinh ra **một** lần triển khai, không phải ba. Đây là chủ ý: ba lần triển
+khai nối đuôi nhau chỉ tổ làm ứng dụng khởi động lại ba lần để đi tới cùng một kết quả.
+
+> Không có cơ chế gộp này, hàng đợi phía sau chỉ giữ được **một** lần chờ, và lần chờ cũ
+> bị huỷ khi có lần mới — nghĩa là commit **mới nhất** có thể bị bỏ rơi còn commit giữa
+> lại được triển khai. Gộp ngay từ đầu thì không còn gì để bỏ rơi nhầm.
+
+### Build đủ ba, vì cả ba đều thay đổi thật
+
+```
+build (api)     success
+build (web)     success
+build (worker)  success
+-> khác kịch bản A: ở đó chỉ 1/3 build vì chỉ 1 service đổi
+```
+
+### Kết quả trên cụm — 09:49:38
+
+```
+api-5d795845b9-vmxz8      02:48:57   mới
+web-74c6bcbfdf-db2cl      02:48:57   mới
+worker-58d8d4dbdb-xq5qj   02:48:57   mới
+pg-api-0fde295b-0         02:41:30   KHÔNG ĐỔI  <- cơ sở dữ liệu không bị động
+
+HEAD của repo app : eaabaaa
+phiên bản đã chạy : eaabaaa    <- khớp, không bỏ sót commit nào
+```
+
+**Ý nghĩa:** ba người làm việc song song, kết quả cuối cùng đúng bằng commit mới nhất.
+Cơ sở dữ liệu không bị khởi động lại lần nào trong suốt cả ba kịch bản.
