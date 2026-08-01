@@ -2,6 +2,9 @@
 
 > Công thức đã chạy thật, không phải lý thuyết. Khoảng 10 phút.
 >
+> **Đã kiểm chứng** bằng cách tạo app `demo` từ số 0 theo đúng các bước dưới đây:
+> staging lên 1 pod, production lên 3 pod, cả hai trả HTTP 200, 7/7 bundle Ready.
+>
 > Ví dụ dùng tên app `demo`. Thay `demo` bằng tên app của bạn ở mọi chỗ.
 
 ---
