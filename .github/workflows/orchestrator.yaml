@@ -571,10 +571,12 @@ jobs:
           echo "$STAGING_B64" | base64 -d > cluster-config-staging
           echo "$PROD_B64"    | base64 -d > cluster-config-prod
 
+      # --require-cluster là cờ bật/tắt, không nhận tên tệp: nó đọc biến môi trường
+      # KUBECONFIG. Truyền tên tệp như một tham số thì argparse báo lỗi ngay.
       - name: Preflight
-        run: |
-          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" preflight \
-            --require-cluster "cluster-config-$DEPLOY_ENV"
+        run: python3 platform/orchestrate.py --env-config "$ENV_CONFIG" preflight --require-cluster
+        env:
+          KUBECONFIG: ${{ github.workspace }}/cluster-config-${{ github.event.client_payload.env || 'prod' }}
 
       # Lấy đúng nhánh môi trường, tức đúng thứ Fleet đang đồng bộ.
       - name: Checkout config repo
