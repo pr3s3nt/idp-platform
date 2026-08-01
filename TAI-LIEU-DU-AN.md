@@ -721,6 +721,80 @@ Hai lỗi tìm thấy trong tài liệu hướng dẫn tạo ứng dụng, đề
   tên thì cái sau đè lên cái trước, và môi trường còn lại lặng lẽ không được đồng bộ. Bản cài
   trước không gặp lỗi này vì mỗi môi trường có cụm riêng.
 
+### 6.19. Merge một pull request rồi phát hiện production chưa bao giờ được kiểm
+
+Chuyện bắt đầu rất bình thường. Có một pull request đưa `helloworld` lên production nằm chờ
+duyệt từ hôm trước. Duyệt xong, merge. Fleet nhận commit mới trong vòng một phút. Rồi đứng im
+ở **1/3 pod**.
+
+Pod mới không khởi động được: `ImagePullBackOff`. Ảnh nó đòi — `helloworld:f9763e94…` — không
+tồn tại trên kho ảnh.
+
+**Nguyên nhân là một mâu thuẫn nằm gọn trong cùng một tệp.** Cấu hình CI của `helloworld` trên
+nhánh `main` làm hai việc trái ngược nhau:
+
+- Bước xây ảnh đẩy lên với nhãn `${GITHUB_SHA}` — tức **mã commit**
+- Bước gọi platform lại khai `tag_strategy: "content"` — tức **mã nội dung** (tree hash)
+
+Hai bên nói hai ngôn ngữ khác nhau. Ảnh được đẩy lên mang một tên, còn manifest lại đi tìm một
+tên khác. Không bao giờ gặp nhau.
+
+Điều khó chịu là **bản sửa đã có sẵn từ trước**. Commit `03bde49` — "CI hỏi platform tên ảnh
+thay vì gắn cứng SHA" — sửa đúng chỗ này. Nhưng nó nằm ở nhánh `dev` và chưa từng được merge
+lên `main`. Staging chạy CI đã sửa nên vẫn tốt; production chạy CI cũ nên hỏng. Hai môi trường
+lệch nhau không phải vì mã nguồn của ứng dụng, mà vì **cách xây ứng dụng** lệch nhau.
+
+Rà lại toàn bộ thì **5 trong 6 ứng dụng** đang mang cùng cái bẫy này trên nhánh `main`. Chúng
+chưa hỏng chỉ vì chưa ai đẩy code lên `main` kể từ lúc đó.
+
+#### Nhưng vì sao không ai biết
+
+Đây mới là phần đáng ngại. Xem bảng các bước của lần chạy orchestrator:
+
+```
+success  Commit & push config repo
+skipped  Kiểm cụm thực sự chạy đúng thứ vừa render     ← đây
+success  Check staging reached the tip of the app branch
+success  Summary
+```
+
+Bước kiểm cụm — thứ được thêm vào ở mục 6.14 chính vì sự cố nhãn ảnh lần trước — **bị bỏ qua**.
+Và nó bị bỏ qua một cách hoàn toàn hợp lý: khi triển khai phải đi qua pull request, manifest
+chưa được merge, Fleet chưa thấy gì, kiểm cụm lúc đó chắc chắn sai.
+
+Vấn đề nằm ở chỗ **sau khi người ta merge thì không có gì chạy lại**. Lần chạy orchestrator đã
+kết thúc từ trước đó, xanh toàn tập. Việc merge chỉ là một thao tác trên GitHub, không kích
+hoạt điều gì bên phía platform.
+
+Ghép hai điều này lại thì ra một kết luận không dễ chịu: **production là môi trường duy nhất
+không bao giờ được kiểm.** Staging thì có — nó ghi thẳng, không qua pull request, nên bước
+kiểm cụm luôn chạy. Càng cẩn thận với production bao nhiêu — bắt buộc duyệt, bắt buộc pull
+request — thì càng vô tình đẩy nó ra khỏi tầm kiểm tra bấy nhiêu.
+
+Đúng cái nghịch lý mà tài liệu này lặp đi lặp lại: hàng rào an toàn tự nó tạo ra một điểm mù.
+
+#### Đã sửa gì
+
+Đưa bản sửa CI từ `dev` lên `main` cho `helloworld`. Lần chạy sau đó xây ảnh với nhãn
+`8a744dbf…` — **đúng bằng ảnh staging đang chạy**, tức bản đã được kiểm thật chứ không phải
+một ảnh mới xây lại. Manifest đổi từ nhãn không tồn tại sang nhãn đó, merge, Fleet đồng bộ,
+3/3 pod chạy, URL trả 200.
+
+Đây cũng là một minh chứng ngoài dự tính cho cách đánh nhãn theo nội dung: vì `main` và `dev`
+sau khi merge có cùng nội dung, chúng có cùng nhãn ảnh, nên **thứ lên production đúng là thứ
+đã chạy ở staging** — không phải "một bản xây lại từ cùng mã nguồn", mà đúng cái ảnh đó.
+
+#### Còn để lại
+
+Hai việc chưa làm, cố ý để lại chờ quyết định vì mỗi việc đều kéo theo hệ quả:
+
+- **Đồng bộ `main` với `dev` cho 4 ứng dụng còn lại.** Bản thân việc sửa là an toàn, nhưng nó
+  đồng nghĩa với 4 lần triển khai lên production.
+- **Bịt lỗ hổng "production không được kiểm".** Có hai hướng, đánh đổi khác nhau: đặt một
+  công việc canh chừng chạy định kỳ (đơn giản, nhưng phát hiện chậm và phụ thuộc máy chạy có
+  bật hay không), hoặc để kho cấu hình tự báo về platform ngay khi có người merge (phát hiện
+  tức thì, nhưng phải cấp thêm một khoá cho từng kho cấu hình).
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
@@ -744,6 +818,8 @@ pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10) và bí m
 | Phụ thuộc xuyên kho mã | Địa chỉ tự đổi theo môi trường, không cần hai ứng dụng biết nhau |
 | Cài lại từ đầu | Dựng một bản cài mới theo đúng tài liệu hướng dẫn — chạy được |
 | Dự án ba service dùng chung database | Bốn tình huống vận hành, database không khởi động lại lần nào |
+| Merge pull request production | Fleet nhận commit mới trong khoảng một phút và áp lên cụm — **nhưng không có bước nào kiểm lại kết quả** (6.19) |
+| Nhãn ảnh theo nội dung khi thăng cấp | Sau khi merge `dev` sang `main`, hai nhánh cùng nội dung nên cùng nhãn ảnh — production nhận **đúng ảnh** staging đang chạy, không phải bản xây lại |
 
 ### Quy mô hiện tại
 
@@ -767,6 +843,8 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 | Sandbox chưa có phân quyền | Mọi thứ dùng chung một token toàn quyền | Môi trường thật cần tách quyền theo từng repo |
 | Chỉ có một máy chủ chạy CI | Nhiều ứng dụng đẩy code cùng lúc thì phải xếp hàng nối đuôi. Đo thực tế: sáu ứng dụng cùng lúc mất khoảng 15 phút mới xong hết | Môi trường nhiều đội cần nhiều máy chủ, và nên chia theo đội để phân quyền cụm siết được |
 | Ứng dụng vẫn phải đăng ký thủ công | Tạo kho cấu hình, đăng ký với hệ thống đồng bộ, cấp khoá — đều làm tay | Có thể tự động hoá, chưa làm |
+| **Production không được kiểm sau khi merge** | Bước kiểm cụm bị bỏ qua khi triển khai phải đi qua pull request, và sau lúc người ta merge thì không có gì chạy lại. Càng siết production bằng quy trình duyệt thì càng đẩy nó ra khỏi tầm kiểm tra (6.19) | **Chưa bịt.** Hai hướng đã cân nhắc: canh chừng định kỳ, hoặc để kho cấu hình báo về platform khi có merge |
+| **Nhánh `main` của 4 ứng dụng còn mang CI cũ** | `demo`, `sample-nginx`, `sample-pg`, `sample-boutique`: bước xây ảnh gắn cứng mã commit trong khi bước gọi platform khai nhãn theo nội dung. Chưa hỏng chỉ vì chưa ai đẩy code lên `main` | Sửa bằng cách merge `dev` sang `main`, nhưng việc đó kéo theo 4 lần triển khai production nên đang chờ quyết định |
 | Một kho cấu hình đang để công khai | `helloworld-config` được chuyển sang công khai để bật branch protection (bản miễn phí chỉ hỗ trợ kho công khai) | Đã soát toàn bộ lịch sử trước khi chuyển: **0 bí mật**, không có Secret nào. Kho mã ứng dụng vẫn riêng tư |
 
 ---
