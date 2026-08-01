@@ -601,7 +601,7 @@ def cmd_render(args) -> None:
 
     services = discover(app_dir)
     plan = plan_images(services, args.registry, args.image, args.tag, app_dir,
-                       getattr(args, "tag_strategy", "commit"))
+                       getattr(args, "tag_strategy", "content"))
     rewrite_images(services, plan)
 
     provisioners = sorted(catalog.glob("provisioners/*.provisioners.yaml"))
@@ -757,6 +757,31 @@ def upstream_record(config: Path, env: str, base: str) -> str:
     return cp.stdout.strip() if cp.returncode == 0 else ""
 
 
+def branch_is_protected(config: Path, branch: str) -> bool | None:
+    """Nhánh đích có branch protection không? None nghĩa là không xác định được.
+
+    Đây là NGUỒN SỰ THẬT DUY NHẤT cho việc "môi trường này có cần duyệt không". Trước đây
+    nó là một cờ trong platform.env.yaml, tức là hai nơi cùng khai một sự thật — và một cờ
+    ghi `require_pr: false` trong khi nhánh thật đang được bảo vệ là một lời nói dối chỉ
+    vỡ ra lúc push.
+
+    Hệ quả thực tế: một repo demo không bật bảo vệ thì tự phục vụ hoàn toàn, không phải
+    khai gì. Đến khi đội đó làm nghiêm túc, họ bật protection và platform tự chuyển sang
+    chế độ pull request — không sửa cấu hình, không deploy lại.
+    """
+    url = run(["git", "remote", "get-url", "origin"],
+              cwd=config, check=False, capture=True).stdout.strip()
+    m = re.search(r"[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
+    if not m:
+        return None
+    cp = run(["gh", "api", f"repos/{m.group(1)}/{m.group(2)}/branches/{branch}",
+              "--jq", ".protected"], cwd=config, check=False, capture=True)
+    if cp.returncode != 0:
+        return None
+    value = cp.stdout.strip()
+    return {"true": True, "false": False}.get(value)
+
+
 def open_pull_request(config: Path, base: str, head: str, title: str, body: str) -> str:
     """Open a PR and return its URL. Does NOT merge — a human approves and merges.
 
@@ -808,8 +833,17 @@ def cmd_commit(args) -> None:
             f"lives on '{configured}'. The checkout and the target must match, or this "
             "deploy would publish manifests to a branch it never rendered against."
         )
-    via_pr = getattr(args, "via_pr", False) or bool(
-        CONFIG.get(f"environments.{args.env}.require_pr", False))
+    # Hỏi GitHub, không đọc cấu hình. Xem branch_is_protected().
+    protected = branch_is_protected(config, base)
+    if protected is None:
+        # Không xác định được thì đi đường push thẳng — CỐ Ý.
+        # Nếu nhánh thật ra có bảo vệ, GitHub sẽ từ chối push kèm thông báo rõ ràng
+        # (GH006), tức là hỏng ỒN ÀO. Còn đoán ngược lại thì sinh ra một pull request
+        # nằm im không ai biết, trên một repo demo chẳng ai chờ pull request nào cả.
+        # Việc cưỡng chế nằm ở phía GitHub, không phải ở đoán của chúng ta.
+        warn(f"không xác định được nhánh {base} có bảo vệ hay không -> thử push thẳng")
+    via_pr = getattr(args, "via_pr", False) or bool(protected)
+    log(f"{base}: bảo vệ={protected} -> {'mở pull request' if via_pr else 'push thẳng'}")
 
     # Danh tính này quyết định lịch sử config repo ghi công cho ai — thứ dùng để truy vết
     # "ai deploy cái gì". Lấy từ cấu hình, không gắn cứng.
@@ -1050,13 +1084,14 @@ def cmd_image_plan(args) -> None:
 
 
 def cmd_preflight(args) -> None:
-    missing = [t for t in ("score-k8s", "kubectl", "git") if not shutil.which(t)]
+    # gh cần cho việc đọc branch protection và mở pull request trong bước commit.
+    missing = [t for t in ("score-k8s", "kubectl", "git", "gh") if not shutil.which(t)]
     if missing:
         raise SystemExit(
             f"runner is missing required tool(s): {', '.join(missing)}. "
             "Check the job landed on a correctly-labelled runner."
         )
-    for tool in ("score-k8s", "kubectl", "git"):
+    for tool in ("score-k8s", "kubectl", "git", "gh"):
         log(f"found {tool} at {shutil.which(tool)}")
     log(f"python {sys.version.split()[0]}, pyyaml {yaml.__version__}")
 
@@ -1094,9 +1129,9 @@ def main(argv: list[str] | None = None) -> None:
         # pushing to the wrong company's registry.
         p.add_argument("--registry", required=True)
         p.add_argument(
-            "--tag-strategy", choices=("commit", "content"), default="commit",
-            help="commit: every workload gets --tag. content: each workload gets the hash of "
-                 "its own directory, so one service's commit does not re-tag the others",
+            "--tag-strategy", choices=("commit", "content"), default="content",
+            help="content (mặc định): mỗi workload mang mã băm THƯ MỤC của chính nó. "
+                 "commit: mọi workload dùng --tag. Xem ghi chú trong plan_images.",
         )
         # Optional for `promote --mode tag-only`, which rewrites an existing manifest and
         # needs no catalog, app checkout or scratch dir.
@@ -1119,7 +1154,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--tag", required=True)
     p.add_argument("--registry", required=True)
     p.add_argument("--app-dir", required=True)
-    p.add_argument("--tag-strategy", choices=("commit", "content"), default="commit")
+    p.add_argument("--tag-strategy", choices=("commit", "content"), default="content")
     p.set_defaults(func=cmd_image_plan)
 
     p = sub.add_parser("preflight")

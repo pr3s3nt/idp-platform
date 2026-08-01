@@ -810,35 +810,64 @@ def test_commit_without_via_pr_still_pushes_directly(tmp_path, repo_with_two_com
     assert new in git(config, "log", "--format=%s", "-1", "@{u}")
 
 
-def test_require_pr_is_read_from_config_not_a_yaml_string_compare(tmp_path, repo_with_two_commits, monkeypatch):
-    """The workflow used to compare REQUIRE_PR to the string 'True'. Writing
-    `require_pr: "true"` as a string instead of a boolean would slip past that comparison
-    and push straight at a protected branch. Python decides it once, for every caller."""
-    app, _old, new = repo_with_two_commits
+def test_protected_branch_opens_a_pr(tmp_path, repo_with_two_commits, no_branch_config, monkeypatch):
+    """Việc "môi trường này có cần duyệt không" đọc thẳng từ branch protection của GitHub,
+    không phải từ một cờ trong file cấu hình. Hai nơi cùng khai một sự thật thì có lúc lệch,
+    và một cờ ghi require_pr: false trong khi nhánh thật đang được bảo vệ là lời nói dối
+    chỉ vỡ lúc push."""
+    app, _old, new_sha = repo_with_two_commits
     config = make_config_repo(tmp_path)
-    base = branch_of(config)
-
     calls = tmp_path / "gh-calls.txt"
     monkeypatch.setenv("GH_CALLS", str(calls))
     monkeypatch.setenv("PATH", f"{fake_gh(tmp_path)}:{os.environ['PATH']}")
-    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
-        {"environments": {"prod": {"config_branch": base, "require_pr": True}}}))
+    monkeypatch.setattr(orc, "branch_is_protected", lambda *a: True)
 
     (config / "staging" / "manifests.yaml").write_text("rendered\n")
-    # Note: neither --branch nor --via-pr is passed. Both come from config.
     orc.cmd_commit(orc.argparse.Namespace(
-        config_dir=str(config), app="a", env="prod", sha=new,
+        config_dir=str(config), app="a", env="prod", sha=new_sha,
         app_dir=str(app), catalog_ref=None,
     ))
     assert "pr create" in calls.read_text()
 
 
+def test_unprotected_branch_pushes_directly(tmp_path, repo_with_two_commits, no_branch_config, monkeypatch):
+    """Repo demo không bật bảo vệ -> tự phục vụ hoàn toàn, không phải khai gì."""
+    app, _old, new_sha = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+    monkeypatch.setattr(orc, "branch_is_protected", lambda *a: False)
+    (config / "staging" / "manifests.yaml").write_text("rendered\n")
+    orc.cmd_commit(orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="staging", sha=new_sha,
+        app_dir=str(app), catalog_ref=None,
+    ))
+    assert new_sha in git(config, "log", "--format=%s", "-1", "@{u}")
+
+
+def test_undetectable_protection_falls_back_to_direct_push(tmp_path, repo_with_two_commits, no_branch_config, monkeypatch):
+    """Không hỏi được GitHub thì đi đường push thẳng — CỐ Ý.
+
+    Nếu nhánh thật ra có bảo vệ, GitHub từ chối kèm GH006, tức hỏng ỒN ÀO. Đoán ngược lại
+    thì sinh ra một pull request nằm im trên repo demo chẳng ai chờ đợi. Việc cưỡng chế
+    nằm ở phía GitHub, không nằm ở phán đoán của chúng ta.
+    """
+    app, _old, new_sha = repo_with_two_commits
+    config = make_config_repo(tmp_path)
+    monkeypatch.setattr(orc, "branch_is_protected", lambda *a: None)
+    (config / "staging" / "manifests.yaml").write_text("rendered\n")
+    orc.cmd_commit(orc.argparse.Namespace(
+        config_dir=str(config), app="a", env="staging", sha=new_sha,
+        app_dir=str(app), catalog_ref=None,
+    ))
+    assert new_sha in git(config, "log", "--format=%s", "-1", "@{u}")
+
+
 def test_env_without_require_pr_pushes_directly(tmp_path, repo_with_two_commits, monkeypatch):
-    """staging has require_pr: false, so it must keep the direct-push fast path."""
+    """Nhánh không bảo vệ giữ đường nhanh: push thẳng, không pull request."""
     app, _old, new = repo_with_two_commits
     config = make_config_repo(tmp_path)
+    monkeypatch.setattr(orc, "branch_is_protected", lambda *a: False)
     monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
-        {"environments": {"staging": {"config_branch": branch_of(config), "require_pr": False}}}))
+        {"environments": {"staging": {"config_branch": branch_of(config)}}}))
     (config / "staging" / "manifests.yaml").write_text("rendered\n")
     orc.cmd_commit(orc.argparse.Namespace(
         config_dir=str(config), app="a", env="staging", sha=new,

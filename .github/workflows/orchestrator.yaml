@@ -61,6 +61,12 @@ on:
       image:
         description: "Harbor image name (defaults to app)"
         required: false
+      env:
+        description: "Môi trường đích"
+        required: false
+        default: staging
+        type: choice
+        options: [staging, prod]
 
 # NO INFRASTRUCTURE VALUES HERE. Everything below is read from platform.env.yaml by the
 # "Load environment config" step and exported into the job environment. Moving this
@@ -94,10 +100,10 @@ jobs:
       # How each workload's image tag is chosen. Default `commit` keeps every existing app
       # working unchanged. A repo holding several services should send `content`, so one
       # service's commit stops re-tagging — and therefore restarting — all the others.
-      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || 'commit' }}
+      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || 'content' }}
       # Môi trường đích. Mặc định staging: push lên nhánh phát triển của app chỉ đụng
       # staging. Gửi env=prod khi app merge sang nhánh production.
-      DEPLOY_ENV: ${{ github.event.client_payload.env || 'staging' }}
+      DEPLOY_ENV: ${{ github.event.client_payload.env || inputs.env || 'staging' }}
     steps:
       - name: Checkout platform@main (renderer + workflow)
         uses: actions/checkout@v4
@@ -332,7 +338,7 @@ jobs:
       TAG: ${{ github.event.client_payload.tag }}
       MODE: ${{ github.event.client_payload.mode }}
       IMAGE: ${{ github.event.client_payload.image || github.event.client_payload.app }}
-      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || 'commit' }}
+      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || 'content' }}
     steps:
       - name: Checkout platform@main (renderer)
         uses: actions/checkout@v4
