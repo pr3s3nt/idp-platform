@@ -968,7 +968,7 @@ cái nào chưa dùng tới thì đỏ mãi. Đỏ thường trực thì chẳng
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
-**64/64 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
+**67/67 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
 pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10), bí mật của ứng dụng (6.11) và
 ba tình huống triển khai kẹt giữa chừng mà phép kiểm cũ bỏ lọt (6.20).
 
@@ -1058,6 +1058,7 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 | `HUONG-DAN-TAO-APP-MOI.md` | Đưa một ứng dụng mới vào hệ thống |
 | `HUONG-DAN-GITHUB-APP.md` | Đăng ký danh tính máy cho hệ thống |
 | `CAU-HOI-NGU-CANH.md` | Bộ câu hỏi thu thập thông tin hạ tầng công ty |
+| `CAN-GI-DE-CHAY-THU.md` | Bản rút gọn của file trên — chỉ còn những giá trị **chưa có**, đủ để chạy thử bằng cấu hình công ty |
 | `audit/NHAT-KY-SHOP-V2.md` | Nhật ký từng bước của lần chạy thử bốn tình huống |
 
 ### Lệnh hay dùng
