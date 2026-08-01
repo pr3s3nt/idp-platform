@@ -622,10 +622,109 @@ helloworld/staging: cấu hình đã ghi và đã được đồng bộ, nhưng 
 Bước này **được bỏ qua khi lần triển khai đó mở pull request** — cấu hình chưa được duyệt
 thì chưa ai áp lên cụm, kiểm lúc đó chắc chắn sai.
 
+### 6.15. Ai được duyệt, ai không — để GitHub tự trả lời
+
+Ban đầu việc "môi trường này có cần duyệt không" là một dòng khai trong file cấu hình. Nghe
+thì gọn, nhưng nó tạo ra hai nơi cùng nói về một chuyện: file cấu hình nói một đằng, thiết
+lập bảo vệ nhánh trên GitHub nói một nẻo. Và khi lệch nhau thì chỉ vỡ lúc đẩy code lên.
+
+Bỏ hẳn dòng khai đó. Giờ hệ thống **hỏi thẳng GitHub** xem nhánh đích có được bảo vệ không,
+rồi tự chọn: có bảo vệ thì mở pull request, không thì ghi thẳng.
+
+Cái hay là nó tự động cho ra đúng hai mức mà một tổ chức thường cần:
+
+| Loại dự án | Nhánh production | Hệ thống làm gì |
+|---|---|---|
+| Thử nghiệm, một người | không bật bảo vệ | ghi thẳng, tự phục vụ hoàn toàn |
+| Của cả đội | có bật bảo vệ | mở pull request, chờ người duyệt |
+
+Dự án thử nghiệm **không phải khai gì cả**. Đến lúc muốn siết thì bật bảo vệ nhánh, và lần
+triển khai kế tiếp tự chuyển sang chế độ pull request — không sửa cấu hình, không cài lại.
+
+Trường hợp không hỏi được GitHub thì hệ thống chọn ghi thẳng. Nghe có vẻ ngược, nhưng: nếu
+nhánh thật sự có bảo vệ, GitHub sẽ từ chối kèm thông báo rõ ràng — hỏng ở chỗ nhìn thấy được.
+Còn đoán ngược lại thì sinh ra một pull request nằm im trên một repo chẳng ai chờ đợi nó.
+Việc chặn là của GitHub, không phải của phán đoán trong code.
+
+### 6.16. Nhánh quyết định môi trường
+
+Chuyển sang mô hình khớp với cách hầu hết đội đang làm việc:
+
+```
+nhánh dev   →  staging
+nhánh main  →  production
+```
+
+Đưa lên production giờ là **một thao tác git bình thường** — mở pull request từ `dev` sang
+`main`, có người xem diff rồi merge — chứ không phải ai đó gõ một câu lệnh.
+
+Nhưng mô hình này có một cái bẫy, và nó là lý do phải đổi cách đánh nhãn ảnh thành mặc định:
+
+```
+sau khi gộp dev vào main:
+  mã commit     đổi      (gộp kiểu squash luôn sinh commit mới)
+  mã nội dung   KHÔNG đổi
+```
+
+Nếu nhãn ảnh lấy theo mã commit, việc gộp lên `main` sẽ sinh nhãn mới, buộc xây lại ảnh, và
+**production chạy một bản chưa từng được kiểm ở staging**. Toàn bộ ý nghĩa của việc có môi
+trường staging bị vô hiệu hoá mà không ai nhận ra.
+
+Lấy theo nội dung thì gộp xong nhãn vẫn thế, ảnh đã có sẵn, production chạy **đúng từng byte**
+đã chạy ở staging.
+
+### 6.17. Viết hướng dẫn cài đặt rồi tự cài lại để kiểm tra nó
+
+Viết tài liệu hướng dẫn dựng platform từ đầu, sau đó **làm theo đúng tài liệu đó** để dựng
+một bản cài mới hoàn toàn trên một cụm mới.
+
+Kết quả: bản cài mới chạy được, ứng dụng thử lên và trả về bình thường. Đáng chú ý là phần
+chuẩn bị cụm — vốn là chỗ tốn nhiều thời gian nhất lần đầu — lần này **đúng ngay từ lần thử
+đầu tiên**, không phải mò lại lần nào. Nghĩa là các cạm bẫy đã được ghi đúng chỗ chúng xảy ra.
+
+Ba chỗ tài liệu còn thiếu, chỉ lộ ra khi thực sự làm theo:
+
+- Thiếu một bước tạo thư mục, máy mới chưa có sẵn.
+- Cách đặt tên khi đăng ký ứng dụng có ảnh hưởng tới tên hiển thị về sau, tài liệu chưa nói.
+- Phải sửa dòng trỏ tới platform trong cấu hình CI của ứng dụng. Quên dòng này thì mọi thứ
+  **vẫn chạy thành công** — chỉ là triển khai lên nhầm hạ tầng.
+
+Cái thứ ba là loại nguy hiểm nhất: không có gì báo lỗi cả.
+
+### 6.18. Chạy thử một dự án thật: ba service dùng chung một cơ sở dữ liệu
+
+Dựng một dự án gồm ba service (`api`, `worker`, `web`) trong cùng một kho mã, dùng **chung
+một** cơ sở dữ liệu, rồi chạy qua bốn tình huống hay gặp nhất.
+
+| Tình huống | Kết quả |
+|---|---|
+| Sửa **một** service | Chỉ service đó được xây lại và khởi động lại. Hai service kia không đụng |
+| **Hoàn tác** thay đổi | Không xây lại gì cả — dùng lại ảnh cũ, gần như tức thì |
+| **Ba người** cùng đẩy code cách nhau vài giây | Gộp thành một lần triển khai, kết quả đúng bằng thay đổi mới nhất |
+| Yêu cầu triển khai **đến sai thứ tự** | Bị từ chối kèm thông báo rõ, môi trường không lùi về bản cũ |
+
+Điều đáng nói nhất: **cơ sở dữ liệu không khởi động lại lần nào** trong suốt cả bốn tình
+huống, dù ba service xung quanh nó thay đổi liên tục.
+
+Chuyện hoàn tác nhanh là một hệ quả không lường trước khi thiết kế: vì nhãn ảnh tính theo nội
+dung, hoàn tác nội dung thì nhãn quay về giá trị cũ, mà ảnh cũ vẫn còn nguyên trên kho ảnh.
+Không phải xây lại, không phải chờ.
+
+Nhật ký từng bước của lần chạy thử này nằm ở `audit/NHAT-KY-SHOP-V2.md`, đủ chi tiết để soi
+lại.
+
+Hai lỗi tìm thấy trong tài liệu hướng dẫn tạo ứng dụng, đều đã sửa:
+
+- **Mẫu cấu hình CI khác nhau tuỳ kho mã có một hay nhiều service** — tài liệu không nói.
+  Chép nhầm mẫu thì hỏng ngay ở bước xây ảnh.
+- **Khi một cụm phục vụ cả hai môi trường, tên đăng ký phải kèm tên môi trường.** Đặt trùng
+  tên thì cái sau đè lên cái trước, và môi trường còn lại lặng lẽ không được đồng bộ. Bản cài
+  trước không gặp lỗi này vì mỗi môi trường có cụm riêng.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
-**54/54 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
+**61/61 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
 pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10) và bí mật của ứng dụng (6.11).
 
 ### Kiểm chứng chạy thật
@@ -643,6 +742,8 @@ pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10) và bí m
 | Nhánh được bảo vệ | Push thẳng bị GitHub từ chối; production đi qua pull request; sau khi merge Fleet áp lên cụm |
 | Bí mật của ứng dụng | Giá trị thật vào được container, trong Git chỉ có tham chiếu |
 | Phụ thuộc xuyên kho mã | Địa chỉ tự đổi theo môi trường, không cần hai ứng dụng biết nhau |
+| Cài lại từ đầu | Dựng một bản cài mới theo đúng tài liệu hướng dẫn — chạy được |
+| Dự án ba service dùng chung database | Bốn tình huống vận hành, database không khởi động lại lần nào |
 
 ### Quy mô hiện tại
 
@@ -664,6 +765,8 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 | Commit trung gian không có image | Do gộp các lần push liên tiếp | Muốn thăng cấp đúng commit đó phải build lại |
 | **Không kiểm tra quyền sở hữu ứng dụng** | Tên ứng dụng và kho mã do bên gọi **tự khai**, không có bước xác thực nào. Bất kỳ ai gọi được vào platform đều có thể triển khai thay ứng dụng của đội khác | **Đã cân nhắc và tạm chấp nhận**: sandbox một người dùng, chưa có nhiều đội. Phải xử lý trước khi nhiều đội dùng chung |
 | Sandbox chưa có phân quyền | Mọi thứ dùng chung một token toàn quyền | Môi trường thật cần tách quyền theo từng repo |
+| Chỉ có một máy chủ chạy CI | Nhiều ứng dụng đẩy code cùng lúc thì phải xếp hàng nối đuôi. Đo thực tế: sáu ứng dụng cùng lúc mất khoảng 15 phút mới xong hết | Môi trường nhiều đội cần nhiều máy chủ, và nên chia theo đội để phân quyền cụm siết được |
+| Ứng dụng vẫn phải đăng ký thủ công | Tạo kho cấu hình, đăng ký với hệ thống đồng bộ, cấp khoá — đều làm tay | Có thể tự động hoá, chưa làm |
 | Một kho cấu hình đang để công khai | `helloworld-config` được chuyển sang công khai để bật branch protection (bản miễn phí chỉ hỗ trợ kho công khai) | Đã soát toàn bộ lịch sử trước khi chuyển: **0 bí mật**, không có Secret nào. Kho mã ứng dụng vẫn riêng tư |
 
 ---
@@ -680,6 +783,8 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 | `idp-sample-pg` + `-config` | App có Postgres |
 | `idp-sample-boutique` + `-config` | 11 service, image dựng sẵn |
 | `idp-boutique` + `-config` | 11 service, build từ mã nguồn |
+| `idp-platform-v2` | Bản cài thứ hai, dựng để kiểm tra tài liệu hướng dẫn |
+| `idp-shop-v2` + `idpv2-shop-config` | Ba service dùng chung một database, dùng để chạy thử các tình huống vận hành |
 
 ### Đường dẫn thử
 
@@ -693,6 +798,16 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 > `nip.io` là dịch vụ DNS công cộng trả về đúng địa chỉ IP nằm trong tên miền, nên
 > `boutique.127.0.0.1.nip.io` luôn trỏ về máy của bạn. Nhờ vậy mở bằng trình duyệt được ngay
 > mà không phải sửa file `hosts`.
+
+### Các tài liệu khác
+
+| File | Nội dung |
+|---|---|
+| `HUONG-DAN-CAI-DAT.md` | Dựng platform từ đầu trên hạ tầng mới |
+| `HUONG-DAN-TAO-APP-MOI.md` | Đưa một ứng dụng mới vào hệ thống |
+| `HUONG-DAN-GITHUB-APP.md` | Đăng ký danh tính máy cho hệ thống |
+| `CAU-HOI-NGU-CANH.md` | Bộ câu hỏi thu thập thông tin hạ tầng công ty |
+| `audit/NHAT-KY-SHOP-V2.md` | Nhật ký từng bước của lần chạy thử bốn tình huống |
 
 ### Lệnh hay dùng
 
