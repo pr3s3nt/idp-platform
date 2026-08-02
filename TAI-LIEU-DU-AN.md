@@ -965,6 +965,38 @@ hai ứng dụng đó chưa từng lên production nên nhánh tương ứng ch�
 nó cho thấy hướng dẫn cài đặt đang bảo tạo `GitRepo` cho cả hai môi trường ngay từ đầu, và
 cái nào chưa dùng tới thì đỏ mãi. Đỏ thường trực thì chẳng mấy chốc không ai nhìn nữa.
 
+### 6.22. Nếu công ty chạy GitHub Enterprise Server
+
+Một góp ý từ bên ngoài chỉ ra: `actions/create-github-app-token` **không nằm trong bộ action
+đi kèm** GitHub Enterprise Server. Trên máy chủ GHES không bật GitHub Connect, workflow sẽ
+hỏng ngay ở bước đó.
+
+Kiểm lại thì phạm vi đúng như vậy — toàn hệ thống chỉ dùng **hai** action:
+`actions/checkout@v4` và `actions/create-github-app-token@v1`. Cái đầu có sẵn trong bộ đi
+kèm, cái sau thì không.
+
+Nhưng góp ý đó đứng trên một giả định **chưa ai xác nhận**: rằng công ty chạy GHES. Nếu là
+github.com hoặc Enterprise Cloud thì vấn đề không tồn tại. Đây là câu phải hỏi trước khi
+làm bất cứ điều gì.
+
+Dù sao cũng nên có sẵn đường lui, nên đã viết `tools/mint-app-token.sh` — làm đúng việc của
+action kia bằng `openssl` và `curl`, tức công cụ có sẵn trên mọi máy chạy CI. **47 dòng.**
+Đã kiểm chạy thật: ký JWT đúng chuẩn RS256, lấy được installation token thật, token đó đọc
+được kho và mang đúng ba quyền đã khai.
+
+Hai chi tiết dễ sai đã xử lý sẵn: `iat` lùi 60 giây vì đồng hồ máy chạy CI lệch vài giây là
+chuyện thường và GitHub từ chối JWT có thời điểm ở tương lai; và JWT sống tối đa 10 phút theo
+quy định của GitHub, để 9 phút cho an toàn.
+
+Nhưng **đường đơn giản nhất không phải cái này.** Nếu dùng tài khoản máy thay cho GitHub App
+— khả năng cao, vì cài App vào tổ chức thường cần chủ tổ chức duyệt mà quyền hiện có chỉ ở
+mức đội — thì `create-github-app-token` biến mất hoàn toàn, không cần script nào cả. Đường
+tự ký JWT chỉ đáng đi khi vừa dùng được App, vừa không mở được GitHub Connect.
+
+Còn một điều nên hỏi trước khi tự dựng gì: nhiều công ty chạy GHES đã có sẵn quy trình đồng
+bộ action vào tổ chức nội bộ. Nếu vậy thì chỉ cần nhờ họ thêm một action, workflow giữ
+nguyên không phải sửa.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
@@ -990,6 +1022,7 @@ ba tình huống triển khai kẹt giữa chừng mà phép kiểm cũ bỏ l�
 | Cài lại từ đầu | Dựng một bản cài mới theo đúng tài liệu hướng dẫn — chạy được |
 | Dự án ba service dùng chung database | Bốn tình huống vận hành, database không khởi động lại lần nào |
 | Merge pull request production | Fleet nhận commit mới trong khoảng một phút và áp lên cụm, kho cấu hình báo về platform, platform kiểm cụm và trả kết quả (6.19, 6.20) |
+| **Tự mint token của GitHub App không cần action** | `tools/mint-app-token.sh`: chữ ký RS256 hợp lệ, lấy được installation token thật, token đọc được kho và mang đúng 3 quyền đã khai (6.22) |
 | **Nhãn ảnh trong manifest có thật không** | Đối chiếu toàn bộ 48 tham chiếu ảnh của 8 ứng dụng trên cả hai môi trường với kho ảnh: **48/48 tồn tại**, không cái nào trỏ vào khoảng không |
 | **Hai môi trường chạy cùng một ảnh** | Sau khi đồng bộ nhánh, bốn ứng dụng có nhãn ảnh production **trùng khớp** staging — production chạy đúng ảnh đã được kiểm, không phải bản xây lại |
 | **Phép kiểm có biết báo đỏ không** | Cố ý đặt nhãn ảnh không tồn tại vào production: lần đầu nó **báo xanh sai** vì pod cũ vẫn phục vụ; sau khi sửa thì bắt đúng, kèm chẩn đoán (6.20) |
