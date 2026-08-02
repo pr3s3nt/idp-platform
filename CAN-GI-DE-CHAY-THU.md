@@ -25,6 +25,34 @@ Cái tôi cần chỉ là **tên và đường dẫn**, không phải thứ mở
 
 ---
 
+## Phần 0 — Một câu hỏi phải trả lời TRƯỚC mọi thứ khác
+
+**Công ty dùng github.com (Enterprise Cloud) hay GitHub Enterprise Server tự dựng?**
+
+Nhìn địa chỉ là biết: `github.com/<tổ-chức>` là Cloud; `github.<tên-công-ty>.vn` hoặc bất kỳ
+tên miền nội bộ nào là Enterprise Server.
+
+Vì sao hỏi trước: **GHES chỉ có sẵn một bộ action giới hạn**. Nền tảng này dùng đúng hai
+action — `actions/checkout` có trong bộ đi kèm, còn `actions/create-github-app-token` thì
+không. Trên GHES không bật GitHub Connect, workflow sẽ hỏng ngay ở bước lấy token.
+
+Nếu là GHES thì hỏi thêm hai câu:
+
+| Câu hỏi | Nếu có | Nếu không |
+|---|---|---|
+| Đã bật **GitHub Connect** chưa? | dùng action bình thường, không phải làm gì | xem dòng dưới |
+| Đã có quy trình **đồng bộ action vào tổ chức nội bộ** (`actions-sync`) chưa? | nhờ thêm một action, workflow giữ nguyên | xem dòng dưới |
+
+Cả hai đều không thì vẫn còn hai đường, không bí:
+
+- **Dùng tài khoản máy** thay GitHub App → không cần action đó nữa, vấn đề biến mất
+- **`tools/mint-app-token.sh`** — đã viết sẵn và kiểm chạy thật, 47 dòng dùng `openssl` +
+  `curl`, làm đúng việc của action kia mà không phụ thuộc gì bên ngoài
+
+> Nếu là github.com thì bỏ qua toàn bộ phần này.
+
+---
+
 ## Phần 1 — Bảy giá trị phải điền
 
 Đây là những ô đang để `todo-*.invalid`. Chúng cố ý đặt dạng không hợp lệ để nếu quên điền
@@ -155,6 +183,11 @@ runner: có sẵn nhãn ... / phải dựng mới
 danh_tinh_bot: GitHub App / tài khoản máy
   ten: idp-orchestrator
   email: ...
+
+loai_github: github.com / Enterprise Server
+  # chỉ khai 2 dòng dưới nếu là Enterprise Server
+  co_github_connect: có / không
+  co_actions_sync: có / không
 ```
 
 Thiếu vài mục cũng được — cứ gửi phần đã có, tôi điền dần và chỉ rõ cái nào còn chặn.
