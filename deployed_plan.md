@@ -25,7 +25,7 @@ Chi tiết kỹ thuật nằm ở **Phụ lục** cuối file — AI được ch
 | `traefik-gateway` | `Accepted=True Programmed=True`, `allowedRoutes: All` |
 | Fleet | có, Rancher quản, `GitRepo` ở `fleet-local` |
 | StorageClass | `rook-ceph-block` (mặc định) |
-| GHES | 3.18.12, có PAT fine-grained |
+| GHES | 3.18.12. Fine-grained PAT cần admin duyệt mà không có người duyệt -> **dùng classic** |
 | Harbor | `harbor.stg.exampledevops.com`, HTTPS |
 
 ⛔ **Cụm đã đủ mọi thứ. Không cài đặt gì thêm lên cụm.** Cài đè lên Traefik đang phục vụ
@@ -56,16 +56,33 @@ Thiếu bước này: database `ImagePullBackOff`, ổ đĩa treo `Pending` **kh
 
 ## A3. Hai token từ tài khoản dùng chung
 
-Fine-grained, **hai cái riêng** — cái thứ hai phải nằm ở mọi repo ứng dụng nên phơi ra rộng
-hơn nhiều; lộ một cái thì thu hồi được mà không chết cái kia.
+**Dùng PAT classic.** Fine-grained PAT trỏ vào repo của tổ chức phải được admin tổ chức phê
+duyệt, mà ở đây không có người duyệt — token sẽ nằm mãi ở trạng thái `Pending` và bị GHES từ
+chối với `remote: Write access to repository not granted` (403), dù đã chọn "All repositories".
 
-| Tên | Phạm vi repo | Quyền |
+Settings → Developer settings → Personal access tokens → **Tokens (classic)**, tick đúng
+**một** scope: `repo`.
+
+| Tên | Đặt ở đâu | Dùng để |
 |---|---|---|
-| `BOT_TOKEN` | các repo cấu hình | `Contents: write`, `Pull requests: write` |
-| `PLATFORM_DISPATCH_TOKEN` | repo platform | `Contents: write` |
+| `BOT_TOKEN` | repo `idp-platform` | ghi manifest vào repo cấu hình, mở pull request |
+| `PLATFORM_DISPATCH_TOKEN` | mỗi repo app và repo cấu hình | gọi platform, đọc repo platform |
+
+Tạo **hai cái riêng** dù cùng scope: cái thứ hai phải nằm ở mọi repo ứng dụng nên phơi ra
+rộng hơn nhiều. Lộ một cái thì thu hồi được mà không chết cái kia.
+
+> **Đánh đổi của classic:** scope `repo` là thô — ghi được vào **mọi repo mà tài khoản đó
+> nhìn thấy**, không giới hạn theo từng repo được. Phạm vi thiệt hại bị chặn bởi **tài khoản
+> đó là thành viên của những repo nào**, chứ không phải bởi quyền của token. Nên chỉ mời tài
+> khoản dùng chung vào đúng các repo IDP.
+>
+> Xin được duyệt fine-grained sau này thì đổi lại chỉ là thay giá trị secret, **không sửa
+> code**.
 
 - [ ] Ghi lại **tên** và **email** của tài khoản đó — dùng làm danh tính trên commit triển khai
-- [ ] Đặt lịch nhắc trước ngày hết hạn một tuần. Hết hạn là deploy chết với lỗi 401
+- [ ] **Đặt hạn cho token** (ví dụ 1 năm) và lịch nhắc trước một tuần. Classic PAT cho phép
+      "không bao giờ hết hạn" — đừng chọn; token vĩnh viễn là loại rò rỉ rồi sống mãi
+- [ ] Nếu tổ chức bật SAML SSO: bấm **Authorize** cho token với tổ chức, nếu không nó vẫn 403
 
 ⚠️ Tài khoản này **phải khác** tài khoản người sẽ duyệt pull request. GitHub chặn tự duyệt
 PR của chính mình — trùng nhau là cổng duyệt production tự khoá.
@@ -450,7 +467,8 @@ build (máy có internet)              push (máy nội bộ)
 | Job `push` hỏng ở bước tải tệp | GHES thiếu `actions/download-artifact` | `gh api repos/actions/download-artifact` |
 | CI đẩy được ảnh nhưng pod kéo không được | `registry.path` chỉ máy CI phân giải được | thử `crictl pull` trên node |
 | Fleet ngừng đồng bộ sau 1 giờ | `git-creds` dùng token GitHub App (hết hạn 1 giờ) | `kubectl -n fleet-local get gitrepo -o wide` |
-| Deploy đột nhiên 401 | PAT fine-grained hết hạn | xem ngày hết hạn |
+| Deploy đột nhiên 401 | PAT hết hạn | xem ngày hết hạn của token |
+| `remote: Write access to repository not granted` (403) | Fine-grained PAT chưa được tổ chức duyệt, hoặc Resource owner để nhầm tài khoản cá nhân | dùng classic PAT scope `repo` |
 
 ## P4. Hai quyết định còn treo
 
