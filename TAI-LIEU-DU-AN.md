@@ -997,6 +997,67 @@ Còn một điều nên hỏi trước khi tự dựng gì: nhiều công ty ch�
 bộ action vào tổ chức nội bộ. Nếu vậy thì chỉ cần nhờ họ thêm một action, workflow giữ
 nguyên không phải sửa.
 
+### 6.23. GHES không có action lấy token, và cách gỡ
+
+Xác nhận từ công ty: GitHub ở đó là **Enterprise Server tự dựng**, và nó báo đúng cái lỗi
+đã lường trước:
+
+```
+Error: Unable to resolve action `actions/create-github-app-token@v1`,
+       repository not found on this server.
+```
+
+Workflow chết ngay ở bước **đầu tiên** — lấy token — trước khi làm được bất cứ việc gì.
+
+#### Một đoạn đường vòng, và vì sao quay lại
+
+Ban đầu tôi khuyên bỏ GitHub App, chuyển sang tài khoản máy dùng PAT: không cần action nào,
+không phải nuôi code. Lập luận dựa trên một tiền đề — rằng tạo App trên GHES cần quyền chủ
+tổ chức, thứ chỉ có quyền cấp đội thì không xin được.
+
+Tiền đề đó **sai**. Tạo App thì ai cũng tạo được; chỉ việc *cài* nó vào repo của tổ chức mới
+có thể cần duyệt. Khi biết vậy thì App lại là lựa chọn tốt hơn: token sống 1 giờ và tự làm
+mới mỗi lần chạy, quyền đúng ba mục đã khai, không cần tài khoản mới, không phải nhớ xoay
+khoá.
+
+#### Cách làm
+
+Thay ba bước `uses: actions/create-github-app-token` bằng `run:` gọi
+`tools/mint-app-token.sh` — ký JWT bằng `openssl`, đổi lấy installation token bằng `curl`.
+
+Điểm khiến nó chạy được ở cả hai nơi mà không phải rẽ nhánh: script **không ghim địa chỉ
+API**, nó đọc `GITHUB_API_URL` mà Actions tự đặt — `api.github.com` ở Cloud, `/api/v3` ở
+GHES.
+
+Đó cũng là lý do đáng đổi cả sandbox chứ không chỉ đổi cho công ty: **một đường code duy
+nhất, chạy thật mỗi ngày ở sandbox.** Nếu sandbox dùng action còn công ty dùng script thì
+sandbox thôi không còn là bản diễn tập trung thực — đúng loại lệch đã hai lần cắn dự án này
+(`namespace_pattern` và nhãn ảnh tính bằng hai phiên bản code), cả hai đều không thể lộ ra
+vì sandbox chạy đường khác.
+
+Giờ workflow chỉ còn phụ thuộc `actions/checkout`, vốn nằm trong bộ đi kèm GHES.
+
+#### Ba chỗ script bản đầu làm ẩu, đã sửa
+
+Bản viết vội hôm trước có ba khiếm khuyết chỉ lộ ra khi soi kỹ:
+
+- **Lấy installation ĐẦU TIÊN.** Sai khi App được cài ở nhiều nơi — token sẽ mang quyền của
+  tổ chức khác, và lỗi chỉ hiện ra muộn dưới dạng 404 lúc ghi vào repo. Giờ tra theo chủ sở
+  hữu, thử tổ chức trước rồi tài khoản cá nhân.
+- **Nuốt lỗi.** Chỉ đọc trường `token` rồi kiểm rỗng, nên sai khoá, App chưa cài, hay GHES
+  chặn đều hiện ra giống hệt nhau: một chuỗi rỗng. Giờ in nguyên văn mã lỗi và phần thân
+  phản hồi của GitHub.
+- **Nối `curl | python3` trực tiếp.** Khi lệnh gọi thất bại, `python3` vẫn chạy với đầu vào
+  rỗng và phun traceback — trông như hỏng nặng trong khi thực ra chỉ là "chủ sở hữu này
+  không phải tổ chức, thử kiểu còn lại".
+
+#### Kiểm chứng
+
+Chạy thật một vòng deploy trên sandbox: mint token thành công
+(`đã mint token cho installation 150297084`), **token không lọt ra log**, manifest được ghi
+vào kho cấu hình dưới đúng danh tính bot, Fleet đồng bộ, trang staging trả nội dung mới.
+Bước `verify` — cũng dùng chính script này — chạy và đạt.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
@@ -1022,7 +1083,7 @@ ba tình huống triển khai kẹt giữa chừng mà phép kiểm cũ bỏ l�
 | Cài lại từ đầu | Dựng một bản cài mới theo đúng tài liệu hướng dẫn — chạy được |
 | Dự án ba service dùng chung database | Bốn tình huống vận hành, database không khởi động lại lần nào |
 | Merge pull request production | Fleet nhận commit mới trong khoảng một phút và áp lên cụm, kho cấu hình báo về platform, platform kiểm cụm và trả kết quả (6.19, 6.20) |
-| **Tự mint token của GitHub App không cần action** | `tools/mint-app-token.sh`: chữ ký RS256 hợp lệ, lấy được installation token thật, token đọc được kho và mang đúng 3 quyền đã khai (6.22) |
+| **Tự mint token của GitHub App không cần action** | Đã thay hẳn `actions/create-github-app-token` bằng script trong cả 3 job. Chạy thật một vòng deploy: mint được token, token **không lọt ra log**, commit mang đúng danh tính bot, cụm nhận thay đổi (6.22, 6.23) |
 | **Nhãn ảnh trong manifest có thật không** | Đối chiếu toàn bộ 48 tham chiếu ảnh của 8 ứng dụng trên cả hai môi trường với kho ảnh: **48/48 tồn tại**, không cái nào trỏ vào khoảng không |
 | **Hai môi trường chạy cùng một ảnh** | Sau khi đồng bộ nhánh, bốn ứng dụng có nhãn ảnh production **trùng khớp** staging — production chạy đúng ảnh đã được kiểm, không phải bản xây lại |
 | **Phép kiểm có biết báo đỏ không** | Cố ý đặt nhãn ảnh không tồn tại vào production: lần đầu nó **báo xanh sai** vì pod cũ vẫn phục vụ; sau khi sửa thì bắt đúng, kèm chẩn đoán (6.20) |
