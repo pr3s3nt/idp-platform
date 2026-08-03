@@ -111,16 +111,57 @@ docker push <HARBOR>/<PROJECT>/postgres:17-alpine
 > `nginx:1.27-alpine` lúc build, và ảnh kết quả đẩy lên Harbor đã tự chứa mọi thứ. Kubelet
 > chỉ kéo ảnh cuối cùng từ Harbor.
 
-#### ❓ Địa chỉ Harbor phải là MỘT chuỗi duy nhất
+#### Harbor — đã có địa chỉ, còn hai quyết định
 
-Harbor chạy trong cụm (namespace `harbor`, `ClusterIP`). Máy chạy CI ở ngoài nên dùng địa
-chỉ ngoài — qua Ingress hoặc NodePort.
+`harbor.stg.exampledevops.com`, HTTPS. Tên ảnh sẽ có dạng
+`harbor.stg.exampledevops.com/<project>/<app>:<tag>`.
 
-Tên ảnh ghi trong manifest được **cả hai bên** dùng: CI đẩy lên, kubelet kéo về. Nên
-`registry.path` phải là **một chuỗi mà cả máy chạy CI lẫn các node đều phân giải được**.
-Nếu hiện tại hai bên đang dùng hai địa chỉ khác nhau thì phải thống nhất trước.
+**Đề xuất hai project, không phải một:**
 
-Cần: **địa chỉ HTTPS ngoài của Harbor** và **tên project** dùng cho IDP.
+| Project | Chứa gì | Vì sao tách |
+|---|---|---|
+| `idp` | ảnh do CI của ứng dụng build | robot đẩy ảnh dùng ở đây |
+| `base` | ảnh bên thứ ba đã mirror (Postgres…) | vòng đời khác hẳn, và robot đẩy ảnh ứng dụng **không nên** ghi đè được ảnh nền dùng chung |
+
+Gộp một project cũng chạy, chỉ là một robot bị lộ thì kéo theo cả ảnh nền.
+
+#### ⚠️ [CHẶN] Cụm production sẽ dùng Harbor nào
+
+Tên `harbor.**stg**.exampledevops.com` cho thấy đây là Harbor của môi trường staging. Khi cụm
+production xong, nhiều khả năng sẽ có một Harbor riêng.
+
+**Đó là vấn đề với cách nền tảng này thăng cấp.** Khi đưa lên production, nó **chép nguyên
+tham chiếu ảnh** mà staging đã chạy — đó chính là thứ bảo đảm "production chạy đúng ảnh đã
+được kiểm, không phải bản xây lại". Nếu hai môi trường dùng hai Harbor khác tên miền thì
+tham chiếu đó **trỏ sai** ở production.
+
+Hiện `registry.path` là giá trị **dùng chung**, không tách theo môi trường được.
+
+Ba đường, nên chọn **trước khi** dựng cụm production:
+
+| Cách | Đánh đổi |
+|---|---|
+| **Một tên miền Harbor cho cả hai** (ví dụ `harbor.exampledevops.com`) | Đơn giản nhất, giữ nguyên bảo đảm. **Khuyến nghị** |
+| Cụm production kéo thẳng từ Harbor staging | Chạy được ngay, nhưng production phụ thuộc hạ tầng staging |
+| Hai Harbor + replication | Cần sửa nền tảng để `registry.path` tách theo môi trường |
+
+#### ❓ DNS wildcard
+
+Địa chỉ ứng dụng sinh ra theo mẫu `<tên-workload>.<tên-miền>`, ví dụ
+`thanh-toan.stg.exampledevops.com`.
+
+Cần `*.stg.exampledevops.com` trỏ về Gateway Traefik. Nếu **không** có wildcard thì mỗi ứng
+dụng mới phải xin một bản ghi DNS riêng — thêm một bước chờ người trong quy trình đăng ký.
+
+```bash
+dig +short bat-ky-ten-nao.stg.exampledevops.com
+```
+
+Ra IP của Gateway là có wildcard. Không ra gì là chưa có.
+
+> Lưu ý nhỏ: Harbor đang ở `harbor.stg.exampledevops.com`, **cùng tên miền** với ứng dụng.
+> Một ứng dụng có workload tên `harbor` sẽ sinh ra đúng tên miền đó và tranh chấp. Ít khả
+> năng xảy ra, nhưng nên cấm tên đó.
 
 ### 1.3b [NGƯỜI] Máy chạy CI — hai vai trò, một hoặc hai máy
 
