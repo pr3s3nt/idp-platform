@@ -111,13 +111,16 @@ gh repo create <ORG>/idp-platform --private --source=. --push
 
 ## A7. Biến và bí mật
 
+> ⚠️ **Mọi thứ dưới đây đặt ở cấp REPO, không dùng `--org`.** Đặt biến hoặc secret cấp tổ
+> chức cần quyền owner/admin của tổ chức GitHub — quyền member không làm được. Ngoài ra biến
+> cấp tổ chức còn ảnh hưởng tới repo của đội khác.
+
 ```bash
 ORG=<tổ-chức>; R=$ORG/idp-platform
 
-# Nhãn runner — GitHub chọn máy TRƯỚC khi chạy bước đầu tiên nên không đọc được từ file
-gh variable set CI_RUNNER_LABEL   --org $ORG --body "<nhãn-máy-có-internet>"
-gh variable set PUSH_RUNNER_LABEL --org $ORG --body "<nhãn-máy-nội-bộ>"
-gh variable set RUNNER_LABEL      -R $R      --body "<nhãn-máy-nội-bộ>"
+# Nhãn runner của orchestrator. GitHub chọn máy TRƯỚC khi chạy bước đầu tiên nên
+# giá trị này không đọc được từ file trong repo.
+gh variable set RUNNER_LABEL -R $R --body "<nhãn-máy-nội-bộ>"
 
 gh secret set BOT_TOKEN     -R $R < <(printf %s '<PAT-1>')
 gh secret set REGISTRY_HOST -R $R --body 'harbor.stg.exampledevops.com'
@@ -129,6 +132,45 @@ gh secret set REGISTRY_PASS -R $R < <(printf %s '<mật-khẩu-robot-kéo>')
 cat <kubeconfig> | base64 -w0 | gh secret set KUBECONFIG_STAGING -R $R
 cat <kubeconfig> | base64 -w0 | gh secret set KUBECONFIG_PROD    -R $R
 ```
+
+## A7b. Nhãn runner cho CI của ứng dụng — sửa MỘT lần trong mẫu
+
+CI của ứng dụng cũng cần biết chạy trên máy nào. Nhưng đặt biến cấp tổ chức thì không có
+quyền, mà đặt cho từng repo lại phải nhớ mỗi lần thêm app.
+
+Cách gọn nhất: **sửa giá trị mặc định trong mẫu CI** của bạn. Mọi app chép từ mẫu đó nên tự
+đúng, không phải đặt biến nào cả.
+
+Trong `.github/workflows/ci.yaml` của app mẫu, đổi hai dòng:
+
+```yaml
+# job build — máy CÓ internet
+runs-on: ${{ vars.CI_RUNNER_LABEL || 'runner-internet' }}
+
+# job push — máy vào được Harbor
+runs-on: ${{ vars.PUSH_RUNNER_LABEL || vars.CI_RUNNER_LABEL || 'runner-noi-bo' }}
+```
+
+Thay `runner-internet` và `runner-noi-bo` bằng nhãn thật của bạn. Phần `vars.` giữ nguyên —
+nó cho phép ghi đè cho một repo riêng lẻ sau này nếu cần, mà không phải sửa lại mẫu.
+
+Làm tương tự với tên đăng nhập registry:
+
+```yaml
+REG_USER: ${{ vars.REGISTRY_USERNAME || '<robot-đẩy-của-Harbor>' }}
+```
+
+## A7c. Mỗi app mới cần 2 secret
+
+Đây là phần **không tránh được** phải lặp lại, vì secret không hardcode được:
+
+```bash
+gh secret set PLATFORM_DISPATCH_TOKEN -R $ORG/<app>        < <(printf %s '<PAT-2>')
+gh secret set PLATFORM_DISPATCH_TOKEN -R $ORG/<app>-config < <(printf %s '<PAT-2>')
+gh secret set REGISTRY_PASSWORD       -R $ORG/<app>        < <(printf %s '<mật-khẩu-robot-đẩy>')
+```
+
+> Nếu sau này xin được quyền đặt secret cấp tổ chức thì gộp lại còn một lần cho tất cả.
 
 ## A8. Bảo vệ nhánh
 
@@ -222,7 +264,9 @@ trong repo platform. Tóm tắt:
 2. Repo <ORG>/smoke-config với HAI nhánh: dev và main, mỗi nhánh ít nhất 1 commit
 3. Chép templates/config-repo-verify.yaml vào .github/workflows/verify.yaml của smoke-config,
    sửa APP và PLATFORM_REPO
-4. Đặt secret PLATFORM_DISPATCH_TOKEN cho CẢ HAI repo (tôi sẽ cấp giá trị)
+4. Đặt secret cho repo (tôi sẽ cấp giá trị):
+   - PLATFORM_DISPATCH_TOKEN cho CẢ HAI repo
+   - REGISTRY_PASSWORD cho repo ứng dụng
 
 CHƯA tạo GitRepo của Fleet — việc đó ở bước sau, có điều kiện phải kiểm trước.
 
