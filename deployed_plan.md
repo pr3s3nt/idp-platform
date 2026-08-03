@@ -88,82 +88,61 @@ kubectl -n traefik get gateway traefik-gateway \
 | `{"namespaces":{"from":"Same"}}` | **chỉ** namespace `traefik` gắn được — phải sửa |
 | có `selector` | chỉ namespace khớp nhãn — phải gắn nhãn cho namespace của app |
 
-### 1.3 [CHẶN] Cụm KHÔNG ra được internet — hệ quả dây chuyền
+### 1.3 Mạng và registry — đã khảo sát
 
-Đã xác nhận: pod không kéo được ảnh từ Docker Hub. Điều này kéo theo **bốn** việc, không
-phải một.
+| Hạng mục | Kết quả | Hệ quả |
+|---|---|---|
+| Cụm ra internet | **không** | ảnh nào **kubelet** kéo lúc chạy thì phải có trên Harbor |
+| Máy chạy CI ra internet | **có** | `docker build` và `pip install` chạy bình thường |
+| Harbor | **HTTPS** | không phải khai `insecure-registries` |
 
-#### a) Ảnh Postgres — cụm kéo lúc chạy
+**Chỉ còn MỘT việc phải mirror:**
 
 ```bash
 docker pull postgres:17-alpine
 docker tag  postgres:17-alpine <HARBOR>/<PROJECT>/postgres:17-alpine
 docker push <HARBOR>/<PROJECT>/postgres:17-alpine
 ```
-Rồi điền vào `images.postgres`. Thiếu → `StatefulSet` `ImagePullBackOff`, `PersistentVolumeClaim`
-treo `Pending` không rõ lý do.
 
-#### b) Ảnh NỀN trong mọi `Dockerfile` — máy chạy CI kéo lúc build
+Điền vào `images.postgres`. Thiếu → `StatefulSet` của database `ImagePullBackOff` và
+`PersistentVolumeClaim` treo `Pending` không rõ lý do.
 
-Các `Dockerfile` mẫu đang ghi `FROM nginx:1.27-alpine`, tức Docker Hub. Nếu **máy chạy CI**
-cũng không ra được internet thì `docker build` hỏng ngay từ dòng đầu.
+> **Ảnh nền trong `Dockerfile` KHÔNG cần mirror.** Máy chạy CI có internet nên kéo được
+> `nginx:1.27-alpine` lúc build, và ảnh kết quả đẩy lên Harbor đã tự chứa mọi thứ. Kubelet
+> chỉ kéo ảnh cuối cùng từ Harbor.
 
-Phải mirror mọi ảnh nền vào Harbor và sửa `FROM` trỏ vào đó:
+#### ❓ Địa chỉ Harbor phải là MỘT chuỗi duy nhất
 
-```dockerfile
-FROM <HARBOR>/<PROJECT>/nginx:1.27-alpine
-```
+Harbor chạy trong cụm (namespace `harbor`, `ClusterIP`). Máy chạy CI ở ngoài nên dùng địa
+chỉ ngoài — qua Ingress hoặc NodePort.
 
-> ❓ **Câu hỏi quyết định: máy chạy CI có internet không?** Cụm không có, nhưng máy chạy CI
-> là máy khác. Có internet thì bỏ qua mục (b) và (c).
+Tên ảnh ghi trong manifest được **cả hai bên** dùng: CI đẩy lên, kubelet kéo về. Nên
+`registry.path` phải là **một chuỗi mà cả máy chạy CI lẫn các node đều phân giải được**.
+Nếu hiện tại hai bên đang dùng hai địa chỉ khác nhau thì phải thống nhất trước.
 
-#### c) `pip install pyyaml` trong CI của app
+Cần: **địa chỉ HTTPS ngoài của Harbor** và **tên project** dùng cho IDP.
 
-CI của app có bước `pip install --quiet pyyaml` — cần PyPI. Không có internet thì phải:
-cài sẵn `pyyaml` trên máy chạy CI, **hoặc** trỏ vào PyPI nội bộ, **hoặc** bỏ bước đó đi nếu
-máy đã có sẵn.
+### 1.3b [NGƯỜI] Máy chạy CI — hai vai trò, một hoặc hai máy
 
-#### d) [CHẶN] Máy chạy CI cho ứng dụng — `ubuntu-latest` KHÔNG tồn tại trên GHES
+Chưa dựng runner nào. Cần hai vai trò, có thể trên cùng một máy nhưng **nhãn phải khác nhau**:
 
-CI của app đang khai `runs-on: ubuntu-latest`. Đó là runner do GitHub.com cung cấp; **GHES
-mặc định không có runner nào như vậy**. Workflow sẽ nằm chờ mãi không ai nhận, hoặc báo lỗi
-không tìm thấy runner.
+| Vai trò | Chạy gì | Cần gì |
+|---|---|---|
+| CI của ứng dụng | build và đẩy ảnh | `docker`, internet, mạng tới Harbor |
+| Orchestrator | render manifest, ghi git, kiểm cụm | `kubectl`, `helm`, `score-k8s`, `python3`+`pyyaml`, `gh`, **mạng tới API server của cụm** |
 
-Kiểm xem tổ chức có runner nào và nhãn gì:
+Khai nhãn bằng **biến**, không sửa workflow:
 
 ```bash
-gh api /orgs/example-org/actions/runners --jq '.runners[]|"\(.name) \(.status) \(.labels[].name)"'
+gh variable set RUNNER_LABEL    -R <ORG>/idp-platform --body "<nhãn-orchestrator>"
+gh variable set CI_RUNNER_LABEL --org <ORG>           --body "<nhãn-ci>"
 ```
 
-Rồi sửa `runs-on` trong CI của app cho khớp nhãn có thật.
+> `ubuntu-latest` là runner do GitHub.com cấp — **GHES không có**. CI của ứng dụng đã được
+> sửa để đọc `CI_RUNNER_LABEL`; không đặt biến này thì workflow **nằm chờ mãi không ai
+> nhận**, và không có lỗi nào rõ ràng.
 
-> Đây là **hai loại runner khác nhau**:
-> - CI của app: build ảnh — cần Docker, **không** cần vào cụm
-> - Orchestrator: render manifest — cần `kubectl`, `score-k8s`, **và** quyền vào cụm
->
-> Có thể dùng chung một máy, nhưng nhãn phải khai đúng ở cả hai nơi.
-
-#### e) Harbor nằm TRONG cụm — cần địa chỉ ngoài
-
-Harbor chạy ở namespace `harbor`, service kiểu `ClusterIP` cổng 80. Địa chỉ đó chỉ dùng được
-**từ bên trong cụm**. Máy chạy CI ở ngoài nên cần địa chỉ khác — qua Ingress/Gateway hoặc
-NodePort.
-
-Hai giá trị có thể **khác nhau**, và nền tảng hiện chỉ có một khoá `registry.path`:
-
-| Ai dùng | Địa chỉ |
-|---|---|
-| Máy chạy CI (đẩy ảnh) | địa chỉ ngoài |
-| Kubelet trên node (kéo ảnh) | có thể là địa chỉ nội bộ |
-
-**Phải là cùng một chuỗi** — vì tên ảnh ghi trong manifest được cả hai bên dùng. Nếu hiện tại
-hai bên đang dùng hai địa chỉ khác nhau thì phải thống nhất một cái mà cả hai đều phân giải
-được.
-
-> ❓ Harbor cổng 80 nghĩa là **HTTP**. Docker từ chối registry HTTP trừ khi khai
-> `insecure-registries` trong `/etc/docker/daemon.json` của máy chạy CI, và containerd trên
-> **cả 3 node** cũng phải khai tương tự. Nếu Harbor đã được dùng sẵn thì phần node có thể đã
-> cấu hình rồi — cần xác nhận.
+Đặt `CI_RUNNER_LABEL` ở **cấp tổ chức** để mọi repo ứng dụng tự có, khỏi phải nhớ từng cái.
 
 ### 1.4 GHES — đã khảo sát
 
@@ -314,15 +293,27 @@ kubectl -n fleet-local get gitrepo <tên-định-đặt> 2>/dev/null \
   && echo "ĐÃ TỒN TẠI — ĐỔI TÊN" || echo "an toàn"
 ```
 
-#### ❓ Một cụm hay hai cụm
+#### Hiện chỉ có MỘT cụm — cụm production đang dựng
 
-Báo cáo chỉ có dữ liệu của **một** cụm. Nền tảng dùng hai môi trường:
+Cách làm khuyến nghị: **trỏ cả hai môi trường vào cụm staging hiện có**, tách nhau bằng
+namespace. Khi cụm production xong thì đổi đúng một secret.
 
-- **Hai cụm** → mỗi cụm một `GitRepo`, `KUBECONFIG_STAGING` và `KUBECONFIG_PROD` khác nhau
-- **Một cụm** → hai môi trường tách nhau bằng namespace, hai `GitRepo` **trên cùng một cụm**,
-  và lúc đó tên bắt buộc phải kèm môi trường, nếu không cái sau đè cái trước
+```bash
+gh secret set KUBECONFIG_STAGING -R <ORG>/idp-platform   # cụm staging
+gh secret set KUBECONFIG_PROD    -R <ORG>/idp-platform   # TẠM THỜI: cũng cụm staging
+```
 
-Cần trả lời trước khi tạo `GitRepo`.
+Vì sao nên làm vậy thay vì chờ:
+
+- Diễn tập được **trọn vẹn** luồng lên production — mở pull request, người duyệt, merge, Fleet
+  đồng bộ, kiểm cụm — trước khi có cụm thật
+- Namespace tách bạch (`<app>-staging` và `<app>-prod`) nên hai môi trường không đụng nhau
+- Khi cụm production sẵn sàng: đổi `KUBECONFIG_PROD`, tạo lại `GitRepo` prod trên cụm mới,
+  xoá namespace `-prod` ở cụm staging. Không phải sửa code hay cấu hình nào khác
+
+⚠️ **Vì hai môi trường dùng chung một cụm, tên `GitRepo` BẮT BUỘC kèm môi trường.** Đặt trùng
+tên thì cái sau đè cái trước và một môi trường **lặng lẽ không được đồng bộ** — đã gặp thật
+ở sandbox.
 
 ### 3.3 [NGƯỜI] Thông tin đăng nhập Git cho Fleet
 
@@ -507,9 +498,9 @@ gh run list -R <ORG>/idp-platform --limit 1     # phải thấy verify-request, 
 | Fleet ngừng đồng bộ sau 1 giờ | `git-creds` dùng token GitHub App (hết hạn 1 giờ) | `kubectl -n fleet-local get gitrepo -o wide` |
 | Kéo ảnh treo vô hạn, DNS vẫn chạy | MTU của Docker lệch MTU máy | `docker run --rm alpine ping -c1 -s 1400 <harbor>` |
 | Deploy đột nhiên 401 | PAT fine-grained hết hạn | xem ngày hết hạn của token |
-| CI của app nằm chờ mãi không chạy | `runs-on: ubuntu-latest` — GHES không có runner đó | `gh api /orgs/<ORG>/actions/runners` |
-| `docker build` hỏng ở dòng `FROM` | Ảnh nền chưa mirror vào Harbor, máy chạy CI không ra internet | thử `docker pull` ảnh nền trên máy đó |
-| `docker push` báo `http: server gave HTTP response to HTTPS client` | Harbor chạy HTTP, chưa khai `insecure-registries` | xem `/etc/docker/daemon.json` |
+| CI của app nằm chờ mãi không chạy | Chưa đặt biến `CI_RUNNER_LABEL`, hoặc nhãn không khớp runner nào | `gh api /orgs/<ORG>/actions/runners` |
+| Database `ImagePullBackOff`, PVC `Pending` | Chưa mirror ảnh Postgres vào Harbor — cụm không ra internet | `docker manifest inspect <images.postgres>` |
+| CI đẩy được ảnh nhưng pod kéo không được | `registry.path` là địa chỉ chỉ máy chạy CI phân giải được, node thì không | thử `crictl pull` trên node |
 | Một môi trường không được đồng bộ | Hai `GitRepo` trùng tên trên cùng cụm | `kubectl get gitrepo -A` |
 | **Ứng dụng của đội KHÁC ngừng đồng bộ** | `GitRepo` mới trùng tên với `GitRepo` sẵn có (`app1`, `app2`…) — đè lên nhau | `kubectl get gitrepo -A` trước khi tạo |
 | Tạo `GitRepo` xong Fleet vẫn không nhận | Sai namespace — Rancher dùng `fleet-default` hoặc `fleet-local` tuỳ cụm | so với namespace của `GitRepo` đang có |
