@@ -1,0 +1,203 @@
+# =============================================================================
+# MẪU CI CHO REPO CÓ MỘT SERVICE
+#
+# Chép file này vào .github/workflows/ci.yaml của repo ứng dụng, rồi sửa 4 dòng
+# đánh dấu "<-- SỬA" ở khối env bên dưới.
+#
+# CHỌN ĐÚNG MẪU:
+#   - repo có 1 file score.yaml       -> app-ci-mot-service.yaml
+#   - repo có nhiều file score.yaml   -> app-ci-nhieu-service.yaml
+# Chép nhầm mẫu một-service vào repo nhiều service sẽ hỏng ngay ở bước build với
+#   failed to read dockerfile: open Dockerfile: no such file or directory
+#
+# NHÃN MÁY CHẠY: hai job chạy trên HAI máy khác nhau khi mạng bị chia đôi —
+#   build  cần INTERNET (kéo ảnh nền)
+#   push   cần vào được REGISTRY nội bộ
+# Nếu một máy làm được cả hai thì khai cùng một nhãn cho cả hai job.
+# Sửa giá trị mặc định trong `runs-on` bên dưới cho khớp nhãn runner của bạn.
+# =============================================================================
+# CI của APP — cố tình mỏng.
+#
+# App chỉ làm 2 việc: build image và "gọi" platform. Toàn bộ phần render manifest, apply
+# secret, commit vào config repo nằm ở orchestrator trong repo idp-platform, viết một lần
+# dùng chung cho mọi app. Đây là ranh giới của IDP: dev không cần biết Fleet hay k8s.
+#
+# Chạy trên ubuntu-latest (GitHub-hosted) vì bước này chỉ cần Docker + mạng, không cần
+# quyền vào cụm. Chỉ orchestrator mới cần self-hosted runner.
+name: ci
+
+on:
+  push:
+    # dev = staging, main = production. Nhánh quyết định môi trường, nên "đưa lên
+    # production" là một thao tác git review được chứ không phải một lệnh ai đó gõ.
+    branches: [dev, main]
+  workflow_dispatch:
+
+# Một loạt push liên tiếp chỉ cần build và deploy commit MỚI NHẤT.
+# Không có dòng này, mỗi push đều dispatch, và hàng đợi của orchestrator chỉ giữ được
+# một run pending — run mới tới sẽ HUỶ run đang chờ. Đo thực tế: 4 push liên tiếp làm
+# commit mới nhất bị huỷ và staging kẹt lại ở commit áp chót, báo "cancelled" chứ không
+# phải "failed" nên không ai biết. Gộp ngay từ đây thì các commit cũ không bao giờ
+# dispatch, hàng đợi kia không còn gì để huỷ nhầm.
+# Đánh đổi: commit trung gian không có image. Muốn promote đúng commit đó thì phải
+# build lại — chấp nhận được, vì chúng đã bị commit sau thay thế.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # app name -> quyết định tên config repo và namespace (sample-nginx-staging/-prod)
+  APP: TEN-APP                      # <-- SỬA
+  # tên image trùng app name — nhánh mặc định (image != app đã test ở sample-nginx)
+  IMAGE_NAME: TEN-APP               # <-- SỬA (có thể khác APP)
+  REGISTRY: harbor.vi-du.vn/idp     # <-- SỬA
+  PLATFORM_REPO: TO-CHUC/idp-platform  # <-- SỬA
+
+jobs:
+  # ===========================================================================
+  # BUILD — chạy trên máy CÓ INTERNET (kéo được ảnh nền từ Docker Hub).
+  # Máy này không vào được registry nội bộ nên chỉ build rồi đóng gói ảnh lại.
+  # ===========================================================================
+  build:
+    # Nhãn máy chạy đọc từ BIẾN của repo/tổ chức, không gắn cứng.
+    # `ubuntu-latest` là runner do GitHub.com cấp — GitHub Enterprise Server KHÔNG có nó,
+    # workflow sẽ nằm chờ mãi không ai nhận và cũng không báo lỗi gì rõ ràng.
+    # Trên GHES: đặt biến CI_RUNNER_LABEL bằng nhãn của runner tự dựng.
+    # Trên github.com: để trống, mặc định ubuntu-latest.
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    # GITHUB_TOKEN mặc định chỉ đọc. Xin thêm quyền ghi package để đăng nhập GHCR mà
+    # KHÔNG cần PAT. Khai tường minh cả hai dòng: đặt permissions làm mất mọi quyền mặc
+    # định không được liệt kê, nên thiếu `contents: read` thì bước checkout sẽ hỏng.
+    permissions:
+      contents: read
+      packages: write
+    # Tên ảnh do platform quyết, tính ở job này rồi chuyển sang job sau — KHÔNG tính lại.
+    # Tính hai lần là hai cơ hội ra hai kết quả khác nhau.
+    outputs:
+      image: ${{ steps.plan.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dùng PAT chứ không phải GITHUB_TOKEN: cùng một token này còn phải dispatch chéo
+      # sang idp-platform ở bước dưới, nên giữ một credential duy nhất cho dễ debug.
+
+      # HỎI platform tên ảnh phải build, KHÔNG tự tính. Quy tắc đặt tên do orchestrate.py
+      # giữ; nếu CI tự tính rồi lệch thì Fleet apply một manifest trỏ tới ảnh chưa ai đẩy,
+      # và chỉ lộ ra khi pod ImagePullBackOff. Đã xảy ra thật một lần khi đổi mặc định
+      # sang nhãn theo nội dung: 5 app hỏng cùng lúc vì CI còn gắn cứng :${GITHUB_SHA}.
+      #
+      # LẤY Ở `main`, CỐ Ý — KHÔNG theo platform.lock.
+      # platform.lock ghim CATALOG (provisioner, patch) tức DỮ LIỆU, không ghim CODE.
+      # Orchestrator luôn chạy orchestrate.py từ nhánh mặc định, vì GitHub chỉ chạy
+      # workflow repository_dispatch từ đó. Nếu CI tính tên ảnh bằng một phiên bản
+      # orchestrate.py CŨ hơn, hai bên sẽ ra hai tên khác nhau ngay khi quy tắc đặt tên
+      # thay đổi — CI đẩy nhãn cũ, manifest đòi nhãn mới, pod ImagePullBackOff. Hôm nay
+      # chưa nổ chỉ vì mọi platform.lock đều đang ghi "main".
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: main
+          token: ${{ secrets.PLATFORM_DISPATCH_TOKEN }}
+          path: platform
+
+      - name: Hỏi platform tên ảnh
+        id: plan
+        run: |
+          set -euo pipefail
+          pip install --quiet pyyaml
+          IMG=$(python3 platform/orchestrate.py image-plan \
+                  --app "$APP" --image "$IMAGE_NAME" --tag "$GITHUB_SHA" \
+                  --registry "$REGISTRY" --app-dir . | jq -r 'to_entries[0].value')
+          echo "==> sẽ build: $IMG"
+          echo "ref=$IMG" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          REF="${{ steps.plan.outputs.ref }}"
+          docker build -t "$REF" .
+          echo "==> đã build $REF"
+
+      # ĐÓNG GÓI ẢNH ĐỂ CHUYỂN SANG MÁY KHÁC.
+      # Máy build có internet nhưng KHÔNG vào được registry nội bộ; máy đẩy thì ngược lại.
+      # Không máy nào làm trọn được cả hai việc, nên ảnh phải đi qua một tệp trung gian.
+      # gzip -1: nhanh, và lớp ảnh vốn đã nén sẵn nên nén kỹ hơn cũng không lợi bao nhiêu.
+      - name: Đóng gói ảnh thành tệp
+        run: |
+          set -euo pipefail
+          docker save "${{ steps.plan.outputs.ref }}" | gzip -1 > image.tar.gz
+          ls -lh image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 1
+
+  # ===========================================================================
+  # PUSH — chạy trên máy VÀO ĐƯỢC registry nội bộ (không cần internet).
+  # Nhận tệp ảnh từ job trước, nạp lại rồi đẩy lên registry, và chỉ khi đẩy xong
+  # mới gọi platform. Thứ tự đó quan trọng: gọi platform trước khi ảnh có mặt thì
+  # manifest sẽ trỏ tới một ảnh chưa tồn tại, và chỉ lộ ra khi pod ImagePullBackOff.
+  # ===========================================================================
+  push:
+    needs: build
+    # Mặc định rơi về cùng máy với job build, nên ở môi trường một-máy (sandbox)
+    # workflow vẫn chạy y nguyên mà không phải rẽ nhánh cấu hình.
+    runs-on: ${{ vars.PUSH_RUNNER_LABEL || vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_REF: ${{ needs.build.outputs.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Nạp ảnh từ tệp
+        run: |
+          set -euo pipefail
+          gunzip -c image.tar.gz | docker load
+          docker image inspect "$IMAGE_REF" >/dev/null
+          echo "==> đã nạp $IMAGE_REF"
+
+      # Tên đăng nhập và mật khẩu lấy từ biến/secret, không gắn cứng: sandbox dùng GHCR,
+      # công ty dùng Harbor nội bộ. Host suy ra từ REGISTRY nên chỉ khai một chỗ.
+      - name: Đăng nhập registry
+        env:
+          REG_USER: ${{ vars.REGISTRY_USERNAME || github.repository_owner }}
+          REG_PASS: ${{ secrets.REGISTRY_PASSWORD || secrets.PLATFORM_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$REG_PASS" | docker login "${REGISTRY%%/*}" -u "$REG_USER" --password-stdin
+          echo "==> đã đăng nhập ${REGISTRY%%/*}"
+
+      - name: Đẩy ảnh
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_REF"
+          echo "==> đã đẩy $IMAGE_REF"
+
+      # GITHUB_TOKEN mặc định KHÔNG dispatch được sang repo khác, nên bắt buộc dùng PAT.
+      - name: Dispatch deploy-request tới platform
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Nhánh quyết định môi trường đích.
+          DEPLOY_ENV=staging
+          [ "$GITHUB_REF_NAME" = "main" ] && DEPLOY_ENV=prod
+          echo "==> nhánh $GITHUB_REF_NAME -> môi trường $DEPLOY_ENV"
+          jq -n \
+            --arg app   "$APP" \
+            --arg denv  "$DEPLOY_ENV" \
+            --arg repo  "$GITHUB_REPOSITORY" \
+            --arg sha   "$GITHUB_SHA" \
+            --arg image "$IMAGE_NAME" \
+            '{event_type:"deploy-request",
+              client_payload:{app:$app, repo:$repo, sha:$sha, image:$image,
+                              env:$denv, tag_strategy:"content"}}' \
+          | tee /dev/stderr \
+          | gh api -X POST "/repos/${PLATFORM_REPO}/dispatches" --input -
+          echo "==> deploy-request đã gửi cho ${PLATFORM_REPO}"

@@ -88,13 +88,17 @@ Một dòng, là ref của repo platform mà app render theo.
 
 ### A4. `.github/workflows/ci.yaml`
 
-Sao chép từ một app có sẵn, **nhưng chọn đúng mẫu theo số service trong repo** — đây là chỗ
-sai dễ mắc, và nó hỏng ngay ở bước build:
+Mẫu nằm ngay trong repo platform, thư mục `templates/`. **Chọn đúng mẫu theo số service
+trong repo** — đây là chỗ sai dễ mắc, và nó hỏng ngay ở bước build:
 
-| Repo có | Chép từ | Vì sao |
+| Repo có | Chép file | Vì sao |
 |---|---|---|
-| **một** service | `idp-helloworld` | Build từ gốc repo, một ảnh |
-| **nhiều** service | `idp-boutique` | Build từng thư mục service, lấy danh sách động từ platform |
+| **một** `score.yaml` | `templates/app-ci-mot-service.yaml` | Build từ gốc repo, một ảnh |
+| **nhiều** `score.yaml` | `templates/app-ci-nhieu-service.yaml` | Build từng thư mục service, lấy danh sách động từ platform |
+
+```bash
+cp <repo-platform>/templates/app-ci-mot-service.yaml .github/workflows/ci.yaml
+```
 
 Chép nhầm mẫu một-service cho repo nhiều service sẽ ra:
 `failed to read dockerfile: open Dockerfile: no such file or directory`.

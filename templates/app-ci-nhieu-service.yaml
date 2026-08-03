@@ -1,0 +1,202 @@
+# =============================================================================
+# MẪU CI CHO REPO CÓ NHIỀU SERVICE
+#
+# Chép file này vào .github/workflows/ci.yaml của repo ứng dụng, rồi sửa 4 dòng
+# đánh dấu "<-- SỬA" ở khối env bên dưới.
+#
+# CHỌN ĐÚNG MẪU:
+#   - repo có 1 file score.yaml       -> app-ci-mot-service.yaml
+#   - repo có nhiều file score.yaml   -> app-ci-nhieu-service.yaml
+# Chép nhầm mẫu một-service vào repo nhiều service sẽ hỏng ngay ở bước build với
+#   failed to read dockerfile: open Dockerfile: no such file or directory
+#
+# ⚠️ MẪU NÀY CHƯA TÁCH BUILD VÀ PUSH.
+# Nó giả định MỘT máy vừa có internet vừa vào được registry. Nếu mạng công ty chia đôi
+# (máy có internet không vào được registry) thì mẫu này KHÔNG chạy được — cần tách thành
+# hai job như mẫu một-service. Báo lại để được sửa; đây là việc thật, không phải chỉnh nhỏ,
+# vì mỗi service sinh một ảnh riêng nên phải chuyển nhiều tệp qua lại.
+#
+# NHÃN MÁY CHẠY: hai job chạy trên HAI máy khác nhau khi mạng bị chia đôi —
+#   build  cần INTERNET (kéo ảnh nền)
+#   push   cần vào được REGISTRY nội bộ
+# Nếu một máy làm được cả hai thì khai cùng một nhãn cho cả hai job.
+# Sửa giá trị mặc định trong `runs-on` bên dưới cho khớp nhãn runner của bạn.
+# =============================================================================
+# CI của APP — OnlineBoutique, BUILD THẬT từ source.
+#
+# Mỗi service một thư mục chứa Dockerfile + score.yaml + code. CI build từng cái bằng chính
+# Dockerfile của nó rồi push GHCR.
+#
+# CHỈ BUILD SERVICE CÓ NỘI DUNG ĐỔI. Tag của mỗi image là mã băm nội dung THƯ MỤC của
+# service đó (git tree hash), không phải SHA của cả repo. Sửa `email` thì `frontend` giữ
+# nguyên tag -> image đã có sẵn trên registry -> khỏi build, và manifest của nó không đổi
+# nên pod không bị khởi động lại.
+#
+# Đo trước khi sửa: một commit chỉ đụng .github/ vẫn build lại đủ 11 service (~13 phút máy
+# chủ) và làm cả 11 Deployment đổi image -> 11 pod restart, kể cả trên production.
+#
+# Quy tắc đặt tên image do orchestrate.py quyết định, KHÔNG chép lại ở đây: job `plan` gọi
+# `orchestrate.py image-plan` để hỏi. Nếu hai bên tự tính riêng rồi lệch nhau thì Fleet sẽ
+# apply một manifest trỏ tới image chưa ai push, và chỉ phát hiện được khi pod chết.
+name: ci
+
+on:
+  push:
+    # dev = staging, main = production. Nhánh quyết định môi trường, nên "đưa lên
+    # production" là một thao tác git review được chứ không phải một lệnh ai đó gõ.
+    branches: [dev, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP: TEN-APP                      # <-- SỬA
+  IMAGE_NAME: TEN-APP               # <-- SỬA (có thể khác APP)
+  REGISTRY: harbor.vi-du.vn/idp     # <-- SỬA
+  PLATFORM_REPO: TO-CHUC/idp-platform  # <-- SỬA
+
+jobs:
+  plan:
+    # Nhãn máy chạy đọc từ BIẾN, không gắn cứng. `ubuntu-latest` là runner của
+    # GitHub.com — GitHub Enterprise Server KHÔNG có nó, workflow sẽ nằm chờ mãi
+    # không ai nhận mà cũng không báo lỗi rõ ràng.
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    outputs:
+      # Danh sách service CẦN build (image chưa có trên registry).
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Lấy catalog ở đúng ref app đã ghim, giống hệt cách orchestrator làm — để quy tắc
+      # đặt tên mà CI dùng chính là quy tắc sẽ render ra manifest.
+      # Vẫn đọc để ghi vào log — orchestrator tự đọc platform.lock từ kho app khi render.
+      - name: Resolve catalog version (platform.lock)
+        id: lock
+        run: |
+          REF=$(grep -v '^#' platform.lock 2>/dev/null | head -1 | tr -d '[:space:]')
+          [ -n "$REF" ] || REF=main
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          # LẤY Ở `main`, CỐ Ý — KHÔNG theo platform.lock.
+          # platform.lock ghim CATALOG (provisioner, patch) tức DỮ LIỆU, không ghim CODE.
+          # Orchestrator luôn chạy orchestrate.py từ nhánh mặc định, vì GitHub chỉ chạy
+          # workflow repository_dispatch từ đó. Nếu CI tính tên ảnh bằng một phiên bản
+          # orchestrate.py CŨ hơn, hai bên ra hai tên khác nhau ngay khi quy tắc đặt tên
+          # đổi — CI đẩy nhãn cũ, manifest đòi nhãn mới, pod ImagePullBackOff. Hôm nay
+          # chưa nổ chỉ vì mọi platform.lock đều đang ghi "main".
+          ref: main
+          token: ${{ secrets.PLATFORM_DISPATCH_TOKEN }}
+          path: platform
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.PLATFORM_DISPATCH_TOKEN }}" | docker login "${REGISTRY%%/*}" -u "${{ vars.REGISTRY_USERNAME || github.repository_owner }}" --password-stdin
+
+      - name: Hỏi platform xem phải build image nào
+        id: plan
+        run: |
+          set -euo pipefail
+          pip install --quiet pyyaml
+          python3 platform/orchestrate.py image-plan \
+            --app "$APP" --image "$IMAGE_NAME" --tag "$GITHUB_SHA" \
+            --registry "$REGISTRY" --app-dir . --tag-strategy content > plan.json
+          cat plan.json
+
+          # Chỉ giữ lại những image chưa tồn tại trên registry.
+          #
+          # Hỏi 3 lần trước khi kết luận là thiếu. Lần chạy đầu tiên của cơ chế này có một
+          # service bị build thừa vì `docker manifest inspect` lỗi thoáng qua, trong khi
+          # image thật sự đã nằm trên GHCR — kiểm lại thủ công 3/3 lần đều thấy. Coi "lỗi
+          # mạng" đồng nghĩa "chưa có image" là sai hướng an toàn (build thừa thì vô hại,
+          # nhưng vẫn tốn), nên phân biệt hai thứ đó.
+          exists() {
+            for _ in 1 2 3; do
+              docker manifest inspect "$1" >/dev/null 2>&1 && return 0
+              sleep 3
+            done
+            return 1
+          }
+
+          NEED='[]'
+          for w in $(jq -r 'keys[]' plan.json); do
+            ref=$(jq -r --arg w "$w" '.[$w]' plan.json)
+            if exists "$ref"; then
+              echo "  bỏ qua $w — $ref đã có"
+            else
+              echo "  cần build $w — $ref"
+              NEED=$(jq -c --arg w "$w" --arg r "$ref" '. + [{workload:$w, ref:$r}]' <<<"$NEED")
+            fi
+          done
+          echo "matrix=$NEED" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq 'length' <<<"$NEED")" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.PLATFORM_DISPATCH_TOKEN }}" | docker login "${REGISTRY%%/*}" -u "${{ vars.REGISTRY_USERNAME || github.repository_owner }}" --password-stdin
+
+      # RETRY, không phải phòng xa suông: lần chạy đầu tiên của repo này có đúng một service
+      # hỏng vì Docker Hub trả 502 Bad Gateway khi kéo base image — cùng service đó build
+      # sạch ở máy local vài phút trước. 11 service kéo base image từ 4 registry khác nhau,
+      # và một service hỏng là cả deploy không đi tiếp được.
+      - name: Build ${{ matrix.workload }}
+        run: |
+          set -euo pipefail
+          REF="${{ matrix.ref }}"
+          for attempt in 1 2 3; do
+            docker build -t "$REF" "${{ matrix.workload }}/" && break
+            [ "$attempt" = 3 ] && { echo "::error::build ${{ matrix.workload }} hỏng sau 3 lần"; exit 1; }
+            echo "::warning::build ${{ matrix.workload }} hỏng (lần $attempt/3) — thử lại sau 20s"
+            sleep 20
+          done
+          for attempt in 1 2 3; do
+            docker push "$REF" && break
+            [ "$attempt" = 3 ] && { echo "::error::push $REF hỏng sau 3 lần"; exit 1; }
+            echo "::warning::push hỏng (lần $attempt/3) — thử lại sau 20s"
+            sleep 20
+          done
+          echo "==> pushed $REF"
+
+  dispatch:
+    needs: [plan, build]
+    # always() vì `build` bị SKIPPED khi không có service nào đổi — và đó là trường hợp
+    # thành công phổ biến nhất, không phải lỗi. Không có always() thì mọi commit chỉ sửa
+    # tài liệu sẽ không bao giờ tới được orchestrator.
+    if: always() && needs.plan.result == 'success' && needs.build.result != 'failure'
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    steps:
+      - name: Dispatch deploy-request tới platform
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Nhánh quyết định môi trường đích.
+          DEPLOY_ENV=staging
+          [ "$GITHUB_REF_NAME" = "main" ] && DEPLOY_ENV=prod
+          echo "==> nhánh $GITHUB_REF_NAME -> môi trường $DEPLOY_ENV"
+          jq -n \
+            --arg app   "$APP" \
+            --arg denv  "$DEPLOY_ENV" \
+            --arg repo  "$GITHUB_REPOSITORY" \
+            --arg sha   "$GITHUB_SHA" \
+            --arg image "$IMAGE_NAME" \
+            '{event_type:"deploy-request",
+              client_payload:{app:$app, repo:$repo, sha:$sha, image:$image,
+                              env:$denv, tag_strategy:"content"}}' \
+          | gh api -X POST "/repos/${PLATFORM_REPO}/dispatches" --input -
+          echo "==> deploy-request đã gửi (đã build ${{ needs.plan.outputs.count }} service)"
