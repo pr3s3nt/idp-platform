@@ -1051,7 +1051,37 @@ Bản viết vội hôm trước có ba khiếm khuyết chỉ lộ ra khi soi k
   rỗng và phun traceback — trông như hỏng nặng trong khi thực ra chỉ là "chủ sở hữu này
   không phải tổ chức, thử kiểu còn lại".
 
+#### Rồi hoá ra công ty đã có sẵn tài khoản bot
+
+Hỏi lại thì công ty có **tài khoản dùng chung** và cho phép dùng **PAT dạng fine-grained**
+của nó. Điều đó làm mọi thứ đơn giản hẳn: không phải tạo App, không phải chờ duyệt cài,
+không cần script lấy token. Chỉ là một secret.
+
+Fine-grained là điểm quyết định. PAT kiểu cũ trên GHES chỉ có scope thô `repo` — ghi được
+vào **mọi repo tài khoản đó nhìn thấy**, mà tài khoản dùng chung thì thường thấy rất nhiều.
+Fine-grained thì giới hạn được đúng các repo IDP với đúng quyền cần, tức gần bằng App về
+mức độ khoanh vùng nhưng dễ hơn nhiều.
+
+Nên workflow giờ nhận **cả hai**, ưu tiên `BOT_TOKEN`:
+
+| Có gì | Dùng gì |
+|---|---|
+| `BOT_TOKEN` | PAT của tài khoản bot — đường chính ở công ty |
+| chỉ `APP_ID` + khoá | GitHub App, tự ký JWT — đường sandbox đang chạy |
+| không có gì | hỏng ngay ở bước đầu kèm thông báo rõ |
+
+Giữ hai đường thay vì chọn một, vì hai nơi có ràng buộc khác nhau: công ty có sẵn tài khoản
+bot, còn sandbox thì không — token duy nhất ở đây là của chính người dùng, mà dùng nó thì
+cổng duyệt production tự khoá lại (GitHub chặn tự duyệt pull request của mình).
+
 #### Kiểm chứng
+
+Kiểm **cả hai đường** trên sandbox, mỗi đường một vòng deploy thật:
+
+| Đường | Kết quả |
+|---|---|
+| Đặt `BOT_TOKEN` | log ghi `dùng BOT_TOKEN`, deploy xanh, **token không xuất hiện lần nào trong log**, trang staging đổi nội dung |
+| Gỡ `BOT_TOKEN` ra | tự quay về App: `đã mint token cho installation 150297084`, deploy xanh, commit mang đúng danh tính bot |
 
 Chạy thật một vòng deploy trên sandbox: mint token thành công
 (`đã mint token cho installation 150297084`), **token không lọt ra log**, manifest được ghi
