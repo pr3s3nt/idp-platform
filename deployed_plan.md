@@ -93,7 +93,8 @@ kubectl -n traefik get gateway traefik-gateway \
 | Hạng mục | Kết quả | Hệ quả |
 |---|---|---|
 | Cụm ra internet | **không** | ảnh nào **kubelet** kéo lúc chạy thì phải có trên Harbor |
-| Máy chạy CI ra internet | **có** | `docker build` và `pip install` chạy bình thường |
+| Máy build ra internet | **có** | `docker build` và `pip install` chạy bình thường |
+| Máy build vào được Harbor | **không** | ảnh phải đi qua máy thứ hai — xem 1.3b |
 | Harbor | **HTTPS** | không phải khai `insecure-registries` |
 
 **Chỉ còn MỘT việc phải mirror:**
@@ -163,27 +164,59 @@ Ra IP của Gateway là có wildcard. Không ra gì là chưa có.
 > Một ứng dụng có workload tên `harbor` sẽ sinh ra đúng tên miền đó và tranh chấp. Ít khả
 > năng xảy ra, nhưng nên cấm tên đó.
 
-### 1.3b [NGƯỜI] Máy chạy CI — hai vai trò, một hoặc hai máy
+### 1.3b [NGƯỜI] Ba vai trò máy chạy CI
 
-Chưa dựng runner nào. Cần hai vai trò, có thể trên cùng một máy nhưng **nhãn phải khác nhau**:
+Mạng ở đây bị chia đôi: **máy có internet thì không vào được Harbor, máy vào được Harbor thì
+không có internet.** Nên việc build một ảnh phải đi qua hai máy.
 
-| Vai trò | Chạy gì | Cần gì |
-|---|---|---|
-| CI của ứng dụng | build và đẩy ảnh | `docker`, internet, mạng tới Harbor |
-| Orchestrator | render manifest, ghi git, kiểm cụm | `kubectl`, `helm`, `score-k8s`, `python3`+`pyyaml`, `gh`, **mạng tới API server của cụm** |
+| Vai trò | Nhãn khai bằng biến | Cần gì | Làm gì |
+|---|---|---|---|
+| **Build** | `CI_RUNNER_LABEL` | Docker, **internet**, tới được GHES | kéo ảnh nền, build, đóng gói ảnh thành tệp |
+| **Push** | `PUSH_RUNNER_LABEL` | Docker, **tới được Harbor**, tới được GHES | nạp tệp, đẩy lên Harbor, gọi platform |
+| **Orchestrator** | `RUNNER_LABEL` | `kubectl`, `helm`, `score-k8s`, `python3`+`pyyaml`, `gh`, **tới được API server của cụm** | render manifest, ghi git, kiểm cụm |
 
-Khai nhãn bằng **biến**, không sửa workflow:
+Máy Push và máy Orchestrator **có thể là một** — cả hai đều nằm trong mạng nội bộ. Khi đó
+khai cùng một nhãn cho `PUSH_RUNNER_LABEL` và `RUNNER_LABEL`.
 
 ```bash
-gh variable set RUNNER_LABEL    -R <ORG>/idp-platform --body "<nhãn-orchestrator>"
-gh variable set CI_RUNNER_LABEL --org <ORG>           --body "<nhãn-ci>"
+gh variable set CI_RUNNER_LABEL   --org <ORG> --body "<nhãn-máy-có-internet>"
+gh variable set PUSH_RUNNER_LABEL --org <ORG> --body "<nhãn-máy-nội-bộ>"
+gh variable set RUNNER_LABEL      -R <ORG>/idp-platform --body "<nhãn-máy-nội-bộ>"
 ```
 
-> `ubuntu-latest` là runner do GitHub.com cấp — **GHES không có**. CI của ứng dụng đã được
-> sửa để đọc `CI_RUNNER_LABEL`; không đặt biến này thì workflow **nằm chờ mãi không ai
-> nhận**, và không có lỗi nào rõ ràng.
+Đặt hai biến đầu ở **cấp tổ chức** để mọi repo ứng dụng tự có.
 
-Đặt `CI_RUNNER_LABEL` ở **cấp tổ chức** để mọi repo ứng dụng tự có, khỏi phải nhớ từng cái.
+#### CI của ứng dụng chạy hai job — đã sửa sẵn, không phải làm gì thêm
+
+```
+build (máy có internet)                push (máy nội bộ)
+  hỏi platform tên ảnh                   tải tệp về
+  docker build            ──tệp──▶       docker load
+  docker save | gzip                     docker login Harbor
+  tải tệp lên artifact                   docker push
+                                         gọi platform
+```
+
+Ba điều đáng chú ý trong thiết kế này:
+
+1. **Tên ảnh tính đúng MỘT lần**, ở job build, rồi chuyển sang job push. Tính hai lần là hai
+   cơ hội cho ra hai kết quả khác nhau — đúng loại lỗi đã làm hỏng production một lần.
+2. **Gọi platform nằm ở job push**, sau khi đẩy ảnh xong. Trước đây hai việc cùng một job
+   nên thứ tự tự nhiên đúng; tách ra rồi thì phải khai tường minh, nếu không manifest sẽ trỏ
+   tới ảnh chưa tồn tại và chỉ lộ ra khi pod `ImagePullBackOff`.
+3. **Không đặt `PUSH_RUNNER_LABEL` thì nó rơi về `CI_RUNNER_LABEL`** — môi trường một máy
+   chạy y nguyên, không phải rẽ nhánh cấu hình.
+
+> ⚠️ **[CHẶN] Kiểm hai action này có trên GHES không** — cách chuyển tệp phụ thuộc chúng:
+> ```bash
+> gh api repos/actions/upload-artifact   --jq .full_name
+> gh api repos/actions/download-artifact --jq .full_name
+> ```
+> Không có thì đổi sang dùng `gh release upload` / `gh release download` — chỉ cần `gh`,
+> không cần action nào. Báo lại để tôi sửa mẫu CI.
+
+> Cách này thay cho việc **commit tệp ảnh thẳng vào git**: tệp ảnh vài trăm MB nằm trong
+> lịch sử git là ở đó vĩnh viễn, kho phình ra không lấy lại được.
 
 ### 1.4 GHES — đã khảo sát
 
@@ -539,7 +572,9 @@ gh run list -R <ORG>/idp-platform --limit 1     # phải thấy verify-request, 
 | Fleet ngừng đồng bộ sau 1 giờ | `git-creds` dùng token GitHub App (hết hạn 1 giờ) | `kubectl -n fleet-local get gitrepo -o wide` |
 | Kéo ảnh treo vô hạn, DNS vẫn chạy | MTU của Docker lệch MTU máy | `docker run --rm alpine ping -c1 -s 1400 <harbor>` |
 | Deploy đột nhiên 401 | PAT fine-grained hết hạn | xem ngày hết hạn của token |
-| CI của app nằm chờ mãi không chạy | Chưa đặt biến `CI_RUNNER_LABEL`, hoặc nhãn không khớp runner nào | `gh api /orgs/<ORG>/actions/runners` |
+| CI của app nằm chờ mãi không chạy | Chưa đặt `CI_RUNNER_LABEL` / `PUSH_RUNNER_LABEL`, hoặc nhãn không khớp runner nào | `gh api /orgs/<ORG>/actions/runners` |
+| Job `push` hỏng ở bước tải tệp | GHES không có `actions/download-artifact` | `gh api repos/actions/download-artifact` |
+| Job `push` hỏng ở `docker load` | Job build và push chạy trên máy có kiến trúc CPU khác nhau | so `uname -m` trên hai máy |
 | Database `ImagePullBackOff`, PVC `Pending` | Chưa mirror ảnh Postgres vào Harbor — cụm không ra internet | `docker manifest inspect <images.postgres>` |
 | CI đẩy được ảnh nhưng pod kéo không được | `registry.path` là địa chỉ chỉ máy chạy CI phân giải được, node thì không | thử `crictl pull` trên node |
 | Một môi trường không được đồng bộ | Hai `GitRepo` trùng tên trên cùng cụm | `kubectl get gitrepo -A` |
