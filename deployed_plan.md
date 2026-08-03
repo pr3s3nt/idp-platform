@@ -102,11 +102,20 @@ Câu 1 mà **không có** thì báo lại — mẫu CI phải đổi sang `gh re
 
 ## A6. Đưa mã nguồn vào GHES
 
+> Mọi lệnh dưới đây dùng biến. **Sửa các dòng gán ở đầu khối rồi mới chạy cả khối** — đừng
+> chép lẻ từng dòng, vì các dòng sau phụ thuộc biến ở dòng trước.
+
 ```bash
-git clone <nguồn> idp-platform && cd idp-platform
+# ===== SỬA 2 DÒNG NÀY =====
+ORG="example-org"                       # tên tổ chức trên GHES
+NGUON="https://github.com/.../idp-platform.git"   # nơi lấy mã nguồn về
+# ==========================
+[ "$ORG" = "example-org" ] && echo "!! chưa sửa ORG, dừng lại" && return 2>/dev/null
+
+git clone "$NGUON" idp-platform && cd idp-platform
 rm -rf .git && git init -b main
 git add -A && git commit -m "cài đặt platform"
-gh repo create <ORG>/idp-platform --private --source=. --push
+gh repo create "$ORG/idp-platform" --private --source=. --push
 ```
 
 ## A7. Biến và bí mật
@@ -116,21 +125,33 @@ gh repo create <ORG>/idp-platform --private --source=. --push
 > cấp tổ chức còn ảnh hưởng tới repo của đội khác.
 
 ```bash
-ORG=<tổ-chức>; R=$ORG/idp-platform
+# ===== SỬA CÁC DÒNG NÀY =====
+ORG="example-org"
+NHAN_NOI_BO="runner-noi-bo"             # nhãn của runner vào được cụm
+ROBOT_KEO="robot\$idp-pull"              # tài khoản robot CHỈ KÉO của Harbor
+KUBECONFIG_FILE="$HOME/.kube/config"    # file kubeconfig của cụm
+# ============================
+R="$ORG/idp-platform"
+[ -f "$KUBECONFIG_FILE" ] || { echo "!! không thấy $KUBECONFIG_FILE"; }
 
 # Nhãn runner của orchestrator. GitHub chọn máy TRƯỚC khi chạy bước đầu tiên nên
 # giá trị này không đọc được từ file trong repo.
-gh variable set RUNNER_LABEL -R $R --body "<nhãn-máy-nội-bộ>"
+gh variable set RUNNER_LABEL -R "$R" --body "$NHAN_NOI_BO"
 
-gh secret set BOT_TOKEN     -R $R < <(printf %s '<PAT-1>')
-gh secret set REGISTRY_HOST -R $R --body 'harbor.stg.exampledevops.com'
-gh secret set REGISTRY_USER -R $R --body '<robot-chỉ-kéo>'
-gh secret set REGISTRY_PASS -R $R < <(printf %s '<mật-khẩu-robot-kéo>')
+gh secret set REGISTRY_HOST -R "$R" --body 'harbor.stg.exampledevops.com'
+gh secret set REGISTRY_USER -R "$R" --body "$ROBOT_KEO"
+
+# Ba secret dưới đây gõ giá trị vào khi được hỏi, KHÔNG truyền qua tham số —
+# tránh để mật khẩu nằm lại trong lịch sử lệnh của shell.
+echo "dán BOT_TOKEN rồi Ctrl-D:";              gh secret set BOT_TOKEN     -R "$R"
+echo "dán mật khẩu robot chỉ kéo rồi Ctrl-D:"; gh secret set REGISTRY_PASS -R "$R"
 
 # Hiện chỉ có một cụm. Trỏ cả hai môi trường vào đó, tách nhau bằng namespace.
 # Khi cụm production xong thì đổi đúng secret KUBECONFIG_PROD.
-cat <kubeconfig> | base64 -w0 | gh secret set KUBECONFIG_STAGING -R $R
-cat <kubeconfig> | base64 -w0 | gh secret set KUBECONFIG_PROD    -R $R
+base64 -w0 < "$KUBECONFIG_FILE" | gh secret set KUBECONFIG_STAGING -R "$R"
+base64 -w0 < "$KUBECONFIG_FILE" | gh secret set KUBECONFIG_PROD    -R "$R"
+
+gh secret list -R "$R"      # phải thấy đủ 6
 ```
 
 ## A7b. Nhãn runner cho CI của ứng dụng — sửa MỘT lần trong mẫu
@@ -165,9 +186,14 @@ REG_USER: ${{ vars.REGISTRY_USERNAME || '<robot-đẩy-của-Harbor>' }}
 Đây là phần **không tránh được** phải lặp lại, vì secret không hardcode được:
 
 ```bash
-gh secret set PLATFORM_DISPATCH_TOKEN -R $ORG/<app>        < <(printf %s '<PAT-2>')
-gh secret set PLATFORM_DISPATCH_TOKEN -R $ORG/<app>-config < <(printf %s '<PAT-2>')
-gh secret set REGISTRY_PASSWORD       -R $ORG/<app>        < <(printf %s '<mật-khẩu-robot-đẩy>')
+ORG="example-org"; APP="smoke"
+
+echo "dán PLATFORM_DISPATCH_TOKEN rồi Ctrl-D:"
+gh secret set PLATFORM_DISPATCH_TOKEN -R "$ORG/$APP"
+gh secret set PLATFORM_DISPATCH_TOKEN -R "$ORG/$APP-config"
+
+echo "dán mật khẩu robot ĐẨY của Harbor rồi Ctrl-D:"
+gh secret set REGISTRY_PASSWORD -R "$ORG/$APP"
 ```
 
 > Nếu sau này xin được quyền đặt secret cấp tổ chức thì gộp lại còn một lần cho tất cả.
