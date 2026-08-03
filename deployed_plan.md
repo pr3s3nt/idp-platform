@@ -55,25 +55,38 @@ git add -A && git commit -m "cài đặt platform"
 gh repo create <ORG>/idp-platform --private --source=. --push
 ```
 
-### 1.2 [NGƯỜI][CHẶN] Quyền phải xin trước
+### 1.2 Quyền — ĐÃ KIỂM, không phải xin gì
 
-Ba việc dưới đây **không có đường vòng**. Xin xong mới bắt đầu.
+Đã chạy `kubectl auth can-i` trên cụm thật. **Tất cả đều `yes`:**
 
-| Xin ai | Xin gì | Vì sao |
-|---|---|---|
-| Đội vận hành K8s | Tạo namespace theo tiền tố `<đội>-*`, **hoặc** tạo sẵn `{app}-staging`, `{app}-prod`, `cluster-state` | Nền tảng tự tạo namespace; không có quyền thì phải có sẵn |
-| Đội vận hành K8s | Gateway `traefik-gateway` cho namespace của đội gắn `HTTPRoute` | **Không mở thì route không attach và không báo lỗi gì** |
-| Quản trị Harbor | 1 project + 2 robot account (một đẩy, một kéo) | CI đẩy ảnh, cụm kéo ảnh |
+| Quyền | Kết quả |
+|---|---|
+| `create namespace` | yes |
+| `create secret` / `pvc` / `deployment` | yes |
+| `create gitrepo.fleet.cattle.io` | yes |
+| `create httproute` | yes |
+| `patch gateway` | yes |
+| `create clusterrolebinding` | yes |
 
-Kiểm Gateway có cho phép không:
+Nghĩa là nền tảng tự tạo được namespace, tự tạo `GitRepo`, tự tạo secret trong cụm. **Bỏ
+qua mọi bước "nhờ đội khác làm hộ".**
+
+#### [CHẶN] Còn đúng MỘT thứ chưa biết
+
+`allowedRoutes` của Gateway. Có quyền `patch gateway` nên sửa được nếu cần, nhưng phải biết
+hiện trạng trước — **đây là thứ hỏng im lặng nhất trong cả hệ thống**: route không attach,
+ứng dụng vẫn chạy, pod vẫn khoẻ, chỉ là không ai vào được và **không có lỗi ở đâu cả**.
 
 ```bash
 kubectl -n traefik get gateway traefik-gateway \
-  -o jsonpath='{range .spec.listeners[*]}{.name}{" -> "}{.allowedRoutes.namespaces}{"\n"}{end}'
+  -o jsonpath='{range .spec.listeners[*]}{.name}: {.allowedRoutes}{"\n"}{end}'
 ```
 
-Nếu ra `{"from":"All"}` là mở cho mọi namespace. Nếu là `Selector` hoặc `Same` thì **phải
-xin bổ sung**.
+| Kết quả | Nghĩa |
+|---|---|
+| `{"namespaces":{"from":"All"}}` | mở cho mọi namespace — không phải làm gì |
+| `{"namespaces":{"from":"Same"}}` | **chỉ** namespace `traefik` gắn được — phải sửa |
+| có `selector` | chỉ namespace khớp nhãn — phải gắn nhãn cho namespace của app |
 
 ### 1.3 [NGƯỜI][CHẶN] Ảnh nền phải có trên Harbor
 
@@ -89,13 +102,18 @@ docker push <HARBOR>/<PROJECT>/postgres:17-alpine
 Bỏ qua bước này thì `StatefulSet` của database sẽ `ImagePullBackOff`, còn `PersistentVolumeClaim`
 thì `Pending` mãi không rõ lý do.
 
-### 1.4 [NGƯỜI] Máy chạy CI
+### 1.4 GHES — đã khảo sát
 
-Một máy Linux:
+| Hạng mục | Kết quả | Ảnh hưởng |
+|---|---|---|
+| Phiên bản | **3.18.12** | Hỗ trợ PAT fine-grained ✅ |
+| `actions/checkout` | có | dùng bình thường |
+| `actions/create-github-app-token` | **KHÔNG có** | đã xử lý — workflow tự ký JWT, không gọi action |
+| Tổ chức | `example-org` | điền vào `git.org` |
+| Tài khoản | `testacc` | |
 
-- Docker chạy được **không cần `sudo`**
-- Mạng tới: GHES, Harbor, **API server của cả hai cụm**
-- Cần **root một lần** cho hai chỉnh sửa ở bước 3.1
+> Việc GHES thiếu `create-github-app-token` **đã được xử lý sẵn**: workflow không còn gọi
+> action đó. Nếu dùng `BOT_TOKEN` thì thậm chí không đụng tới phần ký JWT.
 
 ### 1.5 [NGƯỜI] Danh tính bot
 
@@ -138,18 +156,18 @@ thì thu hồi được mà không chết cái kia.
 
 | Khoá | Giá trị | Lấy từ đâu |
 |---|---|---|
-| `git.org` | | tên tổ chức trên GHES |
+| `git.org` | `example-org` ✅ | đã khảo sát |
 | `git.config_repo_pattern` | ví dụ `{app}-config` | quy ước của đội |
 | `git.committer_name` | | tên tài khoản bot |
 | `git.committer_email` | | email tài khoản bot |
 | `registry.host` | | quản trị Harbor |
 | `registry.path` | `<host>/<project>` | quản trị Harbor |
 | `images.postgres` | | đường dẫn ảnh đã mirror ở 1.3 |
-| `kubernetes.storage_class` | `rook-ceph-block` | đã xác nhận |
+| `kubernetes.storage_class` | `rook-ceph-block` ✅ | đã khảo sát — mặc định của cụm |
 | `kubernetes.namespace_pattern` | mặc định `{app}-{env}` | quy ước công ty |
 | `kubernetes.state_namespace` | mặc định `cluster-state` | phải được phép tạo |
-| `ingress.gateway_name` | `traefik-gateway` | đã xác nhận |
-| `ingress.gateway_namespace` | `traefik` | đã xác nhận |
+| `ingress.gateway_name` | `traefik-gateway` ✅ | đã khảo sát |
+| `ingress.gateway_namespace` | `traefik` ✅ | đã khảo sát |
 | `environments.staging.domain` | | đội mạng |
 | `environments.prod.domain` | | đội mạng |
 
@@ -161,59 +179,64 @@ thì thu hồi được mà không chết cái kia.
 
 ## 3. Các bước triển khai
 
-### 3.1 [NGƯỜI] Hai chỉnh sửa mức hệ điều hành trên máy chạy CI
+### 3.1 [NGƯỜI] Máy chạy CI
 
-Cần `sudo`. **Cả hai đều từng làm hỏng cụm theo kiểu rất khó đoán.**
+Chỉ cần một máy Linux có `docker`, `kubectl`, `helm`, `git`, `gh`, `python3` + `pyyaml`,
+`score-k8s`; vào được GHES, Harbor và API server của cả hai cụm.
+
+> Hai chỉnh sửa `inotify` và MTU trong `HUONG-DAN-CAI-DAT.md` **chỉ áp dụng khi dựng cụm
+> bằng `kind` trên máy cá nhân**. Cụm công ty là 3 node thật nên bỏ qua. Nếu máy chạy CI có
+> MTU nhỏ hơn 1500 (VPN, overlay) thì mới cần xem lại MTU của Docker.
+
+### 3.2 [AI] Cụm — CHỈ KIỂM CHỨNG, KHÔNG CÀI GÌ
+
+Đã khảo sát cụm thật. **Mọi thành phần nền tảng cần đều đã có sẵn và đang chạy:**
+
+| Thành phần | Hiện trạng | Việc phải làm |
+|---|---|---|
+| Kubernetes | v1.35.1, 3 node Ubuntu 26.04 | — |
+| StorageClass | `rook-ceph-block` (mặc định, Ceph RBD) | — |
+| Gateway API | có bản **experimental** (`TLSRoute` có `v1`) | — |
+| GatewayClass | `traefik` | — |
+| Gateway | `traefik-gateway` ở ns `traefik`, `Accepted=True Programmed=True` | — |
+| Traefik | 3 pod Running | — |
+| Fleet | có, **Rancher quản** | — |
+
+> ⛔ **KHÔNG chạy các lệnh cài đặt trong `HUONG-DAN-CAI-DAT.md` phần C.** Hướng dẫn đó viết
+> cho cụm trống. Cài đè lên hạ tầng đang phục vụ ứng dụng khác là rủi ro không cần thiết —
+> đặc biệt lệnh `helm upgrade --install traefik` sẽ ghi đè cấu hình Traefik đang chạy.
+
+**Ba điểm khác sandbox, ghi lại để không sửa nhầm:**
+
+1. **Gateway nghe cổng 80 và 443**, không phải 8000. Sandbox phải dùng 8000 vì Traefik ở đó
+   cấu hình entryPoint khác. Nền tảng **không quan tâm** — `parentRefs` trong provisioner chỉ
+   khai tên và namespace của Gateway, không khai cổng. Không phải sửa gì.
+2. **`rook-ceph-block` dùng `Immediate` binding**, sandbox dùng `WaitForFirstConsumer`. Với
+   ổ đĩa mạng thì không sao. `local-blk` là `no-provisioner`, ổ dính chặt vào một node —
+   **tuyệt đối không dùng cho database** trên cụm 3 node vì pod chuyển node là mất dữ liệu.
+3. **Gateway có 2 listener** (`web` HTTP, `websecure` HTTPS). `HTTPRoute` không khai
+   `sectionName` nên sẽ thử gắn vào cả hai; gắn được vào `web` là đủ để chạy HTTP.
+
+#### [CHẶN] Fleet đã có sẵn người dùng khác — phải tránh giẫm chân
+
+Cụm đang chạy **Fleet do Rancher quản**, với các `GitRepo` sẵn có (`app1`, `app2`), và một
+bundle đang ở trạng thái `progressing`.
+
+Hai rủi ro thật:
+
+- **Trùng tên `GitRepo`.** Đặt trùng tên một `GitRepo` đang có là **đè lên nó** — ứng dụng
+  của người khác ngừng được đồng bộ, âm thầm. Quy ước bắt buộc: `<app>-<môi-trường>`.
+- **Sai namespace.** Rancher thường đặt `GitRepo` ở `fleet-default` (cụm downstream) hoặc
+  `fleet-local` (cụm local). Tạo nhầm namespace thì Fleet **không nhận**, mà cũng không báo
+  lỗi — orchestrator vẫn xanh, cụm vẫn trống.
+
+Lấy đúng namespace và quy ước đặt tên đang dùng:
 
 ```bash
-# Giới hạn inotify — thiếu thì cụm thứ ba trở đi không khởi động được
-echo 'fs.inotify.max_user_instances = 1024' | sudo tee /etc/sysctl.d/99-inotify.conf
-sudo sysctl --system
-
-# MTU của Docker phải khớp MTU của máy
-ip route get 1.1.1.1 | grep -o 'dev [^ ]*'          # xem card mạng
-ip link show <card> | grep -o 'mtu [0-9]*'          # xem MTU
-# Nếu MTU máy < 1500, sửa /etc/docker/daemon.json: {"mtu": <giá-trị>} rồi khởi động lại Docker
+kubectl get gitrepo -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,REPO:.spec.repo,BRANCH:.spec.branch,PATHS:.spec.paths
 ```
 
-**Vì sao quan trọng:** MTU lệch làm mọi lần kéo ảnh **treo vô hạn** trong khi DNS vẫn hoạt
-động — triệu chứng trông y hệt lỗi registry, rất tốn thời gian truy.
-
-**Kiểm:** `docker run --rm alpine ping -c1 -s 1400 <harbor-host>` phải thông.
-
-### 3.2 [AI] Chuẩn bị cụm — làm cho **cả hai** cụm
-
-Nếu cụm công ty đã có sẵn Traefik + Gateway API + Fleet thì **bỏ qua phần lớn**, chỉ kiểm
-chứng. Chạy các lệnh kiểm dưới đây trước:
-
-```bash
-# Gateway API bản experimental v1.6.1+ (bản standard KHÔNG đủ)
-kubectl get crd tlsroutes.gateway.networking.k8s.io -o jsonpath='{.spec.versions[*].name}'
-# phải có v1, không chỉ v1alpha2
-
-# Gateway đã sẵn sàng
-kubectl -n traefik get gateway traefik-gateway \
-  -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}'
-# phải ra: Accepted=True Programmed=True
-
-# Fleet đã cài
-kubectl get clusters.fleet.cattle.io -A
-# phải thấy một cluster ở trạng thái 1/1
-
-# StorageClass đúng tên
-kubectl get storageclass rook-ceph-block
-```
-
-**[CHẶN]** Bất kỳ lệnh nào ở trên không ra kết quả mong đợi → dừng, báo người, đừng tự cài
-đè lên hạ tầng dùng chung.
-
-Nếu phải cài mới, làm theo `HUONG-DAN-CAI-DAT.md` phần C. Ba bẫy hay gặp nhất:
-
-| Bẫy | Hậu quả |
-|---|---|
-| Dùng Gateway API bản `standard` | Traefik đứng im ở "chờ controller", không báo lỗi |
-| `service.type` thay vì `service.spec.type` | Giá trị bị bỏ qua **trong im lặng** |
-| Listener để `port: 80` | Báo `PortUnavailable` — phải là `8000`, cổng bên trong container |
+**Dùng đúng namespace mà các `GitRepo` hiện có đang nằm.** Đừng đoán.
 
 ### 3.3 [NGƯỜI] Thông tin đăng nhập Git cho Fleet
 
@@ -399,6 +422,8 @@ gh run list -R <ORG>/idp-platform --limit 1     # phải thấy verify-request, 
 | Kéo ảnh treo vô hạn, DNS vẫn chạy | MTU của Docker lệch MTU máy | `docker run --rm alpine ping -c1 -s 1400 <harbor>` |
 | Deploy đột nhiên 401 | PAT fine-grained hết hạn | xem ngày hết hạn của token |
 | Một môi trường không được đồng bộ | Hai `GitRepo` trùng tên trên cùng cụm | `kubectl get gitrepo -A` |
+| **Ứng dụng của đội KHÁC ngừng đồng bộ** | `GitRepo` mới trùng tên với `GitRepo` sẵn có (`app1`, `app2`…) — đè lên nhau | `kubectl get gitrepo -A` trước khi tạo |
+| Tạo `GitRepo` xong Fleet vẫn không nhận | Sai namespace — Rancher dùng `fleet-default` hoặc `fleet-local` tuỳ cụm | so với namespace của `GitRepo` đang có |
 
 ---
 
