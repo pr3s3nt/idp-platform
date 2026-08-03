@@ -31,10 +31,10 @@
 #           Multi-workload repos render each workload as <image>-<workload>.
 #
 # Required secrets:
-#   APP_ID / APP_PRIVATE_KEY   GitHub App — mint một token sống 1 giờ cho MỌI thao tác git
-#                              (đọc repo app, ghi repo cấu hình, mở pull request). Thay cho
-#                              APP_REPOS_TOKEN và CONFIG_REPO_TOKEN trước đây; hai secret đó
-#                              đã bị xoá vì không còn workflow nào tham chiếu tới.
+#   BOT_TOKEN                  PAT fine-grained của tài khoản bot — danh tính để ghi vào
+#                              repo cấu hình và mở pull request. ĐƯỢC ƯU TIÊN nếu có.
+#   APP_ID / APP_PRIVATE_KEY   Đường thay thế: GitHub App, token sống 1 giờ. Chỉ dùng khi
+#                              KHÔNG đặt BOT_TOKEN. Phải có ít nhất một trong hai.
 #   KUBECONFIG_STAGING  base64 kubeconfig for the staging cluster
 #   KUBECONFIG_PROD     base64 kubeconfig for the prod cluster
 #   REGISTRY_HOST / REGISTRY_USER / REGISTRY_PASS   pull-only robot account
@@ -119,20 +119,38 @@ jobs:
       # Đây cũng là thứ làm cổng duyệt production hoạt động được: GitHub CHẶN tự duyệt pull
       # request của chính mình, nên nếu PR do token của một người tạo ra mà người đó cũng là
       # người duyệt thì không ai duyệt được.
-      # KHÔNG dùng actions/create-github-app-token. Action đó không nằm trong bộ action đi
-      # kèm GitHub Enterprise Server; đo thật trên GHES của công ty:
+      # HAI ĐƯỜNG, ưu tiên BOT_TOKEN.
+      #   BOT_TOKEN  — PAT fine-grained của một tài khoản bot. Đơn giản nhất: không cần
+      #                App, không cần script. Giới hạn phạm vi bằng cách chỉ cấp cho token
+      #                đúng những repo IDP.
+      #   APP_ID/KEY — GitHub App, token sống 1 giờ và tự làm mới mỗi lần chạy.
+      #
+      # KHÔNG dùng actions/create-github-app-token cho đường App. Action đó KHÔNG nằm trong
+      # bộ action đi kèm GitHub Enterprise Server — đo thật trên GHES của công ty:
       #   Error: Unable to resolve action `actions/create-github-app-token@v1`,
       #          repository not found on this server.
       # Script tự ký JWT bằng openssl rồi đổi lấy installation token — chạy được trên cả
       # github.com lẫn GHES vì nó đọc GITHUB_API_URL do Actions tự đặt. MỘT đường code cho
       # cả hai nơi, và sandbox chạy đúng thứ công ty chạy.
-      - name: Mint GitHub App token
+      - name: Lấy token cho bot
         id: app-token
         env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           APP_ID: ${{ secrets.APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
           OWNER: ${{ github.repository_owner }}
-        run: platform/tools/mint-app-token.sh
+        run: |
+          set -euo pipefail
+          if [ -n "${BOT_TOKEN:-}" ]; then
+            echo "::add-mask::$BOT_TOKEN"
+            echo "token=$BOT_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "==> dùng BOT_TOKEN (tài khoản bot)"
+          elif [ -n "${APP_ID:-}" ]; then
+            platform/tools/mint-app-token.sh
+          else
+            echo "::error::chưa có BOT_TOKEN lẫn APP_ID — không có danh tính nào để ghi vào repo cấu hình"
+            exit 1
+          fi
 
       - name: Load environment config
         run: |
@@ -382,20 +400,38 @@ jobs:
       # Đây cũng là thứ làm cổng duyệt production hoạt động được: GitHub CHẶN tự duyệt pull
       # request của chính mình, nên nếu PR do token của một người tạo ra mà người đó cũng là
       # người duyệt thì không ai duyệt được.
-      # KHÔNG dùng actions/create-github-app-token. Action đó không nằm trong bộ action đi
-      # kèm GitHub Enterprise Server; đo thật trên GHES của công ty:
+      # HAI ĐƯỜNG, ưu tiên BOT_TOKEN.
+      #   BOT_TOKEN  — PAT fine-grained của một tài khoản bot. Đơn giản nhất: không cần
+      #                App, không cần script. Giới hạn phạm vi bằng cách chỉ cấp cho token
+      #                đúng những repo IDP.
+      #   APP_ID/KEY — GitHub App, token sống 1 giờ và tự làm mới mỗi lần chạy.
+      #
+      # KHÔNG dùng actions/create-github-app-token cho đường App. Action đó KHÔNG nằm trong
+      # bộ action đi kèm GitHub Enterprise Server — đo thật trên GHES của công ty:
       #   Error: Unable to resolve action `actions/create-github-app-token@v1`,
       #          repository not found on this server.
       # Script tự ký JWT bằng openssl rồi đổi lấy installation token — chạy được trên cả
       # github.com lẫn GHES vì nó đọc GITHUB_API_URL do Actions tự đặt. MỘT đường code cho
       # cả hai nơi, và sandbox chạy đúng thứ công ty chạy.
-      - name: Mint GitHub App token
+      - name: Lấy token cho bot
         id: app-token
         env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           APP_ID: ${{ secrets.APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
           OWNER: ${{ github.repository_owner }}
-        run: platform/tools/mint-app-token.sh
+        run: |
+          set -euo pipefail
+          if [ -n "${BOT_TOKEN:-}" ]; then
+            echo "::add-mask::$BOT_TOKEN"
+            echo "token=$BOT_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "==> dùng BOT_TOKEN (tài khoản bot)"
+          elif [ -n "${APP_ID:-}" ]; then
+            platform/tools/mint-app-token.sh
+          else
+            echo "::error::chưa có BOT_TOKEN lẫn APP_ID — không có danh tính nào để ghi vào repo cấu hình"
+            exit 1
+          fi
 
       - name: Load environment config
         run: |
@@ -555,20 +591,38 @@ jobs:
         with:
           path: platform
 
-      # KHÔNG dùng actions/create-github-app-token. Action đó không nằm trong bộ action đi
-      # kèm GitHub Enterprise Server; đo thật trên GHES của công ty:
+      # HAI ĐƯỜNG, ưu tiên BOT_TOKEN.
+      #   BOT_TOKEN  — PAT fine-grained của một tài khoản bot. Đơn giản nhất: không cần
+      #                App, không cần script. Giới hạn phạm vi bằng cách chỉ cấp cho token
+      #                đúng những repo IDP.
+      #   APP_ID/KEY — GitHub App, token sống 1 giờ và tự làm mới mỗi lần chạy.
+      #
+      # KHÔNG dùng actions/create-github-app-token cho đường App. Action đó KHÔNG nằm trong
+      # bộ action đi kèm GitHub Enterprise Server — đo thật trên GHES của công ty:
       #   Error: Unable to resolve action `actions/create-github-app-token@v1`,
       #          repository not found on this server.
       # Script tự ký JWT bằng openssl rồi đổi lấy installation token — chạy được trên cả
       # github.com lẫn GHES vì nó đọc GITHUB_API_URL do Actions tự đặt. MỘT đường code cho
       # cả hai nơi, và sandbox chạy đúng thứ công ty chạy.
-      - name: Mint GitHub App token
+      - name: Lấy token cho bot
         id: app-token
         env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           APP_ID: ${{ secrets.APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
           OWNER: ${{ github.repository_owner }}
-        run: platform/tools/mint-app-token.sh
+        run: |
+          set -euo pipefail
+          if [ -n "${BOT_TOKEN:-}" ]; then
+            echo "::add-mask::$BOT_TOKEN"
+            echo "token=$BOT_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "==> dùng BOT_TOKEN (tài khoản bot)"
+          elif [ -n "${APP_ID:-}" ]; then
+            platform/tools/mint-app-token.sh
+          else
+            echo "::error::chưa có BOT_TOKEN lẫn APP_ID — không có danh tính nào để ghi vào repo cấu hình"
+            exit 1
+          fi
 
       - name: Load environment config
         run: |
