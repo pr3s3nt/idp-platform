@@ -1182,6 +1182,7 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 | `HUONG-DAN-TAO-APP-MOI.md` | Đưa một ứng dụng mới vào hệ thống |
 | `HUONG-DAN-GITHUB-APP.md` | Đăng ký danh tính máy cho hệ thống |
 | `CAU-HOI-NGU-CANH.md` | Bộ câu hỏi thu thập thông tin hạ tầng công ty |
+| `deployed_plan.md` | Kế hoạch triển khai vào hạ tầng công ty, viết cho tác nhân AI nội bộ thực thi — đánh dấu rõ bước nào máy làm, bước nào người phải làm, bước nào không qua thì dừng |
 | `CAN-GI-DE-CHAY-THU.md` | Bản rút gọn của file trên — chỉ còn những giá trị **chưa có**, đủ để chạy thử bằng cấu hình công ty |
 | `audit/NHAT-KY-SHOP-V2.md` | Nhật ký từng bước của lần chạy thử bốn tình huống |
 
