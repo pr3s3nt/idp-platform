@@ -99,6 +99,12 @@ sai dễ mắc, và nó hỏng ngay ở bước build:
 Chép nhầm mẫu một-service cho repo nhiều service sẽ ra:
 `failed to read dockerfile: open Dockerfile: no such file or directory`.
 
+> ⚠️ **Đừng gắn cứng `runs-on`.** Cả hai mẫu đều đọc biến:
+> `runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}`. `ubuntu-latest` là runner do
+> GitHub.com cấp — **GitHub Enterprise Server không có nó**, workflow sẽ nằm chờ mãi không
+> ai nhận mà cũng không báo lỗi gì rõ ràng. Trên GHES, đặt `CI_RUNNER_LABEL` ở **cấp tổ
+> chức** là mọi repo ứng dụng tự có.
+
 Sau khi chép, đổi 3 dòng:
 
 ```yaml
