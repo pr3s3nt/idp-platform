@@ -644,7 +644,6 @@ def cmd_ensure_gitrepo(args) -> None:
     ns = CONFIG.get("kubernetes.fleet_namespace", "fleet-local") or "fleet-local"
     branch = CONFIG.get(f"environments.{args.env}.config_branch") \
         or CONFIG.get("git.default_branch", "main")
-    secret = CONFIG.get("kubernetes.fleet_git_secret", "git-creds") or "git-creds"
 
     # Địa chỉ kho lấy từ chính bản checkout, không dựng lại từ mẫu tên — dựng lại là
     # thêm một chỗ có thể lệch với thực tế.
@@ -666,6 +665,14 @@ def cmd_ensure_gitrepo(args) -> None:
             "bộ mà không báo gì. Đổi tên app, hoặc xoá GitRepo cũ nếu chắc chắn nó thừa."
         )
 
+    # Thông tin đăng nhập git cho Fleet: KHÔNG áp đặt một tên mặc định.
+    # Khai một tên secret không tồn tại thì Fleet không clone được — mà lỗi đó nằm trong
+    # status của GitRepo, không ai nhìn, và triệu chứng lại y hệt "quên tạo GitRepo".
+    # Thứ tự: lấy từ cấu hình nếu có khai; không thì HỌC THEO các GitRepo đang chạy trên
+    # cùng namespace; không có gì để học thì bỏ trống, để Fleet tự xoay như nó vẫn làm với
+    # kho công khai hoặc secret mặc định của cụm.
+    secret = CONFIG.get("kubernetes.fleet_git_secret") or ""
+
     # Đã có ai đăng ký chỗ này dưới TÊN KHÁC chưa? Bản cài cũ thường đặt tên không kèm
     # môi trường (ví dụ `demo` thay vì `demo-staging`). Tạo thêm một cái nữa thì hai
     # GitRepo cùng đồng bộ một thư mục, sinh hai Bundle chồng nhau — không hỏng ngay
@@ -673,6 +680,7 @@ def cmd_ensure_gitrepo(args) -> None:
     cp = kubectl(["get", "gitrepo", "-n", ns, "-o", "json"],
                  kubeconfig=args.kubeconfig, check=False, capture=True)
     if cp.returncode == 0:
+        hang_xom = []
         for item in (json.loads(cp.stdout).get("items") or []):
             spec = item.get("spec") or {}
             if (re.sub(r"\.git$", "", spec.get("repo", "")) == url
@@ -680,14 +688,24 @@ def cmd_ensure_gitrepo(args) -> None:
                 log(f"kho này đã được đăng ký dưới tên {item['metadata']['name']} "
                     f"-> không tạo thêm {name}")
                 return
+            if spec.get("clientSecretName"):
+                hang_xom.append((item["metadata"]["name"], spec["clientSecretName"]))
+        if not secret and hang_xom:
+            ten, secret = hang_xom[0]
+            log(f"học theo GitRepo {ten}: dùng clientSecretName={secret}")
 
     body = {
         "apiVersion": "fleet.cattle.io/v1alpha1",
         "kind": "GitRepo",
         "metadata": {"name": name, "namespace": ns},
         "spec": {"repo": url, "branch": branch, "paths": [args.env],
-                 "clientSecretName": secret, "pollingInterval": "15s"},
+                 "pollingInterval": "15s"},
     }
+    if secret:
+        body["spec"]["clientSecretName"] = secret
+    else:
+        log("không có clientSecretName -> để Fleet tự xoay (kho công khai, "
+            "hoặc cụm có secret mặc định)")
     tmp = Path(args.work or ".") / f"gitrepo-{name}.json"
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(json.dumps(body))

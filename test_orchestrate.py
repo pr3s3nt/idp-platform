@@ -1377,3 +1377,59 @@ def test_không_tạo_thêm_khi_kho_đã_đăng_ký_dưới_tên_khác(tmp_path,
     orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
         app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
     assert not [a for a in gọi if a[0] == "create"], "không được tạo trùng"
+
+
+def _fake_kubectl_gitrepo(items, monkeypatch, gọi):
+    def fake(args, *, kubeconfig=None, **kw):
+        gọi.append(args)
+        if len(args) > 2 and args[:2] == ["get", "gitrepo"] and not args[2].startswith("-"):
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="NotFound")
+        if args[:2] == ["get", "gitrepo"]:
+            return subprocess.CompletedProcess(args, 0,
+                                               stdout=json.dumps({"items": items}), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(orc, "kubectl", fake)
+
+
+def test_học_clientSecretName_theo_gitrepo_đang_chạy(tmp_path, monkeypatch):
+    """Cụm công ty đã có Fleet chạy sẵn với cách xác thực riêng. Áp đặt tên secret mặc
+    định là làm hỏng đúng thứ đang chạy được — Fleet không clone nổi, lỗi nằm trong status
+    của GitRepo không ai nhìn, và triệu chứng y hệt 'quên tạo GitRepo'."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"kubernetes": {"fleet_git_secret": ""}}))
+    r = _repo_gia(tmp_path); gọi = []
+    _fake_kubectl_gitrepo([{"metadata": {"name": "app-cua-doi-khac"},
+                            "spec": {"repo": "https://git.vi-du.vn/khac/kho",
+                                     "paths": ["staging"],
+                                     "clientSecretName": "creds-cua-cum"}}], monkeypatch, gọi)
+    orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+        app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+    body = json.loads((tmp_path / "gitrepo-app-staging.json").read_text())
+    assert body["spec"]["clientSecretName"] == "creds-cua-cum"
+
+
+def test_bỏ_hẳn_clientSecretName_khi_không_có_gì_để_học(tmp_path, monkeypatch):
+    """Không khai, không học được thì BỎ TRỐNG — để Fleet tự xoay như nó vẫn làm với kho
+    công khai. Khai bừa một tên không tồn tại còn tệ hơn không khai."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"kubernetes": {"fleet_git_secret": ""}}))
+    r = _repo_gia(tmp_path); gọi = []
+    _fake_kubectl_gitrepo([], monkeypatch, gọi)
+    orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+        app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+    body = json.loads((tmp_path / "gitrepo-app-staging.json").read_text())
+    assert "clientSecretName" not in body["spec"]
+
+
+def test_cấu_hình_thắng_việc_học(tmp_path, monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"kubernetes": {"fleet_git_secret": "toi-tu-khai"}}))
+    r = _repo_gia(tmp_path); gọi = []
+    _fake_kubectl_gitrepo([{"metadata": {"name": "khac"},
+                            "spec": {"repo": "https://git.vi-du.vn/khac/kho",
+                                     "paths": ["staging"],
+                                     "clientSecretName": "creds-cua-cum"}}], monkeypatch, gọi)
+    orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+        app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+    body = json.loads((tmp_path / "gitrepo-app-staging.json").read_text())
+    assert body["spec"]["clientSecretName"] == "toi-tu-khai"
