@@ -1088,10 +1088,70 @@ Chạy thật một vòng deploy trên sandbox: mint token thành công
 vào kho cấu hình dưới đúng danh tính bot, Fleet đồng bộ, trang staging trả nội dung mới.
 Bước `verify` — cũng dùng chính script này — chạy và đạt.
 
+### 6.24. Tự đăng ký với Fleet — khép nốt lỗ hổng im lặng số một
+
+Khi triển khai ở công ty, bước `verify` báo đỏ: `nginx: chưa tồn tại trên cụm`, namespace
+trống trơn, không pod, không sự kiện. Manifest nằm đúng trong git, mọi bước trước đều xanh.
+
+Nguyên nhân: **thiếu `fleet.yaml`** trong thư mục môi trường của kho cấu hình. Fleet lấy
+`defaultNamespace` từ file đó để biết đặt tài nguyên vào đâu; không có thì tài nguyên rơi đi
+chỗ khác. Và hướng dẫn của tôi **không hề nhắc tới file này** — nó chỉ nằm trong thư mục mẫu
+mà không ai bảo phải chép.
+
+Đây là lần thứ hai cùng một loại lỗi: thứ gì bắt buộc phải có mà con người phải nhớ, thì sẽ
+có ngày quên. Cách sửa đúng không phải viết thêm vào tài liệu, mà là **để máy tự làm**.
+
+#### Hai việc giờ tự động
+
+**Sinh `fleet.yaml`.** Khi render, nếu thư mục môi trường chưa có thì sinh ra, `namespace`
+suy từ `namespace_pattern`. Không ghi đè nếu đã có — ai muốn tuỳ biến Bundle vẫn tuỳ biến
+được.
+
+**Tạo `GitRepo`.** Chạy sau bước commit, ba nhánh xử lý:
+
+| Tình trạng | Làm gì |
+|---|---|
+| Chưa có | tạo |
+| Có, trỏ đúng kho | để yên |
+| Có, trỏ **kho khác** | **dừng**, không bao giờ apply đè |
+
+Nhánh thứ ba quan trọng nhất. Cụm ở công ty đang có `GitRepo` của đội khác; apply đè lên là
+ứng dụng của họ **ngừng đồng bộ trong im lặng**. Nên nguyên tắc là "thiếu thì tạo, không bao
+giờ ghi đè".
+
+Thêm một phép kiểm nữa mà lần đầu tôi bỏ sót: nếu kho đã được đăng ký dưới **tên khác** —
+bản cài cũ đặt tên không kèm môi trường, ví dụ `helloworld` thay vì `helloworld-staging` —
+thì cũng không tạo thêm. Hai `GitRepo` cùng đồng bộ một thư mục sinh hai Bundle chồng nhau,
+không hỏng ngay nhưng rất rối khi cần gỡ.
+
+Địa chỉ kho lấy từ chính bản checkout thay vì dựng lại từ mẫu tên — dựng lại là thêm một chỗ
+có thể lệch. Và gỡ token nếu remote có nhúng: token lọt vào `GitRepo` thì ai đọc được cụm
+cũng xem được.
+
+#### Kiểm chứng
+
+Xoá **cả** `GitRepo` lẫn `fleet.yaml` của một ứng dụng trong sandbox rồi đẩy một commit:
+
+| Kiểm | Kết quả |
+|---|---|
+| `fleet.yaml` sinh lại | ✅ đúng namespace |
+| `GitRepo` tạo lại | ✅ đúng kho, nhánh, thư mục |
+| Pod chạy, bundle 1/1 | ✅ |
+| Ứng dụng đã có `GitRepo` tên cũ | ✅ `kho này đã được đăng ký dưới tên helloworld -> không tạo thêm` |
+| Dựng `GitRepo` giả trỏ kho "của đội khác" | ✅ **dừng, thoát mã 1**, và tài nguyên đó **không bị sửa một chữ nào** |
+
+75/75 test đạt. Toàn hệ thống sau đó: 17/17 bundle khoẻ trên 3 cụm.
+
+#### Còn lại gì phải làm tay khi thêm app mới
+
+Tạo 2 repo, đặt 2 secret, bật bảo vệ nhánh `main`. Rồi push — `fleet.yaml` và `GitRepo` tự
+có. Việc tạo repo tự động hoá được nhưng cần token quyền cao hơn; bật bảo vệ nhánh thì **cố
+ý để người làm**, vì đó là điểm kiểm soát duy nhất của con người trong cả luồng.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
-**67/67 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
+**75/75 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
 pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10), bí mật của ứng dụng (6.11) và
 ba tình huống triển khai kẹt giữa chừng mà phép kiểm cũ bỏ lọt (6.20).
 
@@ -1140,7 +1200,7 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 | **Không kiểm tra quyền sở hữu ứng dụng** | Tên ứng dụng và kho mã do bên gọi **tự khai**, không có bước xác thực nào. Bất kỳ ai gọi được vào platform đều có thể triển khai thay ứng dụng của đội khác | **Đã cân nhắc và tạm chấp nhận**: sandbox một người dùng, chưa có nhiều đội. Phải xử lý trước khi nhiều đội dùng chung |
 | **Một token cá nhân nằm ở 22 nơi** | 19 kho GitHub và 3 cụm Kubernetes. Quyền của nó: đọc/ghi mọi kho riêng tư, và sửa được file workflow ở mọi kho — mà workflow chạy trên máy có kubeconfig của cả hai cụm (6.21) | Đã dọn 2 secret thừa. Bước đẩy image thử chuyển sang token tự sinh nhưng bị kho ảnh từ chối, cần một thao tác tay cho mỗi package. Fleet vẫn dùng token này để clone, đúng ra chỉ cần khoá chỉ đọc |
 | Chỉ có một máy chủ chạy CI | Nhiều ứng dụng đẩy code cùng lúc thì phải xếp hàng nối đuôi. Đo thực tế: sáu ứng dụng cùng lúc mất khoảng 15 phút mới xong hết | Môi trường nhiều đội cần nhiều máy chủ, và nên chia theo đội để phân quyền cụm siết được |
-| Ứng dụng vẫn phải đăng ký thủ công | Tạo kho cấu hình, đăng ký với hệ thống đồng bộ, cấp khoá — đều làm tay | Có thể tự động hoá, chưa làm |
+| Ứng dụng vẫn phải đăng ký thủ công | Còn lại: tạo 2 repo, đặt 2 secret, bật bảo vệ nhánh. `fleet.yaml` và `GitRepo` **đã tự động** (6.24) | Tạo repo tự động được nhưng cần token quyền cao hơn |
 | **Tắt bảo vệ nhánh thì platform im lặng chuyển sang ghi thẳng** | Platform hỏi GitHub xem nhánh có được bảo vệ không rồi làm theo. Nếu ai đó lỡ tay tắt bảo vệ, cổng duyệt production biến mất mà không có cảnh báo nào (6.19) | Đây là mặt trái của việc lấy GitHub làm nguồn sự thật duy nhất. Đổi lại thì không có chỗ nào khai trùng lặp để sai lệch |
 | Một kho cấu hình đang để công khai | `helloworld-config` được chuyển sang công khai để bật branch protection (bản miễn phí chỉ hỗ trợ kho công khai) | Đã soát toàn bộ lịch sử trước khi chuyển: **0 bí mật**, không có Secret nào. Kho mã ứng dụng vẫn riêng tư |
 
