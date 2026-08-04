@@ -1148,6 +1148,58 @@ Tạo 2 repo, đặt 2 secret, bật bảo vệ nhánh `main`. Rồi push — `f
 có. Việc tạo repo tự động hoá được nhưng cần token quyền cao hơn; bật bảo vệ nhánh thì **cố
 ý để người làm**, vì đó là điểm kiểm soát duy nhất của con người trong cả luồng.
 
+### 6.25. Tạo kho cấu hình: tự động tới đâu thì dừng
+
+Câu hỏi từ người dùng: *"viết một file .sh mà không gọi đến nó thì viết để làm gì?"* — hoàn
+toàn đúng. Script dựng kho cấu hình ban đầu chỉ để người chạy tay, và tôi cũng quên nối nó
+vào hướng dẫn nào.
+
+Đã nối vào workflow: orchestrator gọi chính script đó ngay trước bước checkout kho cấu hình.
+Script idempotent nên kho đã có thì bỏ qua.
+
+#### Chạy thật thì lộ ra giới hạn thật
+
+```
+GraphQL: Resource not accessible by integration (createRepository)
+```
+
+GitHub App của nền tảng chỉ xin ba quyền: Contents, Pull requests, Metadata. **Không tạo
+được repo.** Muốn tạo thì phải thêm `Administration: write` trên cả tổ chức — tức App có
+quyền tạo, sửa, xoá repo ở **bất kỳ đâu**. Đó là cái giá quá đắt để tiết kiệm một thao tác
+làm mỗi app một lần.
+
+Nên kết luận là: **giữ nguyên quyền hẹp, và làm cho thất bại trở nên hữu ích.** Thông báo
+lỗi giờ nói rõ hai nguyên nhân thường gặp và in sẵn câu lệnh chạy tay.
+
+Với PAT classic scope `repo` thì bước này chạy được, miễn tài khoản đó được phép tạo repo
+trong tổ chức. Cùng một đoạn code, kết quả tuỳ danh tính — và cả hai đường đều dẫn tới trạng
+thái đúng.
+
+#### Kiểm chứng
+
+Dựng một app hoàn toàn mới, chưa có kho cấu hình:
+
+| Bước | Kết quả |
+|---|---|
+| Orchestrator tự tạo kho cấu hình | ❌ App thiếu quyền — **hỏng đúng chỗ, thông báo chỉ rõ phải làm gì** |
+| Chạy tay script như thông báo hướng dẫn | ✅ kho + 2 nhánh + `fleet.yaml` + workflow verify |
+| Gọi lại orchestrator | ✅ đi qua, render, commit, **tự tạo `GitRepo`** |
+| `verify` | ❌ đúng — ảnh chưa được đẩy lên (token thử thiếu quyền package) |
+| Hồi quy trên app đang chạy | ✅ không ảnh hưởng gì |
+
+Điều đáng nói: `verify` báo đỏ vì `ImagePullBackOff`, đúng loại lỗi nó sinh ra để bắt. Toàn
+bộ phần còn lại xanh mà ứng dụng vẫn không chạy — nếu không có bước đó thì lại là một lần
+"mọi thứ xanh, cụm hỏng".
+
+#### Còn lại gì phải làm tay khi thêm app mới
+
+Tạo repo app (mã nguồn — việc của người viết app), đặt một secret cho nó, đăng ký runner.
+Kho cấu hình, `fleet.yaml`, `GitRepo`, namespace, secret trong cụm: máy lo.
+
+Secret trên repo app **không tự động hoá được**: platform chỉ được gọi *bởi* CI của app đó,
+chưa có secret thì CI không gọi nổi platform. Con gà quả trứng thật sự — trừ khi tổ chức cho
+đặt secret cấp tổ chức, khi đó đặt một lần cho tất cả.
+
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
