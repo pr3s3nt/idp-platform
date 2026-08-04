@@ -1237,3 +1237,143 @@ def test_thiếu_quyền_tạo_namespace_thì_hỏng_ồn_ào(monkeypatch):
     monkeypatch.setattr(orc, "kubectl", fake)
     with pytest.raises(SystemExit, match="forbidden"):
         orc.ensure_namespace("chua-co", None)
+
+
+# ======================================================================================
+# ĐĂNG KÝ VỚI FLEET — fleet.yaml và GitRepo
+# Hai thứ này thiếu thì mọi bước đều xanh mà cụm trống trơn. Gặp thật khi triển khai
+# ở công ty, mất một buổi mới truy ra.
+# ======================================================================================
+def test_sinh_fleet_yaml_khi_chưa_có(tmp_path, monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+    d = tmp_path / "staging"; d.mkdir()
+    orc.ensure_fleet_yaml(d, "thanh-toan", "staging")
+    got = yaml.safe_load((d / "fleet.yaml").read_text())
+    assert got == {"namespace": "thanh-toan-staging",
+                   "defaultNamespace": "thanh-toan-staging"}
+
+
+def test_không_ghi_đè_fleet_yaml_người_dùng_đã_sửa(tmp_path, monkeypatch):
+    """Ai muốn tuỳ biến Bundle thì vẫn tuỳ biến được — platform không giẫm lên."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+    d = tmp_path / "staging"; d.mkdir()
+    (d / "fleet.yaml").write_text("namespace: tôi-tự-đặt\n")
+    orc.ensure_fleet_yaml(d, "thanh-toan", "staging")
+    assert "tôi-tự-đặt" in (d / "fleet.yaml").read_text()
+
+
+def test_fleet_yaml_theo_namespace_pattern(tmp_path, monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"kubernetes": {"namespace_pattern": "doi-abc-{env}"}}))
+    d = tmp_path / "prod"; d.mkdir()
+    orc.ensure_fleet_yaml(d, "thanh-toan", "prod")
+    assert yaml.safe_load((d / "fleet.yaml").read_text())["defaultNamespace"] == "doi-abc-prod"
+
+
+def _repo_gia(tmp_path, url="https://git.vi-du.vn/to-chuc/app-config"):
+    r = tmp_path / "config"; r.mkdir()
+    git(r, "init", "-q"); git(r, "remote", "add", "origin", url)
+    return r
+
+
+def test_tạo_gitrepo_khi_chưa_có(tmp_path, monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"environments": {"staging": {"config_branch": "dev"}}}))
+    r = _repo_gia(tmp_path); gọi = []
+
+    def fake(args, *, kubeconfig=None, **kw):
+        gọi.append(args)
+        if args[:2] == ["get", "gitrepo"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="NotFound")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake)
+    orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+        app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+
+    tạo = [a for a in gọi if a[0] == "create"]
+    assert tạo, f"không gọi create; đã gọi: {gọi}"
+    body = json.loads(Path(tạo[0][2]).read_text())
+    assert body["metadata"]["name"] == "app-staging"          # tên KÈM môi trường
+    assert body["spec"]["branch"] == "dev"
+    assert body["spec"]["paths"] == ["staging"]
+    assert body["spec"]["repo"] == "https://git.vi-du.vn/to-chuc/app-config"
+
+
+def test_gitrepo_đã_có_trỏ_đúng_thì_để_yên(tmp_path, monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+    r = _repo_gia(tmp_path); gọi = []
+
+    def fake(args, *, kubeconfig=None, **kw):
+        gọi.append(args)
+        if args[:2] == ["get", "gitrepo"]:
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(
+                {"spec": {"repo": "https://git.vi-du.vn/to-chuc/app-config.git"}}), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake)
+    orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+        app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+    assert not [a for a in gọi if a[0] == "create"], "không được tạo lại"
+
+
+def test_gitrepo_trùng_tên_trỏ_kho_khác_thì_DỪNG(tmp_path, monkeypatch):
+    """Cụm thường đã có GitRepo của đội khác. Đè lên là ứng dụng của họ ngừng đồng bộ
+    trong im lặng — phải dừng và báo, tuyệt đối không apply."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+    r = _repo_gia(tmp_path); gọi = []
+
+    def fake(args, *, kubeconfig=None, **kw):
+        gọi.append(args)
+        if args[:2] == ["get", "gitrepo"]:
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(
+                {"spec": {"repo": "https://git.vi-du.vn/doi-khac/app-cua-ho"}}), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake)
+    with pytest.raises(SystemExit, match="của ứng dụng khác|không phải"):
+        orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+            app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+    assert not [a for a in gọi if a[0] == "create"], "đã dừng thì tuyệt đối không tạo"
+
+
+def test_gỡ_token_nhúng_trong_remote(tmp_path, monkeypatch):
+    """Runner hay để remote dạng https://<token>@host/... — token đó KHÔNG được lọt vào
+    GitRepo, vì nó nằm trong một tài nguyên ai đọc được cụm cũng xem được."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+    r = _repo_gia(tmp_path, "https://ghp_bimat123@git.vi-du.vn/to-chuc/app-config.git")
+
+    def fake(args, *, kubeconfig=None, **kw):
+        if args[:2] == ["get", "gitrepo"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="NotFound")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake)
+    orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+        app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+    body = json.loads((tmp_path / "gitrepo-app-staging.json").read_text())
+    assert "ghp_" not in body["spec"]["repo"]
+    assert body["spec"]["repo"] == "https://git.vi-du.vn/to-chuc/app-config"
+
+
+def test_không_tạo_thêm_khi_kho_đã_đăng_ký_dưới_tên_khác(tmp_path, monkeypatch):
+    """Bản cài cũ đặt tên GitRepo không kèm môi trường. Tạo thêm cái nữa thì hai GitRepo
+    cùng đồng bộ một thư mục, sinh hai Bundle chồng nhau."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+    r = _repo_gia(tmp_path); gọi = []
+
+    def fake(args, *, kubeconfig=None, **kw):
+        gọi.append(args)
+        if args[:3] == ["get", "gitrepo", "app-staging"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="NotFound")
+        if args[:2] == ["get", "gitrepo"]:          # liệt kê cả namespace
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"items": [
+                {"metadata": {"name": "app"},        # tên cũ, không kèm môi trường
+                 "spec": {"repo": "https://git.vi-du.vn/to-chuc/app-config",
+                          "paths": ["staging"]}}]}), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake)
+    orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+        app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+    assert not [a for a in gọi if a[0] == "create"], "không được tạo trùng"

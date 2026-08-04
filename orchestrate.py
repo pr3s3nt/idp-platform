@@ -605,6 +605,99 @@ def materialise_catalog(
     return {"provisioners": out_provisioners, "patch": out_patch}
 
 
+def ensure_fleet_yaml(env_dir: Path, app: str, env: str) -> None:
+    """Sinh fleet.yaml nếu thư mục môi trường chưa có.
+
+    Fleet coi mỗi thư mục có fleet.yaml là một Bundle riêng, và lấy defaultNamespace
+    trong đó làm nơi đặt tài nguyên. THIẾU file này thì namespace của app trống trơn
+    trong khi manifest vẫn nằm đúng trong git — bước verify báo "chưa tồn tại trên cụm"
+    và rất khó đoán ra nguyên nhân. Đã mất một buổi vì nó khi triển khai ở công ty.
+
+    KHÔNG ghi đè nếu đã có: ai muốn tuỳ biến (thêm helm values, đổi tên Bundle) thì vẫn
+    tuỳ biến được, platform không giẫm lên.
+    """
+    f = env_dir / "fleet.yaml"
+    if f.exists():
+        log(f"{f} đã có -> giữ nguyên")
+        return
+    ns = app_namespace(app, env)
+    f.write_text(
+        "# Sinh tự động bởi orchestrate.py. Sửa tay được — lần render sau sẽ không ghi đè.\n"
+        f"namespace: {ns}\n"
+        f"defaultNamespace: {ns}\n"
+    )
+    log(f"sinh {f} (namespace {ns})")
+
+
+def cmd_ensure_gitrepo(args) -> None:
+    """Tạo GitRepo của Fleet nếu chưa có. KHÔNG BAO GIỜ ghi đè cái đang có.
+
+    Đây là lỗi im lặng số một của cả hệ thống: quên tạo GitRepo thì orchestrator xanh
+    toàn tập, manifest nằm đúng trong repo cấu hình, mà cụm trống trơn — vì không ai kéo
+    về. Tự tạo ở đây thì khỏi phải nhớ.
+
+    Vì sao không ghi đè: cụm thường đã có GitRepo của đội khác. Đặt trùng tên rồi apply
+    là ĐÈ LÊN họ, và ứng dụng của họ ngừng đồng bộ trong im lặng. Nên: thiếu thì tạo,
+    có rồi mà trỏ đúng kho thì để yên, trỏ kho KHÁC thì dừng và báo.
+    """
+    name = f"{args.app}-{args.env}"
+    ns = CONFIG.get("kubernetes.fleet_namespace", "fleet-local") or "fleet-local"
+    branch = CONFIG.get(f"environments.{args.env}.config_branch") \
+        or CONFIG.get("git.default_branch", "main")
+    secret = CONFIG.get("kubernetes.fleet_git_secret", "git-creds") or "git-creds"
+
+    # Địa chỉ kho lấy từ chính bản checkout, không dựng lại từ mẫu tên — dựng lại là
+    # thêm một chỗ có thể lệch với thực tế.
+    url = run(["git", "remote", "get-url", "origin"],
+              cwd=Path(args.config_dir), capture=True).stdout.strip()
+    url = re.sub(r"^https://[^@]+@", "https://", url)      # bỏ token nếu remote có nhúng
+    url = re.sub(r"\.git$", "", url)
+
+    cp = kubectl(["get", "gitrepo", name, "-n", ns, "-o", "json"],
+                 kubeconfig=args.kubeconfig, check=False, capture=True)
+    if cp.returncode == 0:
+        cur = (json.loads(cp.stdout).get("spec") or {}).get("repo", "")
+        if re.sub(r"\.git$", "", cur) == url:
+            log(f"GitRepo {ns}/{name} đã có, trỏ đúng {url} -> giữ nguyên")
+            return
+        raise SystemExit(
+            f"GitRepo {ns}/{name} đã tồn tại nhưng trỏ tới '{cur}', không phải '{url}'. "
+            "Nó có thể là của ứng dụng khác — apply đè lên sẽ làm ứng dụng đó ngừng đồng "
+            "bộ mà không báo gì. Đổi tên app, hoặc xoá GitRepo cũ nếu chắc chắn nó thừa."
+        )
+
+    # Đã có ai đăng ký chỗ này dưới TÊN KHÁC chưa? Bản cài cũ thường đặt tên không kèm
+    # môi trường (ví dụ `demo` thay vì `demo-staging`). Tạo thêm một cái nữa thì hai
+    # GitRepo cùng đồng bộ một thư mục, sinh hai Bundle chồng nhau — không hỏng ngay
+    # nhưng rối và rất khó truy khi cần gỡ.
+    cp = kubectl(["get", "gitrepo", "-n", ns, "-o", "json"],
+                 kubeconfig=args.kubeconfig, check=False, capture=True)
+    if cp.returncode == 0:
+        for item in (json.loads(cp.stdout).get("items") or []):
+            spec = item.get("spec") or {}
+            if (re.sub(r"\.git$", "", spec.get("repo", "")) == url
+                    and args.env in (spec.get("paths") or [])):
+                log(f"kho này đã được đăng ký dưới tên {item['metadata']['name']} "
+                    f"-> không tạo thêm {name}")
+                return
+
+    body = {
+        "apiVersion": "fleet.cattle.io/v1alpha1",
+        "kind": "GitRepo",
+        "metadata": {"name": name, "namespace": ns},
+        "spec": {"repo": url, "branch": branch, "paths": [args.env],
+                 "clientSecretName": secret, "pollingInterval": "15s"},
+    }
+    tmp = Path(args.work or ".") / f"gitrepo-{name}.json"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(body))
+    _tolerate_exists(
+        kubectl(["create", "-f", str(tmp)], kubeconfig=args.kubeconfig,
+                check=False, capture=True),
+        f"GitRepo {ns}/{name} -> {url} nhánh {branch} thư mục {args.env}",
+    )
+
+
 def cmd_render(args) -> None:
     work, catalog, app_dir = Path(args.work), Path(args.catalog), Path(args.app_dir)
     if work.exists():
@@ -652,6 +745,7 @@ def cmd_render(args) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(public, out)
     log(f"wrote {out}")
+    ensure_fleet_yaml(out.parent, args.app, args.env)
 
     store.push(work / ".score-k8s" / "state.yaml")
 
@@ -1263,6 +1357,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--kubeconfig")
     p.add_argument("--timeout", type=int, default=300)
     p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("ensure-gitrepo",
+                       help="tạo GitRepo của Fleet nếu chưa có (không bao giờ ghi đè)")
+    p.add_argument("--app", required=True)
+    p.add_argument("--env", required=True, choices=("staging", "prod"))
+    p.add_argument("--config-dir", required=True)
+    p.add_argument("--kubeconfig")
+    p.add_argument("--work")
+    p.set_defaults(func=cmd_ensure_gitrepo)
 
     p = sub.add_parser("config", help="read platform.env.yaml (for the workflow to consume)")
     p.add_argument("--get", help="dotted key, e.g. registry.path")

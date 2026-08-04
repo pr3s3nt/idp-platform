@@ -310,6 +310,17 @@ jobs:
             echo "pending_pr=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Fleet là thứ KÉO manifest từ git về cụm. Thiếu GitRepo thì mọi bước trên đều
+      # xanh, manifest nằm đúng trong repo cấu hình, mà cụm trống trơn — lỗi im lặng số
+      # một của cả hệ thống. Tạo ở đây để khỏi phải nhớ khi đăng ký app mới.
+      # Không bao giờ ghi đè: cụm thường có GitRepo của đội khác, đè lên là họ ngừng
+      # đồng bộ mà không báo gì.
+      - name: Đăng ký GitRepo với Fleet (tạo nếu chưa có)
+        run: |
+          python3 platform/orchestrate.py --env-config "$ENV_CONFIG" ensure-gitrepo \
+            --app "$APP" --env "$DEPLOY_ENV" --config-dir config \
+            --kubeconfig "cluster-config-$DEPLOY_ENV" --work work-staging
+
       # CHỖ DUY NHẤT trong toàn luồng thực sự hỏi "ứng dụng có chạy không".
       # Có bước này vì một sự cố thật: đổi cách đặt tên ảnh làm 5 app cùng
       # ImagePullBackOff mà mọi bước đều báo xanh — manifest ghi đúng, Fleet đồng bộ
