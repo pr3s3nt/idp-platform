@@ -23,6 +23,35 @@
 
 ---
 
+## Đường tắt: chạy script thay vì làm tay Phần B
+
+Toàn bộ **Phần B** (dựng kho cấu hình, gieo hai nhánh, `fleet.yaml`, workflow verify, mời
+bot) đã có script làm sẵn:
+
+```bash
+ORG=<tổ-chức> APP=<tên-app> BOT=<tài-khoản-bot> \
+  PLATFORM_REPO=<tổ-chức>/idp-platform \
+  ./tools/tao-app-moi.sh
+```
+
+Chạy bằng **tài khoản của bạn**, không phải tài khoản bot — việc tạo repo và mời cộng tác
+viên cần quyền cao, cấp cho bot nghĩa là bot tạo được repo ở bất kỳ đâu trong tổ chức.
+
+Chạy lại nhiều lần không sao, cái gì có rồi thì bỏ qua.
+
+Script **không** làm 3 việc, và nó in ra nhắc ở cuối:
+
+1. Đặt secret — không tự động hoá an toàn được
+2. **Bật bảo vệ nhánh `main`** — cố ý để người làm, đây là điểm kiểm soát duy nhất của
+   con người trong cả luồng
+3. Đăng ký runner cho repo app
+
+`GitRepo` của Fleet thì **platform tự tạo** ở lần deploy đầu tiên, không cần đụng tới.
+
+Phần dưới đây mô tả từng bước script làm gì — đọc khi cần hiểu hoặc khi phải làm tay.
+
+---
+
 ## Phần A — Đội sản phẩm: dựng repo app
 
 Repo app cần đúng **4 file** (cộng nội dung ứng dụng).

@@ -1240,6 +1240,12 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 |---|---|
 | `HUONG-DAN-CAI-DAT.md` | Dựng platform từ đầu trên hạ tầng mới |
 | `HUONG-DAN-TAO-APP-MOI.md` | Đưa một ứng dụng mới vào hệ thống |
+| `tools/tao-app-moi.sh` | Script dựng kho cấu hình cho app mới — chạy bằng tài khoản người |
+| `tools/thu-thap-ha-tang.sh` | Khảo sát hiện trạng hạ tầng, chỉ đọc |
+| `tools/mint-app-token.sh` | Tự ký token GitHub App, dùng khi không có `BOT_TOKEN` |
+| `templates/app-ci-*.yaml` | Hai mẫu CI cho repo app — chọn theo số service |
+| `templates/config-repo-verify.yaml` | Workflow đặt trong kho cấu hình, gọi platform kiểm cụm sau khi merge |
+| `templates/config-repo-template/` | Khung `fleet.yaml` cho kho cấu hình |
 | `HUONG-DAN-GITHUB-APP.md` | Đăng ký danh tính máy cho hệ thống |
 | `CAU-HOI-NGU-CANH.md` | Bộ câu hỏi thu thập thông tin hạ tầng công ty |
 | `deployed_plan.md` | Kế hoạch triển khai vào hạ tầng công ty, viết cho tác nhân AI nội bộ thực thi — đánh dấu rõ bước nào máy làm, bước nào người phải làm, bước nào không qua thì dừng |
