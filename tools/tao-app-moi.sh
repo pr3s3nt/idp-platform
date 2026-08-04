@@ -44,7 +44,30 @@ if gh repo view "$ORG/$CONFIG_REPO" >/dev/null 2>&1; then
   co "Kho $ORG/$CONFIG_REPO đã có -> bỏ qua"
 else
   co "Tạo kho $ORG/$CONFIG_REPO"
-  gh repo create "$ORG/$CONFIG_REPO" --private --description "Manifest do IDP sinh cho $APP"
+  if ! gh repo create "$ORG/$CONFIG_REPO" --private \
+        --description "Manifest do IDP sinh cho $APP" 2>/tmp/taoapp.err; then
+    cat /tmp/taoapp.err >&2
+    cat >&2 <<MSG
+
+==> KHÔNG TẠO ĐƯỢC KHO CẤU HÌNH
+
+Danh tính đang chạy không có quyền tạo repo trong tổ chức $ORG.
+Hai nguyên nhân thường gặp:
+
+  - Đang dùng GitHub App: App chỉ tạo được repo nếu có quyền "Administration: write"
+    trên tổ chức. Nền tảng này cố ý CHỈ xin Contents/Pull requests/Metadata, nên không
+    tạo được — và đó là đánh đổi có chủ ý, không phải thiếu sót.
+  - Đang dùng PAT của một tài khoản không được phép tạo repo trong tổ chức.
+
+CÁCH XỬ LÝ: chạy chính script này bằng tài khoản CỦA BẠN, một lần cho mỗi app:
+
+  ORG=$ORG APP=$APP PLATFORM_REPO=$PLATFORM_REPO \\
+    ./tools/tao-app-moi.sh
+
+Xong rồi đẩy lại commit — lần sau bước này thấy kho đã có và bỏ qua.
+MSG
+    exit 1
+  fi
 fi
 
 # ------------------------------------------------ 2. gieo hai nhánh dev và main
