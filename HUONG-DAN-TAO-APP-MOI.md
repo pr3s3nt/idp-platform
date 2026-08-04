@@ -127,6 +127,11 @@ lên nhầm hạ tầng.
 
 ### B1. Tạo repo cấu hình, 2 nhánh
 
+> ⚠️ **`fleet.yaml` là bắt buộc.** Fleet coi mỗi thư mục có `fleet.yaml` là một Bundle
+> riêng, và lấy `defaultNamespace` trong đó làm nơi đặt tài nguyên. THIẾU FILE NÀY thì
+> namespace của app trống trơn trong khi manifest vẫn nằm đúng trong git — bước kiểm cụm
+> báo "chưa tồn tại trên cụm" và rất khó đoán ra nguyên nhân.
+
 ```bash
 mkdir -p /tmp/demo-config/{staging,prod}
 cd /tmp/demo-config

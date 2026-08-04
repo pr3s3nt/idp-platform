@@ -305,6 +305,19 @@ trong repo platform. Tóm tắt:
    - Chép ci.yaml từ mẫu MỘT service (không phải mẫu nhiều service)
    - Sửa APP, IMAGE_NAME, PLATFORM_REPO cho đúng
 2. Repo <ORG>/smoke-config với HAI nhánh: dev và main, mỗi nhánh ít nhất 1 commit
+
+   BẮT BUỘC có file fleet.yaml trong mỗi thư mục môi trường, chép từ
+   templates/config-repo-template/ trong repo platform:
+
+     staging/fleet.yaml   ->  namespace: smoke-staging
+                              defaultNamespace: smoke-staging
+     prod/fleet.yaml      ->  namespace: smoke-prod
+                              defaultNamespace: smoke-prod
+
+   Thay <app> trong file mẫu bằng tên app thật. THIẾU FILE NÀY thì Fleet không biết đặt
+   tài nguyên vào namespace nào — namespace của app trống trơn, còn bước kiểm cụm báo
+   "chưa tồn tại trên cụm" dù manifest đã nằm đúng trong git.
+
 3. Chép templates/config-repo-verify.yaml vào .github/workflows/verify.yaml của smoke-config,
    sửa APP và PLATFORM_REPO
 4. Đặt secret cho repo (tôi sẽ cấp giá trị):
@@ -458,6 +471,8 @@ build (máy có internet)              push (máy nội bộ)
 | Triệu chứng | Nguyên nhân thường gặp | Kiểm bằng |
 |---|---|---|
 | Mọi bước xanh, cụm trống trơn | Chưa tạo `GitRepo` của Fleet | `kubectl get gitrepo -A` |
+| Namespace của app trống, nhưng manifest có trong git | **Thiếu `fleet.yaml`** trong thư mục môi trường của kho cấu hình | `git show origin/dev:staging/fleet.yaml` |
+| Tài nguyên chạy nhưng ở **nhầm namespace** | `fleet.yaml` thiếu `defaultNamespace`, hoặc ghi sai tên | `kubectl get deploy -A \| grep <tên-workload>` |
 | Ứng dụng của đội khác ngừng đồng bộ | `GitRepo` mới trùng tên cái đang có | `kubectl -n fleet-local get gitrepo` |
 | Tạo `GitRepo` xong Fleet vẫn không nhận | Sai namespace | so với `GitRepo` đang có |
 | Pod `ImagePullBackOff` | Nhãn ảnh trong manifest chưa được đẩy lên Harbor | `docker manifest inspect <ảnh>` |
