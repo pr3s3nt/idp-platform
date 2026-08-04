@@ -217,6 +217,29 @@ jobs:
           ref: ${{ steps.lock.outputs.ref }}
           path: catalog
 
+      # Kho cấu hình phải TỒN TẠI trước khi checkout — actions/checkout hỏng ngay nếu
+      # chưa có, và thông báo của nó không nói gì về việc "kho chưa được tạo".
+      # Script này idempotent: có rồi thì bỏ qua, chưa có thì tạo kèm hai nhánh và
+      # fleet.yaml. Cùng một script mà người chạy tay khi đăng ký app mới.
+      #
+      # Bot cần quyền tạo repo trong tổ chức. KHÔNG có thì bước này hỏng kèm thông báo
+      # của gh — lúc đó chạy tay script này bằng tài khoản người là xong, phần còn lại
+      # của luồng không đổi.
+      - name: Bảo đảm kho cấu hình tồn tại
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ env.ORG }}
+          APP: ${{ env.APP }}
+          CONFIG_REPO: ${{ env.CONFIG_REPO_NAME }}
+          PLATFORM_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+          export NS_PATTERN="$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" \
+            config --get kubernetes.namespace_pattern)"
+          bash platform/tools/tao-app-moi.sh
+
       - name: Checkout config repo
         uses: actions/checkout@v4
         with:

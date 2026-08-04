@@ -22,6 +22,12 @@ CONFIG_REPO="${CONFIG_REPO:-$APP-config}"
 NS_PATTERN="${NS_PATTERN:-}"
 [ -n "$NS_PATTERN" ] || NS_PATTERN='{app}-{env}'
 
+# Chạy trong workflow thì git chưa có thông tin đăng nhập. gh có token rồi nên nhờ nó
+# cài credential helper — không phải nhét token vào URL, thứ dễ lọt vào log và vào remote.
+if [ -n "${GH_TOKEN:-}${GH_ENTERPRISE_TOKEN:-}" ] && [ -n "${CI:-}" ]; then
+  gh auth setup-git >/dev/null 2>&1 || true
+fi
+
 ns() {
   local s="$NS_PATTERN"
   s="${s//\{app\}/$APP}"
