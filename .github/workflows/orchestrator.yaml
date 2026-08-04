@@ -286,9 +286,20 @@ jobs:
           # Bắt buộc: `gh pr create` bên trong orchestrate.py phải chạy bằng token App.
           # Không đặt thì nó rơi về gh auth có sẵn trên runner — tức tài khoản người, và
           # pull request sẽ mang tên người đó thay vì App.
+          # gh đọc HAI biến khác nhau tuỳ máy chủ: GH_TOKEN cho github.com, còn
+          # GH_ENTERPRISE_TOKEN cho GitHub Enterprise Server. Đặt cả hai để cùng một
+          # workflow chạy được ở cả hai nơi. Chỉ đặt GH_TOKEN thì trên GHES gh coi như
+          # CHƯA đăng nhập — bước hỏi branch protection trả về rỗng (platform sẽ đoán là
+          # nhánh không được bảo vệ rồi push thẳng vào production), còn `gh pr create`
+          # thì hỏng hẳn.
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
+          # GH_HOST cần TÊN MÁY CHỦ, không phải URL — cắt bỏ phần https:// đi.
+          # Không đặt thì gh đoán từ git remote của thư mục đang đứng; đúng trong hầu hết
+          # trường hợp, nhưng khai tường minh thì không phụ thuộc vào việc đứng ở đâu.
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
           OUT=$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env "$DEPLOY_ENV" --sha "$SHA" \
             --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}")
@@ -547,8 +558,17 @@ jobs:
           # Bắt buộc: `gh pr create` bên trong orchestrate.py phải chạy bằng token App.
           # Không đặt thì nó rơi về gh auth có sẵn trên runner — tức tài khoản người, và
           # pull request sẽ mang tên người đó thay vì App.
+          # gh đọc HAI biến khác nhau tuỳ máy chủ: GH_TOKEN cho github.com, còn
+          # GH_ENTERPRISE_TOKEN cho GitHub Enterprise Server. Đặt cả hai để cùng một
+          # workflow chạy được ở cả hai nơi. Chỉ đặt GH_TOKEN thì trên GHES gh coi như
+          # CHƯA đăng nhập — bước hỏi branch protection trả về rỗng (platform sẽ đoán là
+          # nhánh không được bảo vệ rồi push thẳng vào production), còn `gh pr create`
+          # thì hỏng hẳn.
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          set -euo pipefail
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app
 
