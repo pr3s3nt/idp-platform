@@ -297,71 +297,46 @@ Commit và push.
 ## B3. Tạo ứng dụng thử
 
 ```text
-Tạo một ứng dụng thử tên "smoke" để kiểm chứng nền tảng. Làm theo HUONG-DAN-TAO-APP-MOI.md
-trong repo platform. Tóm tắt:
+Tạo một ứng dụng thử tên "smoke" để kiểm chứng nền tảng.
 
-1. Repo <ORG>/smoke với 4 file: score.yaml, Dockerfile, platform.lock,
-   .github/workflows/ci.yaml
-   - Chép ci.yaml từ mẫu MỘT service (không phải mẫu nhiều service)
-   - Sửa APP, IMAGE_NAME, PLATFORM_REPO cho đúng
-2. Repo <ORG>/smoke-config với HAI nhánh: dev và main, mỗi nhánh ít nhất 1 commit
+Phần chuẩn bị kho cấu hình đã có script làm sẵn — chạy nó thay vì làm tay:
 
-   BẮT BUỘC có file fleet.yaml trong mỗi thư mục môi trường, chép từ
-   templates/config-repo-template/ trong repo platform:
+  ORG=<ORG> APP=smoke BOT=<tài-khoản-bot> PLATFORM_REPO=<ORG>/idp-platform \
+    ./tools/tao-app-moi.sh
 
-     staging/fleet.yaml   ->  namespace: smoke-staging
-                              defaultNamespace: smoke-staging
-     prod/fleet.yaml      ->  namespace: smoke-prod
-                              defaultNamespace: smoke-prod
+Script tạo kho cấu hình, gieo hai nhánh dev/main kèm fleet.yaml đúng namespace, cài
+workflow verify, và mời tài khoản bot vào. Chạy lại nhiều lần không sao, cái gì có rồi
+thì bỏ qua.
 
-   Thay <app> trong file mẫu bằng tên app thật. THIẾU FILE NÀY thì Fleet không biết đặt
-   tài nguyên vào namespace nào — namespace của app trống trơn, còn bước kiểm cụm báo
-   "chưa tồn tại trên cụm" dù manifest đã nằm đúng trong git.
+Sau đó tạo repo ứng dụng <ORG>/smoke với 4 file: score.yaml, Dockerfile, platform.lock,
+.github/workflows/ci.yaml. Chép ci.yaml từ templates/app-ci-mot-service.yaml trong repo
+platform (mẫu MỘT service), sửa APP, IMAGE_NAME, REGISTRY, PLATFORM_REPO.
 
-3. Chép templates/config-repo-verify.yaml vào .github/workflows/verify.yaml của smoke-config,
-   sửa APP và PLATFORM_REPO
-4. Đặt secret cho repo (tôi sẽ cấp giá trị):
-   - PLATFORM_DISPATCH_TOKEN cho CẢ HAI repo
-   - REGISTRY_PASSWORD cho repo ứng dụng
+CHƯA tạo GitRepo của Fleet — platform tự làm ở lần deploy đầu tiên.
 
-CHƯA tạo GitRepo của Fleet — việc đó ở bước sau, có điều kiện phải kiểm trước.
-
-Báo lại tên hai repo đã tạo và nội dung score.yaml.
+Báo lại: tên hai repo, nội dung score.yaml, và phần "còn ba việc phải làm tay" mà script
+in ra cuối cùng.
 ```
 
-## B4. Đăng ký với Fleet
+## B4. Kiểm Fleet nhận đúng
 
 ```text
-Tạo hai GitRepo của Fleet cho ứng dụng smoke, ở namespace fleet-local.
+Platform TỰ TẠO GitRepo của Fleet ở lần deploy đầu tiên, không phải làm tay. Việc của bạn
+chỉ là kiểm nó tạo đúng và không giẫm lên ai.
 
-TRƯỚC KHI TẠO, bắt buộc kiểm trùng tên:
+TRƯỚC khi deploy lần đầu, ghi lại danh sách hiện có để so sau:
 
   kubectl -n fleet-local get gitrepo
 
-Cụm này đang có GitRepo của đội khác. Đặt trùng tên là ĐÈ LÊN cái đang có và ứng dụng của họ
-ngừng đồng bộ trong im lặng. Nếu tên định đặt đã tồn tại thì DỪNG và báo.
+Cụm này đang có GitRepo của đội khác. Platform sẽ:
+  - tạo mới nếu chưa có, tên <app>-<môi-trường>
+  - để yên nếu đã có và trỏ đúng kho
+  - DỪNG nếu trùng tên nhưng trỏ kho khác
 
-Quy ước tên bắt buộc: <app>-<môi-trường>, tức smoke-staging và smoke-prod. Hai môi trường
-dùng chung một cụm nên tên phải kèm môi trường, nếu không cái sau đè cái trước.
+Nó cũng tự lấy cách xác thực git theo các GitRepo đang chạy cùng namespace, nên không cần
+tạo secret mới.
 
-  apiVersion: fleet.cattle.io/v1alpha1
-  kind: GitRepo
-  metadata: { name: smoke-staging, namespace: fleet-local }
-  spec:
-    repo: https://<GHES>/<ORG>/smoke-config
-    branch: dev
-    paths: [staging]
-    clientSecretName: <tên-secret-git-creds-đang-dùng>
-    pollingInterval: 15s
-
-  # prod: giống trên, đổi name thành smoke-prod, branch thành main, paths thành [prod]
-
-Kiểm xem các GitRepo sẵn có đang dùng clientSecretName nào và dùng đúng cái đó.
-
-Quên bước này là triệu chứng đánh lừa nhất của cả hệ thống: mọi bước báo xanh, manifest có
-trong repo cấu hình, nhưng cụm KHÔNG có gì — vì không ai kéo về.
-
-Báo lại: kubectl -n fleet-local get gitrepo
+Sau lần deploy đầu, so lại danh sách và báo tôi cái nào mới xuất hiện.
 ```
 
 ## B5. Chạy thử staging

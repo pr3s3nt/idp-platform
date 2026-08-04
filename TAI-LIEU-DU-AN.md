@@ -1151,7 +1151,7 @@ có. Việc tạo repo tự động hoá được nhưng cần token quyền cao
 ## 7. Đã kiểm chứng những gì
 
 ### Bộ test tự động
-**75/75 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
+**78/78 test đạt.** Bao gồm các tình huống đua (6.5), đánh nhãn theo nội dung (6.6), luồng
 pull request cho production (6.9), phụ thuộc xuyên kho mã (6.10), bí mật của ứng dụng (6.11) và
 ba tình huống triển khai kẹt giữa chừng mà phép kiểm cũ bỏ lọt (6.20).
 
