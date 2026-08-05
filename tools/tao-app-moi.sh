@@ -17,6 +17,10 @@ set -euo pipefail
 : "${PLATFORM_REPO:?thiếu PLATFORM_REPO — ví dụ example-org/idp-platform}"
 BOT="${BOT:-}"
 CONFIG_REPO="${CONFIG_REPO:-$APP-config}"
+# Nhãn máy chạy cho workflow verify trong kho cấu hình. Job đó chỉ gọi API GitHub nên
+# chạy ở đâu cũng được — mặc định ubuntu-latest cho github.com, còn trên GHES thì phải
+# truyền nhãn của một runner có thật, nếu không workflow nằm chờ mãi không ai nhận.
+VERIFY_RUNNER_LABEL="${VERIFY_RUNNER_LABEL:-ubuntu-latest}"
 # KHÔNG viết ${NS_PATTERN:-{app}-{env}}: bash cắt biểu thức ở dấu } ĐẦU TIÊN, nên giá trị
 # mặc định bị hỏng và thừa một } ở cuối. Đã đo: namespace ra "app-staging-{env}}".
 NS_PATTERN="${NS_PATTERN:-}"
@@ -125,7 +129,8 @@ for br in dev main; do
     -o .github/workflows/verify.yaml 2>/dev/null \
     || gh api "repos/$PLATFORM_REPO/contents/templates/config-repo-verify.yaml" \
          --jq '.content' | base64 -d > .github/workflows/verify.yaml
-  sed -i "s|__APP__|$APP|; s|__PLATFORM_REPO__|$PLATFORM_REPO|" .github/workflows/verify.yaml
+  sed -i "s|__APP__|$APP|; s|__PLATFORM_REPO__|$PLATFORM_REPO|; \
+          s|__RUNNER_LABEL__|$VERIFY_RUNNER_LABEL|" .github/workflows/verify.yaml
   if git diff --quiet .github/workflows/verify.yaml 2>/dev/null && \
      git ls-files --error-unmatch .github/workflows/verify.yaml >/dev/null 2>&1; then
     echo "    $br: đã có, không đổi"
@@ -133,8 +138,18 @@ for br in dev main; do
     git add .github/workflows/verify.yaml
     git -c user.name="$(git config user.name || echo idp)" \
         -c user.email="$(git config user.email || echo idp@local)" \
-        commit -qm "ci: gọi platform kiểm cụm khi nhánh này đổi" && git push -q origin "$br"
-    echo "    $br: đã cài"
+        commit -qm "ci: gọi platform kiểm cụm khi nhánh này đổi"
+    # Push có thể bị chặn: nhánh production của kho cấu hình thường được bảo vệ, và bot
+    # KHÔNG được bypass ở đó — đúng thiết kế. Không để chuyện này giết cả lần deploy:
+    # verify.yaml là thứ nên có, không phải thứ bắt buộc để deploy chạy.
+    if git push -q origin "$br" 2>/dev/null; then
+      echo "    $br: đã cài"
+    else
+      git reset -q --hard "origin/$br"
+      echo "    $br: KHÔNG push được (nhánh được bảo vệ?) -> bỏ qua"
+      echo "       cập nhật tay nếu cần: chép templates/config-repo-verify.yaml," \
+           "thay __APP__/__PLATFORM_REPO__/__RUNNER_LABEL__, rồi mở pull request"
+    fi
   fi
 done
 

@@ -46,7 +46,13 @@ env:
 
 jobs:
   ask-platform-to-verify:
-    runs-on: ubuntu-latest
+    # Job này CHỈ gọi API của GitHub — không cần Docker, không cần vào cụm. Chạy ở đâu
+    # cũng được, miễn máy đó tới được GHES.
+    #
+    # `ubuntu-latest` là runner do GitHub.com cấp; GitHub Enterprise Server KHÔNG có nó,
+    # và workflow sẽ nằm chờ mãi không ai nhận mà cũng không báo lỗi gì. Giá trị dưới đây
+    # do tao-app-moi.sh điền vào lúc tạo kho cấu hình, lấy từ nhãn runner của platform.
+    runs-on: __RUNNER_LABEL__
     steps:
       - name: Gọi platform kiểm cụm
         env:
