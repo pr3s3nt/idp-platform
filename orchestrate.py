@@ -1313,7 +1313,10 @@ def cmd_config(args) -> None:
         value = CONFIG.get(args.get)
         if value is None:
             raise SystemExit(f"no such key in platform.env.yaml: {args.get}")
-        print(value)
+        # Danh sách in ra dạng JSON. JSON là YAML hợp lệ, nên ["a","b"] dán thẳng vào
+        # `runs-on:` được — dùng cho nhãn máy chạy gồm nhiều nhãn. In str(list) của Python
+        # sẽ ra dấu nháy đơn, YAML đọc được nhưng trông lạ và dễ bị sửa nhầm.
+        print(json.dumps(value) if isinstance(value, list) else value)
         return
     if args.export:
         table = CONFIG.for_env(args.env)

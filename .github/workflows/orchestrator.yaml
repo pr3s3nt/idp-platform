@@ -238,9 +238,12 @@ jobs:
           export GH_HOST="${GITHUB_SERVER_URL#https://}"
           export NS_PATTERN="$(python3 platform/orchestrate.py --env-config "$ENV_CONFIG" \
             config --get kubernetes.namespace_pattern)"
-          # Workflow verify trong kho cấu hình chạy trên CÙNG runner với orchestrator:
-          # nó chỉ gọi API GitHub, mà máy này chắc chắn tới được GHES.
-          export VERIFY_RUNNER_LABEL="${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}"
+          # Nhãn máy chạy cho workflow verify trong kho cấu hình — đọc từ cấu hình, không
+          # phải từ nhãn của orchestrator. Job đó chỉ gọi API GitHub nên không cần chiếm
+          # runner riêng của platform. Nhiều nhãn thì cấu hình khai danh sách, và
+          # `config --get` in ra JSON (JSON là YAML hợp lệ nên dán thẳng vào runs-on được).
+          export VERIFY_RUNNER_LABEL="$(python3 platform/orchestrate.py \
+            --env-config "$ENV_CONFIG" config --get ci.verify_runner_label)"
           bash platform/tools/tao-app-moi.sh
 
       - name: Checkout config repo
