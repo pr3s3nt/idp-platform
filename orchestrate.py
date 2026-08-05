@@ -629,6 +629,20 @@ def ensure_fleet_yaml(env_dir: Path, app: str, env: str) -> None:
     log(f"sinh {f} (namespace {ns})")
 
 
+def repo_is_private(url: str) -> bool | None:
+    """Kho có riêng tư không? None nghĩa là không hỏi được.
+
+    Dùng để phân biệt hai trường hợp trông giống nhau khi thiếu credential: kho công khai
+    thì Fleet clone ẩn danh vẫn được, kho riêng tư thì chắc chắn hỏng.
+    """
+    m = re.search(r"[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
+    if not m:
+        return None
+    cp = run(["gh", "api", f"repos/{m.group(1)}/{m.group(2)}", "--jq", ".private"],
+             check=False, capture=True)
+    return {"true": True, "false": False}.get(cp.stdout.strip())
+
+
 def cmd_ensure_gitrepo(args) -> None:
     """Tạo GitRepo của Fleet nếu chưa có. KHÔNG BAO GIỜ ghi đè cái đang có.
 
@@ -703,9 +717,25 @@ def cmd_ensure_gitrepo(args) -> None:
     }
     if secret:
         body["spec"]["clientSecretName"] = secret
+    elif repo_is_private(url):
+        # Kho riêng tư + không có credential = Fleet clone ẩn danh và hỏng CHẮC CHẮN với
+        # "authentication required: Anonymous access denied". Nhưng nó hỏng ở status của
+        # GitRepo, không ai nhìn, và triệu chứng y hệt "quên tạo GitRepo": cụm trống trơn.
+        # Dừng ngay ở đây thì lỗi hiện ra đúng chỗ, đúng lúc, kèm cách sửa.
+        raise SystemExit(
+            f"kho cấu hình {url} là kho RIÊNG TƯ nhưng không tìm được thông tin đăng nhập "
+            "git nào cho Fleet.\n"
+            "Fleet sẽ clone ẩn danh và hỏng với 'Anonymous access denied' — cụm trống trơn "
+            "trong khi mọi bước ở đây báo xanh.\n\n"
+            "Cách sửa: tạo secret trong namespace của Fleet rồi khai tên nó vào "
+            "kubernetes.fleet_git_secret:\n"
+            "  kubectl -n <fleet-ns> create secret generic git-creds-idp \\\n"
+            "    --type=kubernetes.io/basic-auth \\\n"
+            "    --from-literal=username=<tài-khoản> --from-literal=password=<token>\n"
+            "Lưu ý kiểu secret phải khớp địa chỉ kho: https -> basic-auth, ssh -> ssh-auth."
+        )
     else:
-        log("không có clientSecretName -> để Fleet tự xoay (kho công khai, "
-            "hoặc cụm có secret mặc định)")
+        log(f"{url} là kho công khai và không có clientSecretName -> Fleet clone ẩn danh")
     tmp = Path(args.work or ".") / f"gitrepo-{name}.json"
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(json.dumps(body))

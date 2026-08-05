@@ -1433,3 +1433,31 @@ def test_cấu_hình_thắng_việc_học(tmp_path, monkeypatch):
         app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
     body = json.loads((tmp_path / "gitrepo-app-staging.json").read_text())
     assert body["spec"]["clientSecretName"] == "toi-tu-khai"
+
+
+def test_kho_riêng_tư_không_có_credential_thì_DỪNG(tmp_path, monkeypatch):
+    """Kho riêng tư + không tìm được thông tin đăng nhập = Fleet clone ẩn danh và hỏng
+    CHẮC CHẮN với 'Anonymous access denied'. Nhưng nó hỏng trong status của GitRepo, không
+    ai nhìn, và triệu chứng y hệt 'quên tạo GitRepo'. Gặp thật ở công ty."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"kubernetes": {"fleet_git_secret": ""}}))
+    monkeypatch.setattr(orc, "repo_is_private", lambda url: True)
+    r = _repo_gia(tmp_path); gọi = []
+    _fake_kubectl_gitrepo([], monkeypatch, gọi)
+    with pytest.raises(SystemExit, match="Anonymous access denied|RIÊNG TƯ"):
+        orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+            app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+    assert not [a for a in gọi if a[0] == "create"], "đã dừng thì không được tạo"
+
+
+def test_kho_công_khai_không_có_credential_vẫn_tạo(tmp_path, monkeypatch):
+    """Kho công khai thì clone ẩn danh chạy được — không có lý do gì để chặn."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"kubernetes": {"fleet_git_secret": ""}}))
+    monkeypatch.setattr(orc, "repo_is_private", lambda url: False)
+    r = _repo_gia(tmp_path); gọi = []
+    _fake_kubectl_gitrepo([], monkeypatch, gọi)
+    orc.cmd_ensure_gitrepo(orc.argparse.Namespace(
+        app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
+    body = json.loads((tmp_path / "gitrepo-app-staging.json").read_text())
+    assert "clientSecretName" not in body["spec"]

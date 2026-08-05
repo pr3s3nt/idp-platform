@@ -339,7 +339,13 @@ jobs:
       # Không bao giờ ghi đè: cụm thường có GitRepo của đội khác, đè lên là họ ngừng
       # đồng bộ mà không báo gì.
       - name: Đăng ký GitRepo với Fleet (tạo nếu chưa có)
+        env:
+          # Cần gh để hỏi kho cấu hình có riêng tư không — kho riêng tư mà thiếu thông tin
+          # đăng nhập cho Fleet thì hỏng chắc chắn, và hỏng ở chỗ không ai nhìn.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
           python3 platform/orchestrate.py --env-config "$ENV_CONFIG" ensure-gitrepo \
             --app "$APP" --env "$DEPLOY_ENV" --config-dir config \
             --kubeconfig "cluster-config-$DEPLOY_ENV" --work work-staging
