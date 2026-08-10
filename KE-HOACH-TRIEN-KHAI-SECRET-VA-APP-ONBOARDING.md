@@ -231,7 +231,7 @@ AI phải cập nhật bảng này trong quá trình làm. `Blocked` chỉ dùng
 
 | Phase | Trạng thái | Evidence/ghi chú |
 |---|---|---|
-| 0 — ADR, baseline, portability và toolchain | Not started | |
+| 0 — ADR, baseline, portability và toolchain | Done | Xem "Nhật ký Phase 0" bên dưới |
 | 1 — Environment Values, ConfigMap và promotion guard | Not started | |
 | 2 — Vault/VSO foundation trên harness | Not started | |
 | 3 — App secret integration | Not started | |
@@ -241,6 +241,48 @@ AI phải cập nhật bảng này trong quá trình làm. `Blocked` chỉ dùng
 | 7 — Pilot, migration và hardening local | Not started | |
 
 Giá trị trạng thái hợp lệ: `Not started`, `In progress`, `Done`, `Blocked`.
+
+#### Nhật ký Phase 0
+
+Branch `feature/secret-onboarding`, baseline SHA `36372b9`.
+
+Harness đã xác minh: WSL2, Python 3.14.4 + pyyaml 6.0.3, pytest 9.0.2, score-k8s 0.15.0,
+score-compose 0.43.0, kubectl v1.36.1, cụm kind `kind-staging` (k8s v1.36.1) đang chạy
+Fleet và các app legacy (`sample-nginx-staging`, `sample-pg-staging`, `boutique-staging`…).
+
+Test đã chạy thật trên working tree của feature branch:
+
+| Lệnh | Kết quả |
+|---|---|
+| `python3 -m pytest test_orchestrate.py -q` (baseline, trước thay đổi) | 80 passed |
+| `python3 -m pytest test_orchestrate.py -q` (sau Phase 0) | **117 passed** |
+| `orchestrate.py --env-config platform.env.yaml preflight` | OK, khớp phiên bản đã ghim |
+| `preflight --require-score-compose` | OK, score-compose 0.43.0 khớp |
+| `preflight` với pin sai (9.9.9) | Fail đúng như thiết kế, exit 1 |
+
+Ba gate của Phase 0:
+
+1. **Binary sai version fail trước render** — `test_render_refuses_a_mismatched_binary_before_touching_the_catalog` khẳng định `manifests.yaml` không được tạo ra.
+2. **Hai render cùng input/state deterministic** — `test_two_renders_of_one_input_are_byte_identical` so sánh nguyên file output, không chỉ tên tài nguyên.
+3. **Placeholder trong `resources.*.params`** — `test_placeholders_resolve_inside_resource_params` xác nhận score-k8s 0.15.0 thật sự nội suy `${resources.hostname.host}` vào `params.host` của route. Golden path same-origin phụ thuộc vào điều này.
+
+File đã thay đổi: `.gitignore`, `platform.env.yaml`, `platform.env.company.yaml`,
+`orchestrate.py`, `test_orchestrate.py`, `docs/adr/*` (7 file mới).
+
+Config key mới: `ci.score_k8s_version`, `ci.score_compose_version`, `vault.*`,
+`database_profiles.*`, `features.*` (bốn cờ, tất cả `false`).
+
+Migration: không có. Mọi key mới đều có mặc định giữ nguyên hành vi cũ; chuỗi rỗng ở
+`ci.*_version` tắt kiểm tra phiên bản.
+Rollback: xoá khối `ci.score_*_version` (hoặc đặt rỗng) là quay lại hành vi trước.
+
+Hạn chế còn lại: `vault.operator_version: 1.5.0` mới chỉ là ghim trên giấy — chưa cài VSO
+lên harness, sẽ xác minh ở Phase 2. `database_profiles` chưa có provisioner tiêu thụ nó
+(Phase 4).
+
+Người dùng phải xác nhận lại khi mang vào công ty: phiên bản score-k8s/score-compose trên
+runner `platform-orchestrator`; tên KV mount và kv v1/v2 của Vault công ty; phiên bản VSO
+được duyệt; profile prod (instances/storage/retention) do DBA chốt.
 
 ### 0.6. Stop conditions
 

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
 
 # score-k8s scratch. .score-k8s in particular holds raw secrets (generated DB passwords)
 # and must never be committed — the orchestrator keeps that state in a cluster Secret instead.
@@ -8,3 +9,23 @@ __pycache__/
 work-*/
 manifests.yaml
 kubeconfig-*
+
+# score-compose local state. Same hazard as .score-k8s, one layer down: `score-compose
+# generate` writes the LOCAL Postgres password into .score-compose/state.yaml in the
+# clear. That state is disposable local scaffolding — it must never be committed and must
+# never be reused as a staging/prod credential.
+.score-compose/
+compose.yaml
+
+# Local secret material. .env is where a developer's own third-party keys land while they
+# run `make dev`; .env.example is the checked-in template and is the one exception.
+.env
+.env.*
+!.env.example
+
+# Vault bootstrap output — root token, unseal keys, and the harness kubeconfig. These are
+# written by the local Vault install and are the highest-value secrets on the machine.
+# Naming them here means an accidental `git add` of the directory cannot leak them.
+.vault-local/
+*.unseal-keys.json
+*.root-token

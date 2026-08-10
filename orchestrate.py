@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import re
 import shutil
@@ -56,7 +57,33 @@ DEFAULTS: dict = {
     "ingress": {"gateway_name": "", "gateway_namespace": ""},
     "images": {},
     "environments": {},
+    # Empty version strings mean "do not check" — see check_tool_versions. A brownfield
+    # platform must keep running on a runner nobody has re-provisioned yet.
+    "ci": {"score_k8s_version": "", "score_compose_version": ""},
+    "vault": {
+        "operator_version": "",
+        "kv_mount": "kv",
+        "kv_type": "kv-v2",
+        "path_template": "apps/{application}/{environment}/{name}",
+        "auth_ref": "app-vault",
+        "refresh_after": "5m",
+        "initial_sync_timeout_seconds": 60,
+    },
+    "database_profiles": {},
+    # Every capability added by the secret/onboarding programme is off until switched on
+    # per environment. The existing platform must render byte-identically with these unset.
+    "features": {
+        "application_values": False,
+        "vault_secrets": False,
+        "postgres_application": False,
+        "stack_onboarding": False,
+    },
 }
+
+# The two environment names the platform accepts, everywhere. `production` is deliberately
+# NOT an accepted alias: two spellings for one environment is how a values file ends up
+# with a `production:` block that silently never applies.
+ENVIRONMENTS = ("staging", "prod")
 
 # Placeholder syntax for provisioners and patch templates. Deliberately NOT {{ }} — those
 # files are Go templates owned by score-k8s, and NOT ${ } — that is score's own resource
@@ -189,6 +216,201 @@ def app_namespace(app: str, env: str) -> str:
     """
     pattern = CONFIG.get("kubernetes.namespace_pattern", "{app}-{env}") or "{app}-{env}"
     return pattern.replace("{app}", app).replace("{env}", env)
+
+
+def feature(name: str) -> bool:
+    """Is an opt-in capability switched on for this platform install?
+
+    Everything the secret/onboarding programme adds sits behind one of these. The reason
+    is not caution for its own sake: this platform already deploys real apps to staging,
+    and a new code path that only *usually* behaves like the old one is indistinguishable
+    from the old one right up until the deploy it breaks. Off by default means the blast
+    radius of a bug is the apps that opted in, not every app at once.
+    """
+    return bool(CONFIG.get(f"features.{name}", False))
+
+
+# --------------------------------------------------------------------------------------
+# naming and path contracts
+# --------------------------------------------------------------------------------------
+# Everything in this section is a pure function of its arguments plus platform.env.yaml.
+# They are grouped here because they are CONTRACTS: their output ends up in Kubernetes
+# object names, Vault paths and promotion records, so changing one silently renames live
+# resources or moves a secret out from under a running app. Change them only with a
+# migration, never as a refactor.
+
+# DNS-1123 label, which is what a Kubernetes object name and a Vault path segment can both
+# safely be. Anchored on purpose: a partial match would let "stripe/../../admin" through
+# on the strength of the "stripe" prefix.
+DNS_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def validate_secret_name(name: str) -> str:
+    """Gate on the ONE app-supplied component of a Vault path.
+
+    An app declares `secretRef: {name: stripe}` and the platform derives the full path
+    from it. That makes `name` the only attacker-controlled segment, so it gets checked
+    against an allowlist rather than scanned for bad characters: `/` and `..` are the
+    obvious traversals, but so are a leading `-`, an empty string, and unicode that
+    normalises to a separator. Anything not matching a plain DNS label is refused.
+    """
+    if not isinstance(name, str) or not DNS_LABEL.match(name):
+        raise SystemExit(
+            f"invalid secret name {name!r}. Use a DNS-style name: lowercase letters, "
+            "digits and '-', starting and ending alphanumeric, at most 63 characters. "
+            "'/' and '..' are refused because the platform derives the Vault path from "
+            "this value."
+        )
+    return name
+
+
+def validate_environment(env: str) -> str:
+    if env not in ENVIRONMENTS:
+        raise SystemExit(
+            f"unknown environment {env!r}. This platform has exactly two: "
+            f"{', '.join(ENVIRONMENTS)}. ('production' is not an alias for 'prod' — "
+            "one spelling only, so a values block cannot quietly never apply.)"
+        )
+    return env
+
+
+def vault_path(app: str, env: str, name: str) -> str:
+    """Where a logical secret lives in Vault. Derived, never taken from the app.
+
+    Returns the path WITHOUT the KV-v2 `/data/` infix — that is a wire-format detail VSO
+    adds itself, and baking it in here would break kv-v1 mounts and double up on v2.
+    """
+    validate_environment(env)
+    validate_secret_name(name)
+    validate_secret_name(app)
+    mount = CONFIG.get("vault.kv_mount") or "kv"
+    template = CONFIG.get("vault.path_template") or "apps/{application}/{environment}/{name}"
+    path = (template
+            .replace("{application}", app)
+            .replace("{environment}", env)
+            .replace("{name}", name))
+    if "{" in path or "}" in path:
+        raise SystemExit(
+            f"vault.path_template has an unknown placeholder: {template!r}. "
+            "Only {application}, {environment} and {name} are substituted."
+        )
+    return f"{mount}/{path}"
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", str(text).lower())).strip("-")
+
+
+def resource_name(*parts: str, prefix: str = "idp") -> str:
+    """A DNS-safe, <=63 character, collision-resistant name for a generated object.
+
+    Two constraints pull against each other. Names must be READABLE — when a
+    VaultStaticSecret is stuck, whoever is paged has to see which app, environment and
+    workload it belongs to without cross-referencing anything. And they must be UNIQUE and
+    STABLE — 63 characters is the hard limit for a label value, so long inputs get
+    truncated, and truncation alone would map two different apps onto one name.
+
+    So: readable prefix, truncated, plus a short SHA-256 of the FULL tuple. The hash is
+    over the untruncated input, so it still separates names whose readable parts collided.
+
+    Not Python's hash(): it is salted per process (PYTHONHASHSEED), so the same input
+    produces a different name on every run — which is exactly the resource-churn bug the
+    state store exists to prevent, reintroduced through the back door.
+    """
+    digest = hashlib.sha256("\x1f".join(str(p) for p in parts).encode()).hexdigest()[:8]
+    body = "-".join(x for x in [_slug(prefix)] + [_slug(p) for p in parts] if x)
+    body = body[: 63 - len(digest) - 1].rstrip("-")
+    return f"{body}-{digest}" if body else digest
+
+
+def canonical_json(payload) -> str:
+    """The one serialisation used for anything that gets hashed.
+
+    Sorted keys and no incidental whitespace, so a digest describes the DATA and not the
+    file it happened to be typed into. Re-indenting a YAML file, reordering its keys or
+    adding a comment must not read as a configuration change.
+    """
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def values_digest(spec: dict, env: str = "prod") -> str:
+    """Fingerprint of the values an environment will actually be rendered with.
+
+    This is what makes a fast promotion honest. `promote --mode tag-only` rewrites image
+    tags in an already-rendered manifest without re-running the renderer, which is quick
+    and reproducible — but it also means an edit to the prod values block would NOT reach
+    production, while the promotion still reports success. Recording this digest at render
+    time and comparing it at promote time turns that silent skip into a refusal.
+
+    Includes secretRef metadata (name and key) because changing which Vault secret feeds a
+    variable is a real configuration change. Never includes a secret VALUE — the renderer
+    does not have one.
+    """
+    return hashlib.sha256(canonical_json({
+        "application": (spec or {}).get("application") or {},
+        "environment": ((spec or {}).get("environments") or {}).get(env) or {},
+    }).encode()).hexdigest()
+
+
+# --------------------------------------------------------------------------------------
+# toolchain pinning
+# --------------------------------------------------------------------------------------
+# score-k8s decides the SHAPE of every manifest this platform produces. Two runners on two
+# versions render the same app commit into two different manifests, with no error anywhere
+# — one deploy simply changes something nobody edited. Pinning turns that into a refusal.
+PINNED_TOOLS = {
+    "score-k8s": "ci.score_k8s_version",
+    "score-compose": "ci.score_compose_version",
+}
+
+# Matches 0.15.0 and 1.2.3-rc1, but not the go1.26.4 on the same line: there is no word
+# boundary between "go" and "1", so the compiler version cannot be mistaken for the tool's.
+_SEMVER = re.compile(r"\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b")
+
+_version_checked: set[str] = set()
+
+
+def tool_version(tool: str) -> str | None:
+    """Version `tool --version` reports, or None if it is absent or unparseable."""
+    if not shutil.which(tool):
+        return None
+    cp = run([tool, "--version"], check=False, capture=True)
+    first = ((cp.stdout or "") + (cp.stderr or "")).strip().splitlines()
+    match = _SEMVER.search(first[0]) if first else None
+    return match.group(1) if match else None
+
+
+def check_tool_versions(tools: list[str], *, force: bool = False) -> None:
+    """Fail unless each tool matches the version pinned in platform.env.yaml.
+
+    An EMPTY pin disables the check for that tool. That is deliberate rather than lax:
+    this platform is already deploying real apps from runners nobody has re-provisioned,
+    and a version check that fails closed on first upgrade would take those apps down to
+    enforce a policy they predate. Real environments should pin; the empty default is the
+    brownfield on-ramp, and preflight says out loud when it is taking it.
+    """
+    for tool in tools:
+        want = str(CONFIG.get(PINNED_TOOLS[tool]) or "").strip()
+        if not want:
+            log(f"{tool}: no version pinned ({PINNED_TOOLS[tool]} is empty) — check skipped")
+            continue
+        if tool in _version_checked and not force:
+            continue
+        have = tool_version(tool)
+        if have is None:
+            raise SystemExit(
+                f"{tool} is pinned to {want} in platform.env.yaml but its version could "
+                f"not be determined ({'not on PATH' if not shutil.which(tool) else 'unparseable --version output'})."
+            )
+        if have != want:
+            raise SystemExit(
+                f"{tool} version mismatch: runner has {have}, platform.env.yaml pins "
+                f"{PINNED_TOOLS[tool]}={want}. Rendering with the wrong version silently "
+                "changes manifest shape. Install the pinned version on this runner, or "
+                "update the pin and re-run the full test suite."
+            )
+        _version_checked.add(tool)
+        log(f"{tool} {have} matches pinned {PINNED_TOOLS[tool]}")
 
 
 # --------------------------------------------------------------------------------------
@@ -747,6 +969,12 @@ def cmd_ensure_gitrepo(args) -> None:
 
 
 def cmd_render(args) -> None:
+    # Checked here and not only in preflight. preflight is a separate workflow step, so it
+    # proves the runner was sane at the top of the job — not that THIS render used the
+    # pinned binary. Anyone replaying a render by hand skips preflight entirely. The check
+    # memoises, so it costs one subprocess per process, not one per workload.
+    check_tool_versions(["score-k8s"])
+
     work, catalog, app_dir = Path(args.work), Path(args.catalog), Path(args.app_dir)
     if work.exists():
         shutil.rmtree(work)
@@ -1355,6 +1583,16 @@ def cmd_preflight(args) -> None:
         log(f"found {tool} at {shutil.which(tool)}")
     log(f"python {sys.version.split()[0]}, pyyaml {yaml.__version__}")
 
+    # score-compose is not needed to deploy — it belongs to the local-development and
+    # stack-CI paths — so the orchestrator's own preflight does not demand it. A stack's
+    # CI passes --require-score-compose and gets the same pinning guarantee.
+    pinned = ["score-k8s"]
+    if getattr(args, "require_score_compose", False):
+        if not shutil.which("score-compose"):
+            raise SystemExit("score-compose requested but not on PATH")
+        pinned.append("score-compose")
+    check_tool_versions(pinned, force=True)
+
     if args.require_cluster:
         cp = kubectl(["version", "--output=json"], kubeconfig=args.kubeconfig,
                      check=False, capture=True)
@@ -1436,6 +1674,8 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("preflight")
     p.add_argument("--require-cluster", action="store_true")
+    p.add_argument("--require-score-compose", action="store_true",
+                   help="also demand score-compose at its pinned version (stack CI, local dev)")
     p.add_argument("--kubeconfig")
     p.set_defaults(func=cmd_preflight)
 

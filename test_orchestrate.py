@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -1461,3 +1462,324 @@ def test_kho_công_khai_không_có_credential_vẫn_tạo(tmp_path, monkeypatch)
         app="app", env="staging", config_dir=str(r), kubeconfig=None, work=str(tmp_path)))
     body = json.loads((tmp_path / "gitrepo-app-staging.json").read_text())
     assert "clientSecretName" not in body["spec"]
+
+
+# =====================================================================================
+# PHASE 0 — naming, path and digest contracts
+# =====================================================================================
+# These functions decide the NAME of live Kubernetes objects and the PATH a secret is read
+# from. A change to any of them renames a running resource or moves a secret out from under
+# a running app, so they are pinned by test rather than left to whoever refactors next.
+
+# ------------------------------------------------------------------------- vault paths
+def test_vault_path_is_derived_from_config_not_from_the_app():
+    """The app supplies `name` and nothing else; mount and layout come from platform config.
+
+    Read the other way round: there is no app-supplied input that can change which prefix
+    the path lands under, which is what makes the per-app Vault policy enforceable.
+    """
+    assert orc.vault_path("payment-api", "staging", "stripe") == "kv/apps/payment-api/staging/stripe"
+    assert orc.vault_path("payment-api", "prod", "stripe") == "kv/apps/payment-api/prod/stripe"
+
+
+def test_vault_path_follows_a_relocated_mount(monkeypatch):
+    """Company Vault will not have a mount called `kv`. Moving it must be a config edit."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"vault": {
+        "kv_mount": "secret/platform",
+        "path_template": "teams/{application}/{environment}/{name}",
+    }}))
+    assert orc.vault_path("order", "prod", "db") == "secret/platform/teams/order/prod/db"
+
+
+def test_vault_path_carries_no_kv_v2_data_infix():
+    """VSO inserts /data/ itself for kv-v2. Baking it in here double-prefixes on v2 and
+    breaks v1 outright — and the failure surfaces as 'permission denied', which reads like
+    a policy problem and sends you looking in the wrong place entirely."""
+    assert "/data/" not in orc.vault_path("app", "staging", "creds")
+
+
+@pytest.mark.parametrize("bad", [
+    "../admin", "a/b", "stripe/../../root", "-leading", "trailing-",
+    "", "UPPER", "sp ace", "a" * 64, "dots.not.allowed",
+])
+def test_vault_path_refuses_a_name_that_could_move_the_path(bad):
+    """`name` is the ONLY app-controlled path segment, so it is the whole attack surface."""
+    with pytest.raises(SystemExit, match="invalid secret name"):
+        orc.vault_path("app", "staging", bad)
+
+
+def test_vault_path_refuses_production_as_an_alias_for_prod():
+    """Two spellings for one environment is how a values block silently never applies."""
+    with pytest.raises(SystemExit, match="unknown environment"):
+        orc.vault_path("app", "production", "stripe")
+
+
+def test_unknown_template_placeholder_is_fatal(monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"vault": {"path_template": "apps/{application}/{tenant}/{name}"}}))
+    with pytest.raises(SystemExit, match="unknown placeholder"):
+        orc.vault_path("app", "staging", "stripe")
+
+
+# --------------------------------------------------------------- generated object names
+def test_resource_name_is_readable_and_dns_safe():
+    name = orc.resource_name("payment-api", "staging", "web", "stripe")
+    assert orc.DNS_LABEL.match(name), name
+    assert name.startswith("idp-payment-api-staging-web-stripe-")
+    assert len(name) <= 63
+
+
+def test_resource_name_fits_in_a_label_even_for_absurd_inputs():
+    """63 characters is a hard Kubernetes limit. Exceeding it is an apply-time rejection
+    for an object the renderer already promised, i.e. a green render and a dead deploy."""
+    name = orc.resource_name("a" * 80, "staging", "b" * 80, "c" * 80)
+    assert len(name) <= 63 and orc.DNS_LABEL.match(name), name
+
+
+def test_truncated_names_still_separate():
+    """The readable part of these two collides after truncation; the hash is over the FULL
+    tuple, so the names must still differ. Without this, two apps share one Secret."""
+    a = orc.resource_name("x" * 70, "staging", "web", "alpha")
+    b = orc.resource_name("x" * 70, "staging", "web", "beta")
+    assert a[:40] == b[:40] and a != b
+
+
+def test_resource_name_component_boundaries_are_not_ambiguous():
+    """('a-b','c') and ('a','b-c') slug to the same string; the separator must keep them
+    apart or two different resources render to one name."""
+    assert orc.resource_name("a-b", "c") != orc.resource_name("a", "b-c")
+
+
+def test_resource_name_is_stable_across_processes():
+    """Python's hash() is salted per process, so using it would rename every generated
+    object on every render — the exact churn the state store exists to prevent, sneaking
+    back in through the naming function."""
+    import sys as _sys
+    code = ("import orchestrate as o;"
+            "print(o.resource_name('payment-api','staging','web','stripe'))")
+    runs = {
+        subprocess.run([_sys.executable, "-c", code], cwd=CATALOG, text=True,
+                       capture_output=True, check=True,
+                       env={**os.environ, "PYTHONHASHSEED": seed}).stdout.strip()
+        for seed in ("0", "1", "12345")
+    }
+    assert len(runs) == 1, f"name is not process-stable: {runs}"
+    assert runs.pop() == orc.resource_name("payment-api", "staging", "web", "stripe")
+
+
+# --------------------------------------------------------------------- promotion digest
+PROD_VALUES = {
+    "application": {"LOG_LEVEL": "info", "FEATURE_X": "false"},
+    "environments": {
+        "staging": {"LOG_LEVEL": "debug"},
+        "prod": {"PUBLIC_HOST": "payment-api.internal",
+                 "STRIPE_KEY": {"secretRef": {"name": "stripe", "key": "api_key"}}},
+    },
+}
+
+
+def test_prod_digest_ignores_key_order_and_comments():
+    """Digest describes the DATA. Re-indenting a YAML file or sorting its keys is not a
+    configuration change and must not make a promotion fail."""
+    reordered = {
+        "environments": {
+            "prod": {"STRIPE_KEY": {"secretRef": {"key": "api_key", "name": "stripe"}},
+                     "PUBLIC_HOST": "payment-api.internal"},
+            "staging": {"LOG_LEVEL": "debug"},
+        },
+        "application": {"FEATURE_X": "false", "LOG_LEVEL": "info"},
+    }
+    assert orc.values_digest(PROD_VALUES) == orc.values_digest(reordered)
+
+
+def test_prod_digest_is_blind_to_staging_only_changes():
+    """Otherwise every staging tweak invalidates the prod promotion record, the guard cries
+    wolf, and the first thing anyone does is stop trusting it."""
+    changed = json.loads(json.dumps(PROD_VALUES))
+    changed["environments"]["staging"]["LOG_LEVEL"] = "trace"
+    assert orc.values_digest(PROD_VALUES) == orc.values_digest(changed)
+
+
+def test_prod_digest_moves_when_prod_literal_changes():
+    changed = json.loads(json.dumps(PROD_VALUES))
+    changed["environments"]["prod"]["PUBLIC_HOST"] = "elsewhere.internal"
+    assert orc.values_digest(PROD_VALUES) != orc.values_digest(changed)
+
+
+def test_prod_digest_moves_when_the_shared_application_block_changes():
+    """`application` feeds prod through precedence, so it is part of prod's inputs."""
+    changed = json.loads(json.dumps(PROD_VALUES))
+    changed["application"]["LOG_LEVEL"] = "warn"
+    assert orc.values_digest(PROD_VALUES) != orc.values_digest(changed)
+
+
+def test_prod_digest_moves_when_a_secret_is_repointed():
+    """Same variable, different Vault key. No literal changed, but production would read a
+    different secret — that has to count as a change."""
+    changed = json.loads(json.dumps(PROD_VALUES))
+    changed["environments"]["prod"]["STRIPE_KEY"]["secretRef"]["key"] = "restricted_key"
+    assert orc.values_digest(PROD_VALUES) != orc.values_digest(changed)
+
+
+def test_digest_of_absent_values_is_well_defined():
+    """Apps with no values file must not crash the promotion guard."""
+    assert orc.values_digest({}) == orc.values_digest({"environments": {}})
+
+
+# =====================================================================================
+# PHASE 0 — toolchain pinning
+# =====================================================================================
+def test_tool_version_parses_the_real_binary():
+    """Guards the regex against the go version on the same line: score-k8s prints
+    'score-k8s 0.15.0 (go1.26.4 - linux/amd64)' and 1.26.4 must not win."""
+    if not HAS_SCORE_K8S:
+        pytest.skip("score-k8s not installed")
+    version = orc.tool_version("score-k8s")
+    assert version and re.match(r"^\d+\.\d+\.\d+", version)
+    assert not version.startswith("1.26"), "picked up the Go toolchain version"
+
+
+def test_version_mismatch_is_fatal(monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"ci": {"score_k8s_version": "9.9.9"}}))
+    monkeypatch.setattr(orc, "tool_version", lambda t: "0.15.0")
+    monkeypatch.setattr(orc, "_version_checked", set())
+    with pytest.raises(SystemExit, match="version mismatch"):
+        orc.check_tool_versions(["score-k8s"])
+
+
+def test_matching_version_passes(monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"ci": {"score_k8s_version": "0.15.0"}}))
+    monkeypatch.setattr(orc, "tool_version", lambda t: "0.15.0")
+    monkeypatch.setattr(orc, "_version_checked", set())
+    orc.check_tool_versions(["score-k8s"])
+
+
+def test_empty_pin_skips_the_check(monkeypatch):
+    """The brownfield on-ramp. Runners that predate this feature must keep deploying."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"ci": {"score_k8s_version": ""}}))
+    monkeypatch.setattr(orc, "tool_version", lambda t: pytest.fail("must not be consulted"))
+    monkeypatch.setattr(orc, "_version_checked", set())
+    orc.check_tool_versions(["score-k8s"])
+
+
+def test_pinned_but_missing_binary_is_fatal(monkeypatch):
+    """A pin plus an unreadable version is not 'probably fine' — it is unknown, and the
+    whole point of pinning is that unknown is not good enough."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"ci": {"score_k8s_version": "0.15.0"}}))
+    monkeypatch.setattr(orc, "tool_version", lambda t: None)
+    monkeypatch.setattr(orc, "_version_checked", set())
+    with pytest.raises(SystemExit, match="could not be determined"):
+        orc.check_tool_versions(["score-k8s"])
+
+
+@needs_score_k8s
+def test_render_refuses_a_mismatched_binary_before_touching_the_catalog(tmp_path, monkeypatch):
+    """The Phase 0 gate: a wrong binary fails BEFORE render, not after Fleet applied."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"ci": {"score_k8s_version": "0.0.1-nope"}}))
+    monkeypatch.setattr(orc, "_version_checked", set())
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", score_spec("web"))
+    work = tmp_path / "work"
+    with pytest.raises(SystemExit, match="version mismatch"):
+        orc.cmd_render(orc.argparse.Namespace(
+            app="web", image="web", tag="sha1", env="staging", registry="h.io/p",
+            catalog=str(CATALOG), app_dir=str(app_dir), work=str(work),
+            out=str(tmp_path / "out.yaml"), kubeconfig=None,
+            state_file=str(tmp_path / "state.yaml"), no_state=False, tag_strategy="commit"))
+    assert not (work / "manifests.yaml").exists(), "render started despite the mismatch"
+
+
+# =====================================================================================
+# PHASE 0 — feature flags default off
+# =====================================================================================
+def test_every_new_capability_is_off_by_default():
+    """A platform that already deploys real apps must not gain behaviour by upgrading."""
+    fresh = orc.EnvConfig({})
+    assert not any(fresh.get(f"features.{n}") for n in (
+        "application_values", "vault_secrets", "postgres_application", "stack_onboarding"))
+
+
+def test_the_repos_own_config_ships_with_every_feature_off():
+    """platform.env.yaml is what the sandbox deploys with. If a flag lands on by accident,
+    the 'off by default' promise is only true for installs that have no config file."""
+    shipped = orc.EnvConfig.load(str(CATALOG / "platform.env.yaml"))
+    for name in ("application_values", "vault_secrets", "postgres_application",
+                 "stack_onboarding"):
+        assert shipped.get(f"features.{name}") is False, name
+
+
+def test_company_config_also_ships_with_every_feature_off():
+    shipped = orc.EnvConfig.load(str(CATALOG / "platform.env.company.yaml"))
+    for name in ("application_values", "vault_secrets", "postgres_application",
+                 "stack_onboarding"):
+        assert shipped.get(f"features.{name}") is False, name
+
+
+# =====================================================================================
+# PHASE 0 — integration gates against the pinned binary
+# =====================================================================================
+@needs_score_k8s
+def test_placeholders_resolve_inside_resource_params(tmp_path):
+    """The gate the node-fullstack golden path depends on.
+
+    Same-origin routing means the route provisioner needs its hostname from an environment
+    resource: `params.host: "${resources.hostname.host}"`. score-k8s substitutes inside
+    `variables` and file contents for certain, but `resources.*.params` is a different code
+    path — and if it does NOT substitute, the HTTPRoute is created with the literal string
+    '${resources.hostname.host}' as its hostname. That attaches to the gateway, reports
+    healthy, and is simply never routed to. Verified here against the pinned binary before
+    any template ships that assumes it works.
+    """
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", {
+        "apiVersion": "score.dev/v1b1",
+        "metadata": {"name": "web"},
+        "containers": {"main": {"image": "."}},
+        "service": {"ports": {"http": {"port": 8080, "targetPort": 8080}}},
+        "resources": {
+            "hostname": {"type": "dns"},
+            "route": {"type": "route",
+                      "params": {"host": "${resources.hostname.host}", "port": 8080,
+                                 "path": "/api"}},
+        },
+    })
+    args = orc.argparse.Namespace(
+        app="web", image="web", tag="sha1", env="staging", registry="h.io/p",
+        catalog=str(CATALOG), app_dir=str(app_dir), work=str(tmp_path / "work"),
+        out=str(tmp_path / "out.yaml"), kubeconfig=None,
+        state_file=str(tmp_path / "state.yaml"), no_state=False, tag_strategy="commit")
+    orc.cmd_render(args)
+
+    route = next(d for d in orc.load_all(Path(args.work) / "manifests.yaml")
+                 if d["kind"] == "HTTPRoute")
+    hostnames = route["spec"]["hostnames"]
+    assert not any("${" in h for h in hostnames), f"placeholder left unresolved: {hostnames}"
+    # The dns provisioner builds <workload>.<env.domain> from platform.env.yaml.
+    assert hostnames == ["web." + orc.CONFIG.get("environments.staging.domain")]
+    assert route["spec"]["rules"][0]["matches"][0]["path"]["value"] == "/api"
+
+
+@needs_score_k8s
+def test_two_renders_of_one_input_are_byte_identical(tmp_path):
+    """Determinism gate. Not just 'the names are stable' — the whole published manifest.
+
+    This is what makes a re-render safe to diff against what is already in the config repo.
+    If rendering twice produces two different files, every deploy shows a diff, real changes
+    stop standing out, and reviewing the config repo becomes theatre.
+    """
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    for f in (CATALOG / "examples" / "microservices").glob("score-*.yaml"):
+        shutil.copyfile(f, app_dir / f.name)
+    state = tmp_path / "state.yaml"
+
+    def render(tag: str) -> bytes:
+        args = orc.argparse.Namespace(
+            app="boutique", image="boutique", tag="abc123", env="staging",
+            registry="h.io/p", catalog=str(CATALOG), app_dir=str(app_dir),
+            work=str(tmp_path / tag), out=str(tmp_path / f"{tag}.yaml"),
+            kubeconfig=None, state_file=str(state), no_state=False, tag_strategy="commit")
+        orc.cmd_render(args)
+        return Path(args.out).read_bytes()
+
+    assert render("run1") == render("run2")
