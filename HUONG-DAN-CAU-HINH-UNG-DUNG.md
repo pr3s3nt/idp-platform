@@ -148,6 +148,46 @@ app A đọc được bí mật của app B chỉ bằng cách gõ đúng chuỗ
 Ghi giá trị vào Vault là việc riêng, không đi qua Git và không đi qua CI. Xem
 `docs/adr/0002-vault-only-secret-store.md`.
 
+### Ghi giá trị vào Vault
+
+Bạn cần một Vault token có policy ghi của app (Platform/Vault Ops cấp khi onboard). Giá
+trị **chỉ vào qua nhập ẩn hoặc stdin** — cố tình không có cờ `--value`, vì tham số dòng
+lệnh nằm trong history của shell và trong `ps` của mọi user khác trên cùng máy:
+
+```bash
+export VAULT_ADDR=https://vault.<công-ty>   # địa chỉ BẠN gọi được, không phải của cụm
+export VAULT_TOKEN=...                      # token của BẠN, không bao giờ của CI
+
+python3 orchestrate.py secret-set --app payment-api --env staging \
+  --name stripe --key api_key            # nhập ẩn, gõ hai lần
+
+printf '%s' "$KEY" | python3 orchestrate.py secret-set --app payment-api --env staging \
+  --name stripe --key api_key --stdin    # hoặc qua stdin
+```
+
+Mặc định là **vá đúng khoá đó**, không đụng các khoá khác trong cùng secret. Lần đầu tạo
+secret thì thêm `--replace` (vá không tạo được thứ chưa tồn tại — lệnh sẽ nói đúng câu đó).
+
+Đường dẫn do platform suy ra, giống hệt đường app đọc: đó chính là lý do dùng lệnh này
+thay vì `vault kv put` bằng tay — gõ nhầm một đoạn path là "permission denied" trên một
+đường dẫn trông rất đúng.
+
+### Sau khi ghi: chuyện gì xảy ra
+
+Platform sinh cho **mỗi (workload, secret)** một `VaultStaticSecret`. VSO đọc Vault rồi
+tạo Kubernetes Secret; container nhận biến qua `secretKeyRef`. Trong Git chỉ có tham
+chiếu, không bao giờ có giá trị.
+
+- Secret đích **chỉ chứa những khoá workload đó khai**. Thêm khoá mới vào Vault không tự
+  chảy sang app.
+- **Xoay vòng**: ghi giá trị mới, trong vòng `refreshAfter` (mặc định 5 phút) VSO cập nhật
+  Secret và restart **đúng một lần** Deployment tương ứng. Không đổi gì thì không restart.
+- Pod có thể **thoáng qua** `CreateContainerConfigError` ngay sau khi deploy — Fleet apply
+  Deployment và VaultStaticSecret cùng lúc. Nó phải tự hết trong vài chục giây; `verify`
+  chờ đúng việc đó.
+- Vault sập **không** làm chết app đang chạy: Secret đã đồng bộ vẫn còn, chỉ là không cập
+  nhật được cho tới khi Vault trở lại.
+
 ### Bí mật trong file
 
 File lấy từ bí mật được mount thẳng từ Kubernetes Secret, nên nội dung phải là **đúng một
@@ -226,6 +266,11 @@ Sửa riêng khối `staging` không ảnh hưởng dấu vân tay prod.
 | `mixes a secret reference with other content` | Xem mục 4 — thường là `\|` thay vì `\|-`. |
 | `declare a 'type: environment' resource, but features.application_values is off` | Platform chưa bật cờ. Liên hệ Platform team. |
 | `prod values have changed since the last prod render` | Dùng `--mode re-render`. |
+| `is a secretRef, but features.vault_secrets is off` | Platform chưa bật secret. Liên hệ Platform team. |
+| `bí mật chưa được VSO đồng bộ sau …s` + `empty response from Vault` | Chưa ai ghi giá trị vào đường dẫn Vault in kèm. Chạy `secret-set --replace`. |
+| `… + permission denied` | Đã ghi nhưng role của app không đọc được tiền tố đó — sai app/env, hoặc chưa onboard. Gửi Platform team đúng dòng lỗi (nó có sẵn đường dẫn). |
+| `VaultStaticSecret … chưa có trên cụm` | Fleet chưa apply bản render mới. Đợi/kiểm GitRepo, chưa cần động tới Vault. |
+| Biến vẫn là giá trị CŨ sau khi xoay vòng | Biến môi trường chỉ đọc lúc container khởi động. Chờ VSO restart (trong `refreshAfter`), đừng sửa tay. |
 
 ---
 

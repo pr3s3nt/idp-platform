@@ -2661,3 +2661,407 @@ def test_auth_global_qualifies_the_connection_with_its_namespace(vault_cfg):
     controller log nobody is watching rather than at apply time."""
     vault_cfg(operator_namespace="vso-system", connection_name="corp")
     assert orc.vault_auth_global_manifest()["spec"]["vaultConnectionRef"] == "vso-system/corp"
+
+
+# =====================================================================================
+# PHASE 3 — app secrets: bindings and generated VaultStaticSecrets
+# =====================================================================================
+@pytest.fixture
+def secrets_enabled(monkeypatch):
+    """The repo's real config with both application_values and vault_secrets on."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("features", {}).update(
+        {"application_values": True, "vault_secrets": True})
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+
+
+SECRET_VALUES = values_doc(
+    application={"LOG_LEVEL": "info",
+                 "STRIPE_KEY": {"secretRef": {"name": "stripe", "key": "api_key"}}},
+    staging={"LOG_LEVEL": "debug"})
+
+SECRET_SCORE = {
+    "apiVersion": "score.dev/v1b1",
+    "metadata": {"name": "payment-api"},
+    "containers": {"app": {"image": ".", "variables": {
+        "LOG_LEVEL": "${resources.app-config.LOG_LEVEL}",
+        "STRIPE_KEY": "${resources.app-config.STRIPE_KEY}"}}},
+    "service": {"ports": {"http": {"port": 8080, "targetPort": 8080}}},
+    "resources": {"app-config": {"type": "environment"}},
+}
+
+
+def test_a_secret_is_bound_per_workload_not_per_app(secrets_enabled):
+    """Two workloads reading the same logical secret get two destination Secrets.
+
+    Not tidiness: the destination Secret is mounted into that workload's pods, so sharing
+    one across workloads hands the payment key to the worker that only needed the queue
+    password."""
+    resolved = {"STRIPE_KEY": {"secretRef": {"name": "stripe", "key": "api_key"}}}
+    bindings = orc.secret_bindings("payment-api", "staging", resolved,
+                                   {"web": {"STRIPE_KEY"}, "worker": {"STRIPE_KEY"}})
+    assert [b["workload"] for b in bindings] == ["web", "worker"]
+    assert len({b["destination"] for b in bindings}) == 2
+
+
+def test_keys_of_one_logical_secret_share_one_binding(secrets_enabled):
+    """One VaultStaticSecret per logical secret, so both keys land in the same sync.
+
+    Two CRs on one Vault path sync independently, and there is a window where the app runs
+    the new api_key with the old webhook_secret."""
+    resolved = {
+        "STRIPE_KEY": {"secretRef": {"name": "stripe", "key": "api_key"}},
+        "STRIPE_HOOK": {"secretRef": {"name": "stripe", "key": "webhook_secret"}},
+    }
+    bindings = orc.secret_bindings("payment-api", "staging", resolved,
+                                   {"web": {"STRIPE_KEY", "STRIPE_HOOK"}})
+    assert len(bindings) == 1
+    assert bindings[0]["keys"] == {"STRIPE_KEY": "api_key", "STRIPE_HOOK": "webhook_secret"}
+
+
+def test_a_secret_no_workload_uses_produces_no_binding(secrets_enabled):
+    """No reader, no VaultStaticSecret: otherwise a real secret is pulled into the cluster
+    for nobody."""
+    resolved = {"STRIPE_KEY": {"secretRef": {"name": "stripe", "key": "api_key"}}}
+    assert orc.secret_bindings("payment-api", "staging", resolved, {"web": {"LOG_LEVEL"}}) == []
+
+
+def test_binding_names_are_stable_dns_safe_and_environment_scoped(secrets_enabled):
+    resolved = {"K": {"secretRef": {"name": "stripe", "key": "api_key"}}}
+    used = {"web": {"K"}}
+    staging = orc.secret_bindings("payment-api", "staging", resolved, used)[0]
+    again = orc.secret_bindings("payment-api", "staging", resolved, used)[0]
+    prod = orc.secret_bindings("payment-api", "prod", resolved, used)[0]
+    assert staging["destination"] == again["destination"]        # deterministic
+    assert staging["destination"] != prod["destination"]         # never shared across envs
+    assert orc.DNS_LABEL.match(staging["destination"])
+    assert len(staging["destination"]) <= 63
+
+
+def test_generated_cr_reads_only_the_keys_the_workload_asked_for(secrets_enabled):
+    """`includes` alone is not enough — see excludeRaw below."""
+    binding = orc.secret_bindings(
+        "payment-api", "staging",
+        {"A": {"secretRef": {"name": "stripe", "key": "api_key"}}},
+        {"web": {"A"}})[0]
+    spec = orc.vault_static_secret_doc(binding, app="payment-api", env="staging")["spec"]
+    assert spec["destination"]["transformation"]["includes"] == ["^api_key$"]
+
+
+def test_generated_cr_excludes_the_raw_payload(secrets_enabled):
+    """Measured on VSO 1.5.0: without excludeRaw the destination Secret also carries `_raw`
+    — the ENTIRE Vault secret as JSON. `includes` filters the named keys while `_raw` hands
+    over every one of them anyway, so the per-workload filter above becomes decorative."""
+    binding = orc.secret_bindings(
+        "payment-api", "staging",
+        {"A": {"secretRef": {"name": "stripe", "key": "api_key"}}},
+        {"web": {"A"}})[0]
+    spec = orc.vault_static_secret_doc(binding, app="payment-api", env="staging")["spec"]
+    assert spec["destination"]["transformation"]["excludeRaw"] is True
+
+
+def test_generated_cr_carries_rotation_settings(secrets_enabled):
+    """hmacSecretData false makes VSO unable to tell a rotation from a re-read: it either
+    ignores rolloutRestartTargets or restarts on every sync."""
+    binding = orc.secret_bindings(
+        "payment-api", "staging",
+        {"A": {"secretRef": {"name": "stripe", "key": "api_key"}}},
+        {"web": {"A"}})[0]
+    spec = orc.vault_static_secret_doc(binding, app="payment-api", env="staging")["spec"]
+    assert spec["hmacSecretData"] is True
+    assert spec["rolloutRestartTargets"] == [{"kind": "Deployment", "name": "web"}]
+    assert spec["refreshAfter"] == orc.CONFIG.get("vault.refresh_after")
+
+
+def test_generated_cr_authenticates_through_the_namespace_vault_auth(secrets_enabled):
+    """Never the VaultAuthGlobal: that authenticates as an identity shared with every
+    other namespace, which undoes the per-app Vault policy."""
+    binding = orc.secret_bindings(
+        "payment-api", "staging",
+        {"A": {"secretRef": {"name": "stripe", "key": "api_key"}}},
+        {"web": {"A"}})[0]
+    spec = orc.vault_static_secret_doc(binding, app="payment-api", env="staging")["spec"]
+    assert spec["vaultAuthRef"] == orc.CONFIG.get("vault.auth_ref")
+    assert "vaultAuthGlobalRef" not in spec
+
+
+def test_generated_cr_path_has_no_mount_prefix(secrets_enabled):
+    """VSO takes mount and path as two fields. A path that repeats the mount reads as
+    `kv/kv/apps/...` in Vault and fails as 'permission denied', not 'not found'."""
+    binding = orc.secret_bindings(
+        "payment-api", "staging",
+        {"A": {"secretRef": {"name": "stripe", "key": "api_key"}}},
+        {"web": {"A"}})[0]
+    doc = orc.vault_static_secret_doc(binding, app="payment-api", env="staging")
+    assert doc["spec"]["path"] == "apps/payment-api/staging/stripe"
+    assert doc["spec"]["mount"] == "kv"
+    assert orc.vault_path("payment-api", "staging", "stripe") == "kv/apps/payment-api/staging/stripe"
+
+
+def test_generated_cr_carries_no_value_only_coordinates(secrets_enabled):
+    binding = orc.secret_bindings(
+        "payment-api", "staging",
+        {"A": {"secretRef": {"name": "stripe", "key": "api_key"}}},
+        {"web": {"A"}})[0]
+    doc = orc.vault_static_secret_doc(binding, app="payment-api", env="staging")
+    assert "data" not in doc and "stringData" not in doc
+
+
+def test_secret_output_still_refuses_when_the_feature_is_off(tmp_path, monkeypatch):
+    """An app that opted in must fail loudly, not deploy with the variable missing."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("features", {}).update(
+        {"application_values": True, "vault_secrets": False})
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    with pytest.raises(SystemExit, match="features.vault_secrets is off"):
+        orc.write_environment_provisioner(
+            {"K": {"secretRef": {"name": "stripe", "key": "api_key"}}},
+            tmp_path / "p.yaml", app="payment-api", env="staging",
+            used_by_workload={"web": {"K"}})
+
+
+# =====================================================================================
+# PHASE 3 — integration: a secretRef becomes a secretKeyRef, never a value
+# =====================================================================================
+@needs_score_k8s
+def test_a_secret_ref_renders_as_a_secret_key_ref(tmp_path, secrets_enabled):
+    """The gate: the app writes `secretRef`, the container gets `valueFrom.secretKeyRef`,
+    and the value exists in neither the manifest nor anything else this render produced."""
+    app_dir = values_app(tmp_path, SECRET_SCORE, SECRET_VALUES)
+    docs = render_env(tmp_path, app_dir, "staging", "w")
+    dep = next(d for d in docs if d["kind"] == "Deployment")
+    env = {e["name"]: e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["LOG_LEVEL"]["value"] == "debug"
+    assert "value" not in env["STRIPE_KEY"]
+    ref = env["STRIPE_KEY"]["valueFrom"]["secretKeyRef"]
+    assert ref["key"] == "api_key"
+
+    vss = next(d for d in docs if d["kind"] == "VaultStaticSecret")
+    assert vss["spec"]["destination"]["name"] == ref["name"]
+    assert vss["spec"]["path"] == "apps/payment-api/staging/stripe"
+
+
+@needs_score_k8s
+def test_the_vault_cr_goes_to_git_and_the_secret_does_not(tmp_path, secrets_enabled):
+    """VaultStaticSecret is a reference, so Fleet owns it. The Secret it fills is a runtime
+    object owned by VSO and must never appear in the config repo."""
+    app_dir = values_app(tmp_path, SECRET_SCORE, SECRET_VALUES)
+    render_env(tmp_path, app_dir, "staging", "w")
+    committed = orc.load_all(tmp_path / "config" / "staging" / "manifests.yaml")
+    kinds = {d["kind"] for d in committed}
+    assert "VaultStaticSecret" in kinds
+    assert "Secret" not in kinds
+
+
+@needs_score_k8s
+def test_two_renders_with_a_secret_are_byte_identical(tmp_path, secrets_enabled):
+    """Names come from a SHA-256 of a stable tuple, not from state or a random suffix. A
+    changing name here is a new Secret, a new CR and a pod restart nobody asked for."""
+    app_dir = values_app(tmp_path, SECRET_SCORE, SECRET_VALUES)
+    render_env(tmp_path, app_dir, "staging", "w1")
+    first = (tmp_path / "config" / "staging" / "manifests.yaml").read_text()
+    render_env(tmp_path, app_dir, "staging", "w2")
+    assert (tmp_path / "config" / "staging" / "manifests.yaml").read_text() == first
+
+
+@needs_score_k8s
+def test_staging_and_prod_read_different_vault_paths(tmp_path, secrets_enabled):
+    """One score.yaml, one values file, two environments — and a staging credential must
+    never be what production authenticates with."""
+    app_dir = values_app(tmp_path, SECRET_SCORE, SECRET_VALUES)
+    paths = {}
+    for env, work in (("staging", "w1"), ("prod", "w2")):
+        docs = render_env(tmp_path, app_dir, env, work)
+        paths[env] = next(d for d in docs if d["kind"] == "VaultStaticSecret")["spec"]["path"]
+    assert paths == {"staging": "apps/payment-api/staging/stripe",
+                     "prod": "apps/payment-api/prod/stripe"}
+
+
+@needs_score_k8s
+def test_only_the_workload_that_asked_gets_the_secret(tmp_path, secrets_enabled):
+    """Two workloads, one secret, one consumer. The other workload must not end up with a
+    reference to a Secret it never asked for."""
+    # Both in subdirectories: a score.yaml at the root wins over subdirs, so a root file
+    # would hide the worker entirely and the test would pass for the wrong reason.
+    write(tmp_path / "app" / "api" / "score.yaml", SECRET_SCORE)
+    write(tmp_path / "app" / "worker" / "score.yaml", {
+        "apiVersion": "score.dev/v1b1",
+        "metadata": {"name": "worker"},
+        "containers": {"app": {"image": ".", "variables": {
+            "LOG_LEVEL": "${resources.app-config.LOG_LEVEL}"}}},
+        "resources": {"app-config": {"type": "environment"}},
+    })
+    write(tmp_path / "app" / ".score-values" / "values.yaml", SECRET_VALUES)
+    docs = render_env(tmp_path, tmp_path / "app", "staging", "w")
+
+    crs = [d for d in docs if d["kind"] == "VaultStaticSecret"]
+    assert [c["metadata"]["labels"]["idp.platform/workload"] for c in crs] == ["payment-api"]
+    worker = next(d for d in docs if d["kind"] == "Deployment"
+                  and d["metadata"]["name"] == "worker")
+    assert "secretKeyRef" not in json.dumps(worker)
+
+
+# =====================================================================================
+# PHASE 3 — verify waits for the secret before blaming the rollout
+# =====================================================================================
+def verify_args(**kw):
+    base = dict(app="payment-api", env="staging", kubeconfig=None, timeout=1, manifests=None)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+VSS_DOC = {
+    "kind": "VaultStaticSecret",
+    "metadata": {"name": "idp-x", "annotations": {
+        "idp.platform/logical-secret": "stripe",
+        "idp.platform/vault-path": "apps/payment-api/staging/stripe"},
+        "labels": {"idp.platform/application": "payment-api",
+                   "idp.platform/environment": "staging",
+                   "idp.platform/workload": "web"}},
+}
+
+
+def vss_cluster(monkeypatch, payload, returncode=0):
+    def fake_kubectl(args, *, kubeconfig=None, **kw):
+        return subprocess.CompletedProcess(args, returncode, json.dumps(payload), "NotFound")
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+
+
+def test_verify_accepts_a_synced_secret(monkeypatch):
+    vss_cluster(monkeypatch, {"status": {"conditions": [
+        {"status": "True", "reason": "SecretSynced", "message": "Secret synced"}]}})
+    ok, _ = orc.vault_secret_status(VSS_DOC, "payment-api-staging", verify_args())
+    assert ok
+
+
+def test_verify_reports_the_vault_path_and_reason_but_no_value(monkeypatch):
+    """The diagnostic has to be enough to act on — which app, which workload, which Vault
+    path, which reason — while never containing the thing it is protecting."""
+    vss_cluster(monkeypatch, {"status": {"conditions": [
+        {"status": "False", "reason": "VaultClientError",
+         "message": "Error making API request. Code: 403. permission denied"}]}})
+    ok, msg = orc.vault_secret_status(VSS_DOC, "payment-api-staging", verify_args())
+    assert not ok
+    assert "payment-api/staging" in msg and "[web]" in msg
+    assert "secret=stripe" in msg
+    assert "kv/apps/payment-api/staging/stripe" in msg
+    assert "VaultClientError" in msg and "permission denied" in msg
+
+
+def test_verify_says_so_when_the_cr_never_reached_the_cluster(monkeypatch):
+    """Distinct from 'not synced': this one means Fleet has not applied the render yet, and
+    looking at Vault policy would be a waste of time."""
+    vss_cluster(monkeypatch, {}, returncode=1)
+    ok, msg = orc.vault_secret_status(VSS_DOC, "payment-api-staging", verify_args())
+    assert not ok and "chưa có trên cụm" in msg
+
+
+def test_verify_fails_with_diagnostics_when_a_secret_never_syncs(monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"vault": {"initial_sync_timeout_seconds": 0}}))
+    vss_cluster(monkeypatch, {"status": {"conditions": [
+        {"status": "False", "reason": "VaultClientError", "message": "permission denied"}]}})
+    with pytest.raises(SystemExit, match="CreateContainerConfigError"):
+        orc.wait_for_vault_secrets([VSS_DOC], "payment-api-staging", verify_args())
+
+
+def test_verify_is_inert_for_an_app_with_no_secrets(monkeypatch):
+    """Every app deployed before this feature existed renders no VaultStaticSecret."""
+    def explode(*a, **k):
+        raise AssertionError("must not query the cluster when there is nothing to wait for")
+    monkeypatch.setattr(orc, "kubectl", explode)
+    orc.wait_for_vault_secrets([{"kind": "Deployment"}], "ns", verify_args())
+
+
+# =====================================================================================
+# PHASE 3 — writing a secret: `secret-set`
+# =====================================================================================
+def test_secret_set_has_no_value_flag():
+    """A value in argv is in the shell history and in `ps` for every other user on the box.
+    Neither can be un-leaked, so the flag does not exist."""
+    with pytest.raises(SystemExit):
+        orc.main(["--env-config", str(CATALOG / "platform.env.yaml"), "secret-set",
+                  "--app", "payment-api", "--env", "staging", "--name", "stripe",
+                  "--key", "api_key", "--value", "sk_live_1"])
+
+
+def test_secret_set_refuses_without_a_token(monkeypatch):
+    monkeypatch.delenv("VAULT_TOKEN", raising=False)
+    monkeypatch.setenv("VAULT_ADDR", "http://vault.test:8200")
+    with pytest.raises(SystemExit, match="VAULT_TOKEN"):
+        orc.cmd_secret_set(argparse.Namespace(
+            app="payment-api", env="staging", name="stripe", key="api_key",
+            stdin=True, replace=False))
+
+
+def test_secret_set_writes_where_the_app_will_read(monkeypatch, capsys):
+    """The one pairing that matters: written path must equal derived read path. Getting it
+    wrong by hand is the most common source of a 403 against a path that looks right."""
+    sent = {}
+
+    def fake_urlopen(request, timeout=None):
+        sent["url"] = request.full_url
+        sent["method"] = request.get_method()
+        sent["body"] = json.loads(request.data.decode())
+        sent["headers"] = {k.lower(): v for k, v in request.header_items()}
+
+        class R:
+            def read(self): return b""
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return R()
+
+    monkeypatch.setenv("VAULT_ADDR", "http://vault.test:8200")
+    monkeypatch.setenv("VAULT_TOKEN", "s.token")
+    monkeypatch.setattr(orc.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(orc.sys, "stdin", type("S", (), {"read": staticmethod(lambda: "sk_live_1\n")})())
+    orc.cmd_secret_set(argparse.Namespace(
+        app="payment-api", env="staging", name="stripe", key="api_key",
+        stdin=True, replace=False))
+
+    assert sent["url"] == "http://vault.test:8200/v1/kv/data/apps/payment-api/staging/stripe"
+    assert orc.vault_path("payment-api", "staging", "stripe") == "kv/apps/payment-api/staging/stripe"
+    assert sent["body"] == {"data": {"api_key": "sk_live_1"}}
+    # A patch, not a put: writing one key must not delete the others in the same secret.
+    assert sent["method"] == "PATCH"
+    # Neither the token nor the value may be logged.
+    assert "sk_live_1" not in capsys.readouterr().err
+
+
+def test_secret_set_replaces_only_when_asked(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["method"] = request.get_method()
+
+        class R:
+            def read(self): return b""
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return R()
+
+    monkeypatch.setenv("VAULT_ADDR", "http://vault.test:8200")
+    monkeypatch.setenv("VAULT_TOKEN", "s.token")
+    monkeypatch.setattr(orc.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(orc.sys, "stdin", type("S", (), {"read": staticmethod(lambda: "v")})())
+    orc.cmd_secret_set(argparse.Namespace(
+        app="payment-api", env="staging", name="stripe", key="api_key",
+        stdin=True, replace=True))
+    assert seen["method"] == "POST"
+
+
+def test_secret_set_refuses_a_name_that_could_move_the_path(monkeypatch):
+    monkeypatch.setenv("VAULT_ADDR", "http://vault.test:8200")
+    monkeypatch.setenv("VAULT_TOKEN", "s.token")
+    with pytest.raises(SystemExit, match="invalid secret name"):
+        orc.cmd_secret_set(argparse.Namespace(
+            app="payment-api", env="staging", name="../../root", key="api_key",
+            stdin=True, replace=False))
+
+
+def test_secret_set_keeps_a_trailing_space_in_the_value(monkeypatch):
+    """Only the newline the shell adds is stripped. A secret may legitimately end in
+    whitespace, and silently trimming it produces an auth failure nobody can explain."""
+    monkeypatch.setattr(orc.sys, "stdin",
+                        type("S", (), {"read": staticmethod(lambda: "sk_live_1 \n")})())
+    assert orc.read_secret_value(argparse.Namespace(stdin=True, key="api_key")) == "sk_live_1 "

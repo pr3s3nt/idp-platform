@@ -234,7 +234,7 @@ AI phải cập nhật bảng này trong quá trình làm. `Blocked` chỉ dùng
 | 0 — ADR, baseline, portability và toolchain | Done | Xem "Nhật ký Phase 0" bên dưới |
 | 1 — Environment Values, ConfigMap và promotion guard | Done | Xem "Nhật ký Phase 1" bên dưới |
 | 2 — Vault/VSO foundation trên harness | Done | Xem "Nhật ký Phase 2" bên dưới |
-| 3 — App secret integration | Not started | |
+| 3 — App secret integration | Done | Xem "Nhật ký Phase 3" bên dưới |
 | 4 — PostgreSQL capability/profile | Not started | |
 | 5 — Stack catalog và `score-compose` | Not started | |
 | 6 — Onboarding workflow/state machine | Not started | |
@@ -411,6 +411,75 @@ Người dùng phải xác nhận lại khi mang vào công ty: `vault.address` 
 role/policy của Vault Ops (`auth_role_template`, `policy_template`); ai được cấp policy
 GHI cho `prod`; namespace của VSO nếu công ty cài chỗ khác; `allowed_namespaces` nếu nhiều
 đội dùng chung cụm.
+
+#### Nhật ký Phase 3
+
+Branch `feature/secret-onboarding`, verify từ working tree tại SHA `17388f3` (Phase 2).
+
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **247 passed**
+(220 → 247, thêm 27 test). Không có test nào bị skip.
+
+Cơ chế: `secretRef` trong `.score-values/values.yaml` nay sinh ra một `VaultStaticSecret`
+cho **mỗi (workload, secret logic)** và một output `encodeSecretRef`, nên container nhận
+biến qua `secretKeyRef`. Provisioner sinh ra dùng `{{ if eq .SourceWorkload }}` để mỗi
+workload chỉ thấy Secret của chính nó.
+
+**Đo trên cụm `kind-staging`** với app fixture `secretdemo` (namespace riêng, đã xoá sau
+khi đo), render bằng `python3 orchestrate.py` gọi thẳng từ working tree của feature branch:
+
+| Kiểm chứng | Kết quả đo được |
+|---|---|
+| `secretRef` → `secretKeyRef` | biến `STRIPE_KEY` trong Deployment không có `value`, chỉ có `valueFrom.secretKeyRef` |
+| Giá trị trong pod đang chạy | `printenv STRIPE_KEY` = đúng giá trị đã ghi vào Vault |
+| Giá trị **không** vào Git | grep giá trị thật trong manifest/config repo: **0 lần**; `split` báo `0 secret(s)` |
+| Hai lần render cùng input | **giống nhau từng byte** (tên sinh từ SHA-256 của tuple ổn định, không dùng state) |
+| Lọc theo workload | Vault có `api_key` + `admin_token`; Secret đích của workload **chỉ có `api_key`** |
+| Ghi secret bằng `secret-set` | ghi qua stdin, log không in giá trị, đường dẫn ghi = đường dẫn app đọc |
+| **Xoay vòng đúng một lần** | một lần ghi → `generation` 3→4, **một** `restartedAt` mới, **một** pod mới; 9 lần lấy mẫu sau đó không đổi |
+| **Không có restart loop** | 13 lần lấy mẫu trong ~3,5 phút (7 chu kỳ refresh 30s): `generation`, `restartedAt`, tên pod, `restarts=0` — không đổi |
+| `verify` đường hạnh phúc | chờ VaultStaticSecret đồng bộ **trước**, rồi mới chờ rollout; exit 0 |
+
+**Lifecycle test trên cụm:**
+
+| Tình huống | Hành vi |
+|---|---|
+| Nguồn không tồn tại (chưa ai ghi secret) | `verify` fail đúng lúc, in `path=kv/apps/secretdemo/staging/stripe` + `err=empty response from Vault` |
+| Sai quyền (tiền tố app khác) | 403 `permission denied` — đo ở Phase 2, thông điệp đi qua đúng đường chẩn đoán này |
+| Xoá `VaultStaticSecret` | Secret đích bị thu hồi theo `ownerReference`, không còn Secret mồ côi |
+| **Vault sập** (`scale vault --replicas=0`) | app đang chạy **không bị ảnh hưởng** (pod Running, biến vẫn đúng); VSO báo `connection refused` rõ ràng; dựng lại Vault bằng `./tools/dung-vault-harness.sh` một lệnh |
+
+**Regression app legacy**: render `examples/simple-nginx` và `examples/app-with-postgres` ở
+`staging` và `prod`, baseline `36372b9` vs HEAD, dùng chung state file, render từ **bản
+sao** của thư mục app (lần trước render thẳng vào `examples/` đã sửa file được track — đã
+khôi phục). Cả 4 cặp **giống nhau từng byte**.
+
+**Lỗi thật thứ hai bắt được nhờ chạy trên cụm**: `destination.transformation.includes` lọc
+đúng các khoá đã nêu tên, nhưng VSO 1.5.0 vẫn thêm khoá `_raw` chứa **toàn bộ** secret
+Vault dưới dạng JSON — tức bộ lọc theo workload trở thành trang trí. Đo được vì Secret đích
+có `DATA=2` trong khi chỉ khai một khoá. Nay luôn sinh kèm `excludeRaw: true`, có test ghim.
+
+File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `HUONG-DAN-CAU-HINH-UNG-DUNG.md`.
+
+Config key mới: không có. Lệnh mới: `secret-set` (ghi một khoá vào Vault; **không có cờ
+`--value`** — giá trị chỉ qua nhập ẩn hoặc stdin, vì tham số dòng lệnh nằm trong history và
+trong `ps`). Tính năng bật bằng `features.vault_secrets: true`.
+
+Migration: app hiện có không cần làm gì. Opt-in bằng cách thêm `secretRef` vào values file
+rồi nhờ Platform onboard app vào Vault (`vault-onboard`).
+Rollback: đặt `features.vault_secrets: false`. App đã opt-in fail rõ ràng
+("features.vault_secrets is off") chứ không deploy thiếu biến.
+
+Hạn chế còn lại: `verify` mới kiểm `VaultStaticSecret`; thứ tự đầy đủ ở mục 7.4 (database
+Ready, migration Job, HTTPRoute Accepted, synthetic health check) thuộc các phase sau.
+Chưa kiểm chuyện Fleet có hoàn tác annotation `restartedAt` hay không (mục 7.3) — cần một
+app do Fleet quản lý thật sự, để lại cho Phase 7. Scanner theo entropy (mục 6) vẫn chưa
+làm. Rotation test 30 phút theo mục 7.3 mới chạy ~3,5 phút với `refreshAfter=30s` (7 chu
+kỳ) thay vì 30 phút với 5 phút — cùng số chu kỳ, ngắn hơn theo đồng hồ.
+
+Người dùng phải xác nhận lại khi mang vào công ty: `refreshAfter` phù hợp tải Vault công
+ty; ai được cấp policy ghi cho `prod`; Vault công ty có bật kv-v2 patch không (nếu chỉ cho
+`create/update`, dùng `--replace`); và `rolloutRestartTargets` chỉ hỗ trợ
+Deployment/StatefulSet/DaemonSet — workload dạng khác cần cách khác.
 
 ### 0.6. Stop conditions
 

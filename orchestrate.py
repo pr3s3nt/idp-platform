@@ -23,13 +23,17 @@ from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -312,6 +316,18 @@ def vault_path(app: str, env: str, name: str) -> str:
             "Only {application}, {environment} and {name} are substituted."
         )
     return f"{mount}/{path}"
+
+
+def vault_relative_path(app: str, env: str, name: str) -> str:
+    """The same path WITHOUT the mount prefix.
+
+    VSO takes mount and path as two separate fields, so the CR needs the path relative to
+    the mount while a `vault kv` command and every policy need the full one. Deriving both
+    from `vault_path` keeps them from drifting apart.
+    """
+    full = vault_path(app, env, name)
+    mount = CONFIG.get("vault.kv_mount") or "kv"
+    return full[len(mount) + 1:]
 
 
 def _slug(text: str) -> str:
@@ -686,41 +702,177 @@ def _go_template_safe(text: str) -> str:
     return text.replace("{{", '{{"{{"}}')
 
 
-def write_environment_provisioner(resolved: dict, dest: Path, *, app: str, env: str) -> Path:
+# ------------------------------------------------------------------- app secret bindings
+# One VaultStaticSecret per (workload, logical secret). Grouping by workload rather than
+# per app is the least-privilege choice: the destination Secret is mounted into that
+# workload's pods, so a worker that needs only the queue password never has a Secret
+# containing the payment key sitting in its namespace next to it.
+#
+# Grouping by LOGICAL SECRET rather than per key is what makes rotation atomic. One Vault
+# secret can hold `api_key` and `webhook_secret`; two CRs reading the same path would sync
+# independently, and there is a window where the app is running the new key with the old
+# webhook secret.
+def secret_bindings(app: str, env: str, resolved: dict,
+                    used_by_workload: dict[str, set[str]]) -> list[dict]:
+    """Which VaultStaticSecret each workload needs, derived from what it actually uses.
+
+    Deterministic in every respect — sorted, and named from a hash of a stable tuple — so
+    two renders of one input produce byte-identical manifests. Anything else shows up as
+    Fleet churn and, for a secret, as a pod restart nobody asked for.
+    """
+    groups: dict[tuple[str, str], dict] = {}
+    for workload in sorted(used_by_workload):
+        for key in sorted(used_by_workload[workload]):
+            value = resolved.get(key)
+            if not (isinstance(value, dict) and "secretRef" in value):
+                continue
+            ref = value["secretRef"]
+            name, vault_key = ref["name"], ref["key"]
+            group = groups.setdefault((workload, name), {
+                "workload": workload,
+                "secret": name,
+                "path": vault_relative_path(app, env, name),
+                "destination": resource_name(app, env, workload, name),
+                "keys": {},
+            })
+            # Two output keys may legitimately map to the same Vault key; both are kept.
+            group["keys"][key] = vault_key
+    return [groups[k] for k in sorted(groups)]
+
+
+def vault_static_secret_doc(binding: dict, *, app: str, env: str) -> dict:
+    """The CR that makes VSO pull one logical secret into one workload's namespace.
+
+    `includes` narrows the destination Secret to the keys this workload asked for. Vault
+    secrets accumulate keys over time — someone adds `admin_token` next to `api_key` — and
+    without the filter that new key lands in the workload's Secret automatically.
+
+    `excludeRaw` is what makes that filter mean anything. Measured on VSO 1.5.0: by default
+    the destination Secret also gets a `_raw` key holding the ENTIRE Vault secret as JSON,
+    so `includes` filters the named keys while `_raw` hands over every one of them anyway.
+    """
+    wanted = sorted(set(binding["keys"].values()))
+    return {
+        "apiVersion": VAULT_API,
+        "kind": "VaultStaticSecret",
+        "metadata": {
+            "name": binding["destination"],
+            "annotations": {"idp.platform/logical-secret": binding["secret"],
+                            "idp.platform/vault-path": binding["path"]},
+            "labels": _vault_labels(**{"idp.platform/application": app,
+                                       "idp.platform/environment": env,
+                                       "idp.platform/workload": binding["workload"]}),
+        },
+        "spec": {
+            # VaultAuth in this app's own namespace — never the VaultAuthGlobal, which
+            # would authenticate as an identity shared with every other namespace.
+            "vaultAuthRef": _vault_str("auth_ref") or "app-vault",
+            "mount": _vault_str("kv_mount") or "kv",
+            "type": _vault_str("kv_type") or "kv-v2",
+            "path": binding["path"],
+            "refreshAfter": _vault_str("refresh_after") or "5m",
+            # Explicit even though the CRD defaults it to true: with hmacSecretData false,
+            # VSO cannot tell a real rotation from a re-read, so it either ignores
+            # rolloutRestartTargets or restarts on every sync. Both failures are quiet.
+            "hmacSecretData": True,
+            "destination": {
+                "name": binding["destination"],
+                "create": True,
+                "transformation": {
+                    "includes": [f"^{re.escape(k)}$" for k in wanted],
+                    "excludeRaw": True,
+                },
+            },
+            # score-k8s names the Deployment after the workload.
+            "rolloutRestartTargets": [{"kind": "Deployment", "name": binding["workload"]}],
+        },
+    }
+
+
+# ------------------------------------------------------- generated environment provisioner
+def _go_template_safe(text: str) -> str:
+    """Neutralise `{{` in a value that is about to be embedded in a Go template.
+
+    Provisioner `outputs` is a Go template, so a literal value containing `{{ .Foo }}` —
+    entirely plausible in a config string for some other templating system — would be
+    evaluated by score-k8s instead of passed through.
+    """
+    return text.replace("{{", '{{"{{"}}')
+
+
+def _indent(text: str, spaces: int) -> str:
+    pad = " " * spaces
+    return "".join(f"{pad}{line}\n" if line.strip() else "\n" for line in text.splitlines())
+
+
+def write_environment_provisioner(resolved: dict, dest: Path, *, app: str, env: str,
+                                  used_by_workload: dict[str, set[str]] | None = None) -> Path:
     """Materialise a provisioner for `type: environment` carrying this app's values.
 
     Generated per render rather than shipped in the catalog because the values ARE the
     app's, and the catalog is shared and version-pinned. It lands in the work directory
     next to the resolved catalog, so a failed render leaves behind exactly the files
     score-k8s was handed.
+
+    Literals are emitted for every workload; secrets are emitted per workload, because a
+    `secretRef` resolves to a reference to a DIFFERENT Kubernetes Secret depending on which
+    workload is asking. Hence the `{{ if eq .SourceWorkload }}` guards: one provisioner
+    file, one branch per consumer.
     """
-    literals = {}
+    used_by_workload = used_by_workload or {}
+    literals, secret_keys = {}, []
     for key, value in sorted(resolved.items()):
         if isinstance(value, dict) and "secretRef" in value:
-            # Phase 3 turns these into encodeSecretRef outputs backed by a VaultStaticSecret.
-            # Until then, refusing beats rendering a workload with the variable missing.
             if not feature("vault_secrets"):
                 raise SystemExit(
                     f"{VALUES_REL}: {key!r} is a secretRef, but features.vault_secrets is "
                     "off for this platform. Enable it (and install the Vault Secrets "
                     "Operator) or use a literal value."
                 )
-            raise SystemExit(f"internal: secretRef output for {key!r} is not implemented yet")
+            secret_keys.append(key)
+            continue
         literals[key] = value
+
+    bindings = secret_bindings(app, env, resolved, used_by_workload) if secret_keys else []
+    if secret_keys and not bindings:
+        # The key exists and resolves, but nothing consumes it. Emitting a VaultStaticSecret
+        # anyway would pull a real secret into the cluster for no reader.
+        warn(f"{VALUES_REL}: secret value(s) {secret_keys} are not referenced by any "
+             "workload — no VaultStaticSecret generated for them.")
 
     body = yaml.safe_dump(literals, sort_keys=True, default_flow_style=False,
                           allow_unicode=True) if literals else "{}\n"
+    outputs = _indent(_go_template_safe(body), 4)
+    manifests = ""
+    for workload in sorted({b["workload"] for b in bindings}):
+        mine = [b for b in bindings if b["workload"] == workload]
+        refs = "".join(
+            f'{key}: {{{{ encodeSecretRef "{b["destination"]}" "{vault_key}" }}}}\n'
+            for b in mine for key, vault_key in sorted(b["keys"].items()))
+        outputs += f'    {{{{ if eq .SourceWorkload "{workload}" }}}}\n'
+        outputs += _indent(refs, 4)
+        outputs += "    {{ end }}\n"
+
+        docs = "".join(yaml.safe_dump([vault_static_secret_doc(b, app=app, env=env)],
+                                      sort_keys=False, default_flow_style=False)
+                       for b in mine)
+        manifests += f'    {{{{ if eq .SourceWorkload "{workload}" }}}}\n'
+        manifests += _indent(docs, 4)
+        manifests += "    {{ end }}\n"
+
     doc = (
         f"# GENERATED by orchestrate.py for {app}/{env} — do not edit, do not commit.\n"
-        f"# Source: {VALUES_REL}. Values are literals only; nothing here is a secret.\n"
+        f"# Source: {VALUES_REL}. Literal values only — a secretRef becomes a reference to\n"
+        "# a Secret that Vault Secrets Operator fills at runtime, never a value.\n"
         "- uri: template://platform/environment\n"
         "  type: environment\n"
         f"  description: ApplicationValues for {app} in {env}\n"
-        "  outputs: |\n"
-        + "".join(f"    {line}\n" for line in _go_template_safe(body).splitlines())
+        "  outputs: |\n" + outputs
+        + ("  manifests: |\n" + manifests if manifests else "")
     )
     dest.write_text(doc)
-    log(f"generated environment provisioner with {len(literals)} value(s) -> {dest}")
+    log(f"generated environment provisioner with {len(literals)} value(s) and "
+        f"{len(bindings)} vault secret binding(s) -> {dest}")
     return dest
 
 
@@ -1696,6 +1848,9 @@ def apply_application_values(services: list[Service], app_dir: Path, catalog_dir
 
     resolved = resolve_application_values(spec, env)
     used: set[str] = set()
+    # Per workload, not just the union: a secretRef becomes a reference to a Secret that
+    # belongs to ONE workload, so the renderer needs to know who asked for what.
+    used_by_workload: dict[str, set[str]] = {}
     consumers = 0
     for service, doc, alias in aliases:
         if alias is None:
@@ -1703,7 +1858,9 @@ def apply_application_values(services: list[Service], app_dir: Path, catalog_dir
         where = f"{service.path.name} ({service.workload})"
         consumers += 1
         check_file_secrets(doc, resolved, where=where)
-        used |= check_referenced_keys(doc, alias, resolved, where=where)
+        mine = check_referenced_keys(doc, alias, resolved, where=where)
+        used |= mine
+        used_by_workload.setdefault(service.workload, set()).update(mine)
 
     if not consumers:
         warn(f"{VALUES_REL} defines {len(resolved)} value(s) for {env}, but no workload "
@@ -1715,7 +1872,8 @@ def apply_application_values(services: list[Service], app_dir: Path, catalog_dir
         warn(f"{VALUES_REL}: value(s) not referenced by any workload in {env}: {unused}")
 
     return [write_environment_provisioner(
-        resolved, catalog_dir / "generated.environment.provisioners.yaml", app=app, env=env)]
+        resolved, catalog_dir / "generated.environment.provisioners.yaml", app=app, env=env,
+        used_by_workload=used_by_workload)]
 
 
 # ------------------------------------------------------------------- prod values digest
@@ -2261,6 +2419,71 @@ def cmd_promote(args) -> None:
 # --------------------------------------------------------------------------------------
 # preflight
 # --------------------------------------------------------------------------------------
+def vault_secret_status(doc: dict, ns: str, args) -> tuple[bool, str]:
+    """(synced?, một dòng chẩn đoán) cho một VaultStaticSecret.
+
+    Chẩn đoán KHÔNG BAO GIỜ chứa giá trị bí mật — chỉ toạ độ và lý do: app, môi trường,
+    workload, tên secret logic, đường dẫn Vault suy ra, condition và reason của VSO. Đó
+    đúng là bộ thông tin cần để biết phải sửa ở đâu (policy Vault? sai path? chưa ghi
+    secret?), và không có gì trong đó lộ ra thứ đang được bảo vệ.
+    """
+    name = doc["metadata"]["name"]
+    meta = doc["metadata"].get("annotations") or {}
+    labels = doc["metadata"].get("labels") or {}
+    where = (f"{labels.get('idp.platform/application', args.app)}/"
+             f"{labels.get('idp.platform/environment', args.env)}"
+             f"[{labels.get('idp.platform/workload', '?')}]"
+             f" secret={meta.get('idp.platform/logical-secret', '?')}"
+             f" path={_vault_str('kv_mount') or 'kv'}/{meta.get('idp.platform/vault-path', '?')}")
+
+    cp = kubectl(["get", "vaultstaticsecret", name, "-n", ns, "-o", "json"],
+                 kubeconfig=args.kubeconfig, check=False, capture=True)
+    if cp.returncode != 0:
+        return False, f"{where}: VaultStaticSecret {name} chưa có trên cụm (Fleet đã đồng bộ chưa?)"
+    obj = json.loads(cp.stdout or "{}")
+    conditions = (obj.get("status") or {}).get("conditions") or []
+    if not conditions:
+        return False, f"{where}: VSO chưa xử lý {name} (chưa có condition nào)"
+    cond = conditions[0]
+    if cond.get("status") == "True" and cond.get("reason") in ("Accepted", "SecretSynced", "Synced"):
+        return True, ""
+    return False, (f"{where}: chưa đồng bộ — reason={cond.get('reason')} "
+                   f"message={' '.join(str(cond.get('message', '')).split())[:200]}")
+
+
+def wait_for_vault_secrets(docs: list[dict], ns: str, args) -> None:
+    """Chờ mọi VaultStaticSecret vừa render báo đã đồng bộ, trong SLO đã cấu hình.
+
+    `CreateContainerConfigError` xuất hiện thoáng qua là BÌNH THƯỜNG: Fleet apply
+    Deployment và VaultStaticSecret cùng lúc, nên pod có thể khởi động trước khi Secret
+    kịp tồn tại. Định nghĩa hoàn thành là "tự hội tụ trong SLO", không phải "không bao giờ
+    thấy trạng thái đó".
+    """
+    targets = [d for d in docs if d.get("kind") == "VaultStaticSecret"]
+    if not targets:
+        return
+    timeout = int(CONFIG.get("vault.initial_sync_timeout_seconds", 60) or 60)
+    log(f"chờ {len(targets)} VaultStaticSecret trong {ns} đồng bộ (tối đa {timeout}s)")
+    deadline = time.time() + timeout
+    while True:
+        pending = [msg for ok, msg in
+                   (vault_secret_status(d, ns, args) for d in targets) if not ok]
+        if not pending:
+            log(f"tất cả {len(targets)} VaultStaticSecret đã đồng bộ")
+            return
+        if time.time() >= deadline:
+            break
+        time.sleep(5)
+    for line in pending:
+        print(f"::error::{line}", file=sys.stderr, flush=True)
+    raise SystemExit(
+        f"{args.app}/{args.env}: bí mật chưa được VSO đồng bộ sau {timeout}s. Pod sẽ kẹt ở "
+        "CreateContainerConfigError chừng nào Secret đích chưa tồn tại. Kiểm theo thứ tự: "
+        "secret đã được ghi vào đúng đường dẫn Vault ở trên chưa; role/policy của app có "
+        "đọc được tiền tố đó không; VaultAuth trong namespace có Ready không."
+    )
+
+
 def cmd_verify(args) -> None:
     """Chờ tới khi cụm THỰC SỰ chạy đúng thứ vừa render. Hết giờ là fail kèm chẩn đoán.
 
@@ -2274,8 +2497,16 @@ def cmd_verify(args) -> None:
     hỏi "ứng dụng có chạy không".
     """
     ns = app_namespace(args.app, args.env)
+    docs = load_all(Path(args.manifests))
+
+    # Secrets first, and on purpose. A workload whose Secret has not synced sits in
+    # CreateContainerConfigError, which the rollout check below reports as "0/1 replicas
+    # ready" — true, useless, and it sends whoever is paged to look at the image. Checking
+    # the VaultStaticSecret first turns the same failure into "Vault path X, reason Y".
+    wait_for_vault_secrets(docs, ns, args)
+
     want: dict[str, list[str]] = {}
-    for doc in load_all(Path(args.manifests)):
+    for doc in docs:
         if doc.get("kind") != "Deployment":
             continue
         containers = doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
@@ -2284,6 +2515,7 @@ def cmd_verify(args) -> None:
     if not want:
         log("không có Deployment nào để kiểm — bỏ qua")
         return
+
 
     log(f"chờ {len(want)} Deployment trong {ns} chạy đúng ảnh vừa render "
         f"(tối đa {args.timeout}s)")
@@ -2506,6 +2738,88 @@ def cmd_verify_rbac(args) -> None:
           args)
 
 
+def read_secret_value(args) -> str:
+    """Get the value from stdin or a hidden prompt. NEVER from an argument.
+
+    A value passed as `--value` lands in the shell history, in the process table where any
+    other user on the box can read it with `ps`, and in the CI log if this is ever scripted.
+    None of those are things you can un-leak, so the flag simply does not exist.
+    """
+    if args.stdin:
+        value = sys.stdin.read()
+        # Only the trailing newline the shell/pipe adds — a secret may legitimately end in
+        # whitespace, and silently stripping it produces an auth failure nobody can explain.
+        return value[:-1] if value.endswith("\n") else value
+    first = getpass.getpass(f"value for {args.key}: ")
+    if first != getpass.getpass("repeat: "):
+        raise SystemExit("the two values differ — nothing was written")
+    if not first:
+        raise SystemExit("empty value refused: an empty secret fails at runtime, not here")
+    return first
+
+
+def cmd_secret_set(args) -> None:
+    """Write one key of one logical secret into Vault, at the platform-derived path.
+
+    Run by a HUMAN (or the onboarding service acting for one), never by app CI — it needs
+    a Vault token with the write policy from `vault-onboard`. The path is derived exactly
+    like the reader's, so a secret written here is one the app's role can read: getting
+    that pairing wrong by hand is the single most common way this ends in 'permission
+    denied' against a path that looks right.
+    """
+    app, env = validate_secret_name(args.app), validate_environment(args.env)
+    name = validate_secret_name(args.name)
+    if not re.match(r"^[A-Za-z0-9._-]{1,253}$", args.key or ""):
+        raise SystemExit(f"invalid key {args.key!r}: letters, digits, '.', '_' and '-' only")
+
+    address = (os.environ.get("VAULT_ADDR") or "").rstrip("/")
+    token = os.environ.get("VAULT_TOKEN")
+    if not address or not token:
+        raise SystemExit(
+            "VAULT_ADDR and VAULT_TOKEN must be set. Deliberately not read from "
+            "platform.env.yaml: vault.address is the address the CLUSTER uses, which is "
+            "often unreachable from a laptop, and a token must never live in a config file."
+        )
+
+    path = vault_relative_path(app, env, name)
+    mount = _vault_str("kv_mount") or "kv"
+    kv_type = (_vault_str("kv_type") or "kv-v2").lower()
+    url = (f"{address}/v1/{mount}/data/{path}" if kv_type == "kv-v2"
+           else f"{address}/v1/{mount}/{path}")
+    value = read_secret_value(args)
+    payload = {"data": {args.key: value}} if kv_type == "kv-v2" else {args.key: value}
+
+    # kv-v2 patch (not put) so writing one key does not delete the others in the same
+    # secret — that would silently break every other workload reading the same path.
+    headers = {"X-Vault-Token": token, "Content-Type": "application/json"}
+    if kv_type == "kv-v2" and not args.replace:
+        headers["Content-Type"] = "application/merge-patch+json"
+        method = "PATCH"
+    else:
+        method = "POST"
+    if _vault_str("namespace"):
+        headers["X-Vault-Namespace"] = _vault_str("namespace")
+
+    request = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers=headers, method=method)
+    # Note what is NOT logged: the URL is, the token and value are not.
+    log(f"{method} {mount}/{path} (key {args.key}) for {app}/{env}")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:300]
+        if exc.code == 404 and method == "PATCH":
+            raise SystemExit(
+                f"{mount}/{path} does not exist yet, and a patch cannot create it. "
+                "Re-run with --replace to write the first version of this secret."
+            ) from None
+        raise SystemExit(f"Vault refused the write ({exc.code}): {detail}") from None
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"cannot reach Vault at {address}: {exc.reason}") from None
+    log(f"wrote {args.key} to {mount}/{path} — the value was not printed or stored locally")
+
+
 def cmd_config(args) -> None:
     """Expose platform.env.yaml to the workflow, so the YAML holds no infrastructure value.
 
@@ -2682,6 +2996,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--apply", action="store_true", help="kubectl apply phần Kubernetes")
     p.add_argument("--kubeconfig")
     p.set_defaults(func=cmd_vault_onboard)
+
+    # `idp-secret set` trong kế hoạch. Dành cho NGƯỜI, không cho CI: nó cần Vault token có
+    # policy ghi. Giá trị chỉ vào qua nhập ẩn hoặc stdin — không có cờ --value, vì tham số
+    # dòng lệnh nằm trong history và trong `ps` của mọi user khác trên máy.
+    p = sub.add_parser("secret-set",
+                       help="ghi một khoá bí mật vào Vault ở đúng đường dẫn platform suy ra")
+    p.add_argument("--app", required=True)
+    p.add_argument("--env", required=True, choices=("staging", "prod"))
+    p.add_argument("--name", required=True, help="tên secret logic, vd: stripe")
+    p.add_argument("--key", required=True, help="khoá bên trong secret đó, vd: api_key")
+    p.add_argument("--stdin", action="store_true", help="đọc giá trị từ stdin thay vì nhập ẩn")
+    p.add_argument("--replace", action="store_true",
+                   help="ghi đè toàn bộ secret (mặc định chỉ vá đúng khoá này)")
+    p.set_defaults(func=cmd_secret_set)
 
     p = sub.add_parser("verify-rbac",
                        help="in danh tính chỉ-đọc dùng để verify (không có quyền đọc Secret)")
