@@ -20,9 +20,13 @@
 #   deploy-request : { app, repo, sha, image? }
 #   promote-request: { app, repo, tag, mode: "from-staging" | "tag-only" | "re-render", image? }
 #
-#   `tag_strategy` is OPTIONAL on both, default "commit". Send "content" from a repo
-#           holding several services so each one is tagged by ITS OWN directory hash;
-#           otherwise one service's commit re-tags and restarts all the others.
+#   `tag_strategy` is OPTIONAL on both. Leave it OUT and the platform decides: an app
+#           carrying `.idp/stack.yaml` gets the strategy declared there, and anything else
+#           falls back to "content" exactly as before. Send "content" explicitly from a repo
+#           holding several INDEPENDENT services so each is tagged by ITS OWN directory hash;
+#           otherwise one service's commit re-tags and restarts all the others. Send
+#           "commit" from a monorepo whose services share a workspace package — a directory
+#           hash cannot see a change that happened outside the service's own directory.
 #           With "content" a promote must use mode "from-staging", not "tag-only".
 #
 #   `app`   drives the config repo name and the namespaces (<app>-staging / <app>-prod).
@@ -99,10 +103,10 @@ jobs:
       APP_REPO: ${{ github.event.client_payload.repo || inputs.repo }}
       SHA: ${{ github.event.client_payload.sha || inputs.sha }}
       IMAGE: ${{ github.event.client_payload.image || inputs.image || github.event.client_payload.app || inputs.app }}
-      # How each workload's image tag is chosen. Default `commit` keeps every existing app
-      # working unchanged. A repo holding several services should send `content`, so one
-      # service's commit stops re-tagging — and therefore restarting — all the others.
-      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || 'content' }}
+      # How each workload's image tag is chosen. EMPTY means "the payload did not say", and
+      # orchestrate.py then reads `.idp/stack.yaml` before falling back to `content`. An app
+      # with no stack file therefore renders exactly as it always has.
+      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || '' }}
       # Môi trường đích. Mặc định staging: push lên nhánh phát triển của app chỉ đụng
       # staging. Gửi env=prod khi app merge sang nhánh production.
       DEPLOY_ENV: ${{ github.event.client_payload.env || inputs.env || 'staging' }}
@@ -443,7 +447,7 @@ jobs:
       TAG: ${{ github.event.client_payload.tag }}
       MODE: ${{ github.event.client_payload.mode }}
       IMAGE: ${{ github.event.client_payload.image || github.event.client_payload.app }}
-      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || 'content' }}
+      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || '' }}
     steps:
       - name: Checkout platform@main (renderer)
         uses: actions/checkout@v4

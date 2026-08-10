@@ -1,0 +1,40 @@
+# STACK `node-worker` v1.0.0 — tiến trình nền, không nhận HTTP.
+#
+# Không có route và không có PUBLIC_HOST: workload này không có origin công khai nào cả.
+# Đó cũng là lý do nó không dùng chung values file với các stack có frontend — thêm một
+# PUBLIC_HOST không ai đọc chỉ tạo ra một giá trị sai mà không ai phát hiện.
+apiVersion: idp.company/v1
+kind: Stack
+
+metadata:
+  id: node-worker
+  version: 1.0.0
+  description: Worker Node nền + PostgreSQL, không có route công khai.
+
+spec:
+  tagStrategy: commit
+
+  # File do PLATFORM sở hữu. `stack-upgrade` mặc định chỉ đề xuất diff cho các file này,
+  # vì chúng là phần "khung" mà đội ứng dụng không nên sửa tay. Mã nguồn, dependency và
+  # values là của đội ứng dụng — muốn xem diff cả những thứ đó thì dùng --all.
+  managedFiles:
+    - Makefile
+    - .gitignore
+    - .idp/stack.yaml
+    - .idp/score-compose/*.provisioners.yaml
+
+  components:
+    - id: shared-lib
+      dir: shared
+    - id: node-worker
+      dir: worker
+      workload: worker
+      consumes:
+        - database
+
+  capabilities:
+    - database
+
+  values:
+    application:
+      LOG_LEVEL: "info"

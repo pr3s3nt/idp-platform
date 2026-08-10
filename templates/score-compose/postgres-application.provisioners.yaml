@@ -1,0 +1,116 @@
+# `postgres` class `application` cho PHÁT TRIỂN LOCAL (score-compose).
+#
+# Cùng CONTRACT với provisioners/postgres-application.provisioners.yaml (bản Kubernetes),
+# khác IMPLEMENTATION: trên cụm là một Cluster của CloudNativePG + credential từ Vault; ở
+# đây là một container postgres và một mật khẩu ngẫu nhiên. App không nhìn thấy khác biệt
+# đó — nó chỉ đọc `${resources.db.host}` … `${resources.db.password}` như nhau ở cả hai nơi.
+#
+# HAI THỨ CỐ Ý GIỮ GIỐNG BẢN KUBERNETES, dù local hoàn toàn có thể tuỳ tiện:
+#   - Tên database và user: `app_<workload>` (gạch nối -> gạch dưới). Migration nào viết
+#     cứng tên schema/owner mà chạy được local thì cũng chạy được trên staging.
+#   - Bộ output: host/port/name/database/username/password, đúng thứ tự và đúng tên khoá.
+# Major version thì phải khớp `database_profiles.<env>.application.engine_version`, và
+# `check_local_postgres_image()` trong orchestrate.py CHẶN nếu lệch.
+#
+# ẢNH Ở ĐÂY LÀ `%%images.postgres%%`, KHÔNG PHẢI ảnh operand của CloudNativePG. Đã thử ảnh
+# kia và đo được: `ghcr.io/cloudnative-pg/postgresql:17` có CMD là `bash` và chạy bằng uid
+# 26 — nó là operand để operator điều khiển, không phải một server Postgres chạy độc lập.
+# Chạy thẳng bằng docker thì container THOÁT NGAY với mã 0 và log RỖNG: không có thông báo
+# lỗi nào để lần ra, chỉ có `make dev` treo ở bước chờ database.
+#
+# CLASS PHẢI KHAI TƯỜNG MINH — cùng bài học đã trả giá ở Phase 4 trên score-k8s: một
+# provisioner KHÔNG khai `class` sẽ khớp với MỌI class. score-compose có sẵn một provisioner
+# `postgres` không khai class, nên nếu file này cũng không khai thì `class: application`
+# lúc thì rơi vào bản này, lúc thì rơi vào bản mặc định.
+#
+# MẬT KHẨU Ở ĐÂY LÀ MẬT KHẨU DÙNG MỘT LẦN, CHỈ CHO MÁY LẬP TRÌNH VIÊN. Nó nằm trong
+# .score-compose/state.yaml dưới dạng rõ — file đó đã nằm trong .gitignore và KHÔNG BAO GIỜ
+# được dùng lại cho staging/prod. Credential thật chỉ sinh ra bởi `secret-set --generate`
+# và chỉ sống trong Vault.
+- uri: template://platform/postgres-application-local
+  type: postgres
+  class: application
+  description: PostgreSQL local cho `make dev`, cùng contract với class application trên cụm.
+  init: |
+    randomServiceName: pg-{{ randAlphaNum 6 }}
+    randomPassword: {{ randAlphaNum 24 | quote }}
+    sk: platform-postgres-application-local
+    publishPort: {{ dig "annotations" "compose.score.dev/publish-port" "0" .Metadata | quote }}
+  # Giữ trong state để hai lần `score-compose generate` liên tiếp không đổi tên database và
+  # không đổi mật khẩu — nếu đổi thì volume cũ còn dữ liệu mà user mới không đăng nhập được.
+  state: |
+    database: {{ dig "database" (print "app_" (.SourceWorkload | replace "-" "_")) .State | quote }}
+    username: {{ dig "username" (print "app_" (.SourceWorkload | replace "-" "_")) .State | quote }}
+    password: {{ dig "password" .Init.randomPassword .State | quote }}
+  shared: |
+    {{ .Init.sk }}:
+      instanceServiceName: {{ dig .Init.sk "instanceServiceName" .Init.randomServiceName .Shared | quote }}
+      instancePassword: {{ dig .Init.sk "instancePassword" .Init.randomPassword .Shared | quote }}
+  outputs: |
+    host: {{ dig .Init.sk "instanceServiceName" "" .Shared }}
+    port: 5432
+    name: {{ .State.database }}
+    database: {{ .State.database }}
+    username: {{ .State.username }}
+    password: {{ .State.password }}
+  # Script khởi tạo chạy một lần, viết theo kiểu "tạo nếu chưa có" nên `make dev` lặp lại
+  # trên một volume đã có dữ liệu không làm hỏng gì.
+  files: |
+    {{ dig .Init.sk "instanceServiceName" "" .Shared }}-db-scripts/{{ .State.database }}.sql: |
+      SELECT 'CREATE DATABASE "{{ .State.database }}"' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '{{ .State.database }}')\gexec
+      SELECT $$CREATE USER "{{ .State.username }}" WITH PASSWORD '{{ .State.password }}'$$ WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ .State.username }}')\gexec
+      GRANT ALL PRIVILEGES ON DATABASE "{{ .State.database }}" TO "{{ .State.username }}";
+      \connect "{{ .State.database }}";
+      GRANT ALL ON SCHEMA public TO "{{ .State.username }}";
+      ALTER SCHEMA public OWNER TO "{{ .State.username }}";
+  volumes: |
+    {{ dig .Init.sk "instanceServiceName" "" .Shared }}-data:
+      driver: local
+  services: |
+    {{ dig .Init.sk "instanceServiceName" "" .Shared }}:
+      image: %%images.postgres%%
+      restart: always
+      environment:
+        POSTGRES_USER: postgres
+        POSTGRES_PASSWORD: {{ dig .Init.sk "instancePassword" "" .Shared | quote }}
+      {{ if ne .Init.publishPort "0" }}
+      ports:
+      - target: 5432
+        published: {{ .Init.publishPort }}
+      {{ end }}
+      volumes:
+      - type: volume
+        source: {{ dig .Init.sk "instanceServiceName" "" .Shared }}-data
+        target: /var/lib/postgresql/data
+      healthcheck:
+        test: ["CMD", "pg_isready", "-U", "postgres"]
+        interval: 2s
+        timeout: 2s
+        retries: 15
+    {{ dig .Init.sk "instanceServiceName" "" .Shared }}-init:
+      image: %%images.postgres%%
+      entrypoint: ["/bin/sh"]
+      environment:
+        POSTGRES_PASSWORD: {{ dig .Init.sk "instancePassword" "" .Shared | quote }}
+      command:
+      - "-c"
+      - |
+        cd /db-scripts
+        ls *.sql | xargs cat | psql "postgresql://postgres:$${POSTGRES_PASSWORD}@{{ dig .Init.sk "instanceServiceName" "" .Shared }}:5432/postgres"
+      labels:
+        dev.score.compose.labels.is-init-container: "true"
+      depends_on:
+        {{ dig .Init.sk "instanceServiceName" "" .Shared }}:
+          condition: service_healthy
+          restart: true
+      volumes:
+      - type: bind
+        source: {{ .MountsDirectory }}/{{ dig .Init.sk "instanceServiceName" "" .Shared }}-db-scripts
+        target: /db-scripts
+  expected_outputs:
+    - host
+    - port
+    - name
+    - database
+    - username
+    - password

@@ -52,6 +52,70 @@ Phần dưới đây mô tả từng bước script làm gì — đọc khi cầ
 
 ---
 
+## Đường tắt cho Phần A: sinh repo app từ một stack
+
+Thay vì viết tay `score.yaml`, `Dockerfile`, `platform.lock` (mục A1–A3), có thể sinh cả bộ
+từ một **stack** đã phát hành:
+
+```bash
+python3 orchestrate.py --env-config platform.env.yaml stack-list
+
+python3 orchestrate.py --env-config platform.env.yaml stack-new \
+  --stack node-fullstack --app demo --owner đội-cua-ban --out ../idp-demo
+```
+
+| Stack | Gồm gì |
+|---|---|
+| `node-fullstack` | React/Vite + API Express + PostgreSQL, cùng origin |
+| `node-api` | API Express + PostgreSQL |
+| `node-worker` | tiến trình nền + PostgreSQL, không có route công khai |
+| `static-frontend` | chỉ frontend React/Vite |
+
+`stack-new` **không ghi đè** file đã có, nên chạy lại an toàn (`--force` để ép ghi đè).
+
+### Chạy thử ngay trên máy — không cần cụm
+
+```bash
+cd ../idp-demo
+make dev            # rồi mở http://demo.localhost:8080/
+```
+
+Chỉ cần `docker` và `score-compose`. **Không** cần kho platform, `kubectl` hay Vault:
+provisioner local đã được vendor sẵn vào `.idp/score-compose/`.
+
+`compose.yaml` được **sinh ra từ chính `score.yaml`** và nằm trong `.gitignore` — đừng
+commit nó, và đừng viết tay một bản song song. Thêm một resource vào Score là local và
+staging cùng có nó; một `compose.yaml` chép tay sẽ lệch mà không báo gì.
+
+### Ba điều của golden path, đừng "sửa cho gọn"
+
+1. **Backend mount router tại `/api`, không phải `/`.** Provisioner route chuyển tiếp
+   nguyên đường dẫn, **không cắt tiền tố**. Mount tại `/` thì `/api/...` thành 404 và chỉ
+   phát hiện được sau khi deploy.
+2. **Frontend gọi đường dẫn tương đối `fetch("/api/...")`.** `/` và `/api` cùng một origin
+   nên **không có CORS và không cần có**. Nếu bạn thấy mình đang tìm cách bơm địa chỉ API
+   vào lúc chạy thì routing đã sai — bundle đã build nằm trong trình duyệt, biến môi trường
+   của container không với tới nó.
+3. **`tagStrategy: commit`** trong `.idp/stack.yaml`. Kho này có gói dùng chung `shared/`,
+   mà `content` băm theo **thư mục của từng workload** nên không thấy thay đổi ở `shared/`
+   và sẽ deploy lại ảnh cũ, không báo lỗi gì.
+
+### Nâng phiên bản stack
+
+```bash
+python3 orchestrate.py --env-config platform.env.yaml stack-validate --app-dir ../idp-demo
+python3 orchestrate.py --env-config platform.env.yaml stack-upgrade  --app-dir ../idp-demo
+```
+
+`stack-upgrade` **in diff** và không ghi gì; thêm `--write` để ghi vào working tree rồi tự
+mở pull request. Mặc định nó chỉ đụng file do platform sở hữu (`Makefile`, `.gitignore`,
+`.idp/`) — mã nguồn là của bạn. Phiên bản stack và `platform.lock` ghim **độc lập**.
+
+Phần A dưới đây vẫn là mô tả đầy đủ từng file, dùng khi bạn tự dựng repo hoặc muốn hiểu
+những gì `stack-new` vừa sinh ra.
+
+---
+
 ## Phần A — Đội sản phẩm: dựng repo app
 
 Repo app cần đúng **4 file** (cộng nội dung ứng dụng).

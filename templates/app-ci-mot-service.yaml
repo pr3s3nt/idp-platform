@@ -105,7 +105,12 @@ jobs:
         run: |
           set -euo pipefail
           pip install --quiet pyyaml
-          IMG=$(python3 platform/orchestrate.py image-plan \
+          # --env-config LÀ BẮT BUỘC, dù bước này không đọc toạ độ hạ tầng nào. Chiến lược
+          # đặt tag có thể tới từ .idp/stack.yaml, mà file đó chỉ có hiệu lực khi cờ
+          # features.stack_onboarding bật — thiếu config thì CI tính ra một tag, còn
+          # orchestrator tính ra tag khác, và Fleet apply một image chưa ai đẩy lên.
+          IMG=$(python3 platform/orchestrate.py --env-config platform/platform.env.yaml \
+                  image-plan \
                   --app "$APP" --image "$IMAGE_NAME" --tag "$GITHUB_SHA" \
                   --registry "$REGISTRY" --app-dir . | jq -r 'to_entries[0].value')
           echo "==> sẽ build: $IMG"
@@ -197,7 +202,7 @@ jobs:
             --arg image "$IMAGE_NAME" \
             '{event_type:"deploy-request",
               client_payload:{app:$app, repo:$repo, sha:$sha, image:$image,
-                              env:$denv, tag_strategy:"content"}}' \
+                              env:$denv}}' \
           | tee /dev/stderr \
           | gh api -X POST "/repos/${PLATFORM_REPO}/dispatches" --input -
           echo "==> deploy-request đã gửi cho ${PLATFORM_REPO}"

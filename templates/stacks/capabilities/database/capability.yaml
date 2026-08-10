@@ -1,0 +1,51 @@
+# Capability `database` — PostgreSQL do platform quản lý.
+#
+# Một capability KHÔNG phải là một thư mục mã nguồn; nó là vài dòng được chèn vào score.yaml
+# của workload nào khai là mình tiêu thụ nó. Nhờ vậy `node-api` dùng được database mà không
+# cần một biến thể "node-api-có-database" riêng — đúng mô hình Archetype × Runtime ×
+# Capability ở mục 9 của kế hoạch.
+#
+# `class: application` là bắt buộc, không phải mặc định. Không khai class thì rơi vào
+# provisioner postgres CŨ: một StatefulSet 1 bản sao, không HA, không backup, mật khẩu nằm
+# trong Score state. Nó chạy được, nên sai lầm này không báo lỗi — cho tới ngày mất dữ liệu.
+apiVersion: idp.company/v1
+kind: StackCapability
+
+metadata:
+  id: database
+  description: PostgreSQL class `application` — cùng contract ở local, staging và prod.
+
+spec:
+  # Cờ tính năng phải BẬT thì app dùng capability này mới render được. Platform tự kiểm,
+  # nên một app onboard trước khi cờ bật sẽ fail rõ ràng thay vì deploy thiếu database.
+  requiresFeature: postgres_application
+
+  # Khối được ghi vào `.idp/stack.yaml` của app dưới `spec.capabilities`. Nó là bản ghi
+  # DESIRED STATE cho luồng onboarding (workflow ở phase sau đọc nó để biết phải cấp phát
+  # gì), không phải thứ score-k8s đọc — score-k8s đọc `resources` bên dưới.
+  instance: |
+    type: postgres
+    class: application
+
+  # Hai đoạn dưới được chèn NGUYÊN VĂN vào score.yaml (chỉ thụt lề lại cho đúng), cố ý giữ
+  # dạng văn bản chứ không phải cấu trúc YAML: kho ứng dụng do platform sinh ra vẫn phải
+  # đọc được, mà round-trip qua YAML thì mất sạch comment.
+  variables: |
+    # Contract credential database — GIỐNG HỆT NHAU ở local, staging và prod.
+    # Trên cụm, `password` không phải một giá trị mà là tham chiếu tới một Kubernetes
+    # Secret do Vault Secrets Operator đổ đầy; mật khẩu thật không bao giờ đi qua git,
+    # qua manifest hay qua Score state. Ở local, score-compose sinh một mật khẩu ngẫu
+    # nhiên dùng một lần. Code app không phân biệt được hai đường đó, và đó là mục đích.
+    PGHOST: "${resources.db.host}"
+    PGPORT: "${resources.db.port}"
+    PGDATABASE: "${resources.db.database}"
+    PGUSER: "${resources.db.username}"
+    PGPASSWORD: "${resources.db.password}"
+
+  resources: |
+    # `class: application` chọn provisioner do operator quản lý (CloudNativePG trên cụm).
+    # Hồ sơ staging/prod — số bản sao, dung lượng, HA, retention — nằm hết trong
+    # platform.env.yaml (`database_profiles`), app không khai và không sửa được.
+    db:
+      type: postgres
+      class: application

@@ -1,0 +1,15 @@
+{
+  "name": "@__APP__/backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@__APP__/shared": "*",
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  }
+}

@@ -1,0 +1,51 @@
+# STACK `static-frontend` v1.0.0 — chỉ frontend React/Vite, không có API riêng.
+#
+# Route là `/`, và app này thường gọi API của một app KHÁC. Khi đó KHÔNG hardcode URL tuyệt
+# đối vào bundle: khai một resource `type: external-service` để platform sinh địa chỉ theo
+# môi trường, hoặc xin một route `/api` trỏ sang backend dùng chung. Viết thẳng
+# `https://api-abc.example.com` vào mã nguồn là tự chuốc lấy CORS cộng với một giá trị chỉ
+# đúng ở một môi trường.
+apiVersion: idp.company/v1
+kind: Stack
+
+metadata:
+  id: static-frontend
+  version: 1.0.0
+  description: Frontend React/Vite tĩnh phục vụ bằng nginx.
+
+spec:
+  tagStrategy: commit
+
+  # File do PLATFORM sở hữu. `stack-upgrade` mặc định chỉ đề xuất diff cho các file này,
+  # vì chúng là phần "khung" mà đội ứng dụng không nên sửa tay. Mã nguồn, dependency và
+  # values là của đội ứng dụng — muốn xem diff cả những thứ đó thì dùng --all.
+  managedFiles:
+    - Makefile
+    - .gitignore
+    - .idp/stack.yaml
+    - .idp/score-compose/*.provisioners.yaml
+
+  components:
+    - id: shared-lib
+      dir: shared
+    - id: static-frontend
+      dir: frontend
+      workload: frontend
+
+  capabilities: []
+
+  values:
+    application:
+      LOG_LEVEL: "info"
+    environments:
+      staging:
+        PUBLIC_HOST: "__APP__.__DOMAIN_STAGING__"
+      prod:
+        PUBLIC_HOST: "__APP__.__DOMAIN_PROD__"
+
+  # Giá trị dành riêng cho `.env.example` (máy lập trình viên). KHÔNG đi vào
+  # `.score-values/values.yaml`: platform có đúng hai môi trường, staging và prod. Local
+  # không phải môi trường thứ ba mà là bản dựng tạm của staging trên máy — nên nó chỉ ghi
+  # đè đúng những khoá phải khác, và `*.localhost` tự phân giải về 127.0.0.1.
+  localValues:
+    PUBLIC_HOST: "__APP__.localhost"

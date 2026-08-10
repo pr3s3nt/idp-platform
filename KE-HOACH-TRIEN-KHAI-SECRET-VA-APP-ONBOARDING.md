@@ -236,7 +236,7 @@ AI phải cập nhật bảng này trong quá trình làm. `Blocked` chỉ dùng
 | 2 — Vault/VSO foundation trên harness | Done | Xem "Nhật ký Phase 2" bên dưới |
 | 3 — App secret integration | Done | Xem "Nhật ký Phase 3" bên dưới |
 | 4 — PostgreSQL capability/profile | Done | Xem "Nhật ký Phase 4" bên dưới |
-| 5 — Stack catalog và `score-compose` | Not started | |
+| 5 — Stack catalog và `score-compose` | Done | Xem "Nhật ký Phase 5" bên dưới |
 | 6 — Onboarding workflow/state machine | Not started | |
 | 7 — Pilot, migration và hardening local | Not started | |
 
@@ -578,6 +578,102 @@ Người dùng phải xác nhận lại khi mang vào công ty: `database.image_
 chặn nếu thiếu**; DBA chốt `instances`/`storage`/retention của prod; storage class dành cho
 database (phải là ổ đĩa mạng gắn lại được, không phải local no-provisioner); và **chạy thật
 một lần restore** trước khi cho app đầu tiên lên prod.
+
+#### Nhật ký Phase 5
+
+Branch `feature/secret-onboarding`, verify từ working tree tại SHA `0416685` (Phase 4).
+
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **323 passed**
+(275 → 323, thêm 48 test). Không có test nào bị skip. Chạy lại **ba lần liên tiếp** vì
+Phase 5 thêm provisioner mới: 323/323/323.
+
+Mô hình: stack là **phép cộng component**, không phải một template cho mỗi tổ hợp
+(`node-fullstack = static-frontend + node-api + shared-lib + capability database`). Sửa
+`node-api` một lần là sửa cho cả bốn stack. Xem ADR `0009`.
+
+**Gate của Phase 5, đo bằng cách chạy thật** (app fixture `shopdemo`, sinh bằng
+`stack-new`, chạy bằng `make dev` với docker compose v5.1.4 — không phải chỉ pytest):
+
+| Gate | Cách đo | Kết quả |
+|---|---|---|
+| `make dev` chạy từ Score, không có compose viết tay | `stack-new` rồi `make dev` | 6 container lên; `compose.yaml` **được sinh ra** và nằm trong `.gitignore` |
+| Frontend `/` | `curl http://shopdemo.localhost:8080/` | `200 text/html`, trang React thật |
+| Backend `/api` cùng origin | `curl .../api/health`, `/api/ready` | `200`, JSON từ Express |
+| Truy vấn database | `GET/POST /api/items` | đọc `200`, ghi `201` — dữ liệu thật trong Postgres local |
+| **Không cần CORS** | `curl -I .../api/health` | **không có header `Access-Control-*`** nào |
+| **Không bơm địa chỉ API lúc chạy** | grep bundle đã build | chỉ có `"/api"` tương đối; URL tuyệt đối duy nhất là của chính React (`w3.org`, `reactjs.org`) |
+| **Sửa gói dùng chung build lại CẢ HAI** | đổi `shared/index.js`, `make dev` | image ID của **cả** backend và frontend đổi; API trả version mới, bundle mới chứa version mới |
+| Render lên cụm vẫn đúng hình dạng | `render --env staging` | 2 HTTPRoute **cùng một hostname**, `/api`→backend:8080 và `/`→frontend:80, đều `PathPrefix`; 1 CNPG `Cluster`; `PGPASSWORD` là `secretKeyRef`, không phải giá trị |
+| `tagStrategy: commit` từ `.idp/stack.yaml` | render không truyền `--tag-strategy` | cả hai workload cùng tag `deadbeef` |
+| Local và staging cùng quy ước | so tên database | local `app_backend` = trên cụm `app_backend` |
+
+**Regression app legacy**: 4 cặp render (`simple-nginx`, `app-with-postgres` × staging/prod)
+baseline `36372b9` vs HEAD, render từ **bản sao** thư mục app: **giống nhau từng byte**.
+`examples/` không bị sửa (`git status` sạch).
+
+**Lỗi thật thứ năm — provisioner `route` mặc định của score-compose làm local khác staging.**
+Nó khoá map shared bằng `.Uid`, nên nginx sinh `location` theo thứ tự **tên workload**, mà
+nginx lấy regex location khớp **đầu tiên**. Với `backend`/`frontend` thì "backend" < "frontend"
+nên `/api` đứng trước và mọi thứ chạy — nhưng đổi tên thành `orders`/`app-ui` thì `^/` lên
+trước và **mọi request `/api/...` rơi vào frontend**, API trả về trang HTML. Đã đo cả hai
+chiều. Tệ hơn: trên cụm, Gateway API xếp hạng `PathPrefix` theo **độ dài**, nên bản mặc định
+làm local và staging cư xử khác nhau — đúng thứ `make dev` sinh ra để loại bỏ. Provisioner
+của platform khoá theo `999 - len(path)`, có test tích hợp chạy binary thật ghim lại.
+
+**Lỗi thật thứ sáu — nginx nhớ IP cũ sau mỗi lần build lại.** Thiếu `valid=` trong chỉ thị
+`resolver`, nginx giữ kết quả DNS theo TTL của Docker (600s). Mỗi `docker compose up --build`
+dựng lại container với **IP mới**, còn nginx vẫn đẩy request tới IP cũ: API trả **502 suốt
+10 phút** trong khi container đích chạy tốt và log của nó hoàn toàn sạch. Đo được: DNS trả
+`172.19.0.5`, nginx vẫn gọi `172.19.0.4`. Đây là vòng lặp `make dev` được dùng nhiều nhất —
+sửa mã, build lại, thử lại. Nay `resolver 127.0.0.11 valid=5s`; sau khi sửa, API hồi phục
+**sau 1 giây** mà không phải restart nginx.
+
+**Lỗi thật thứ bảy — ảnh operand của CloudNativePG không phải một Postgres chạy được.**
+`ghcr.io/cloudnative-pg/postgresql:17` có `CMD` là `bash` và chạy bằng uid 26: nó để
+operator điều khiển. `docker run` **thoát ngay với mã 0 và log rỗng** — không có gì để lần
+ra. Postgres local dùng `%%images.postgres%%`, và `check_local_postgres_image()` **chặn**
+nếu major version lệch với `database_profiles.staging.application.engine_version`.
+
+**Hai bất nhất tự tìm thấy khi viết test, đều đã sửa:**
+`.idp/stack.yaml` hỏng cú pháp làm `render` chết bằng `yaml.YAMLError` — file này chỉ được
+*tham khảo* trên đường deploy, không được phép giết một lần deploy vốn không cần tới nó (nay
+là `SystemExit` có thông điệp, và `resolve_tag_strategy` nuốt đúng loại đó). Và hai mẫu CI
+gọi `image-plan` **không truyền `--env-config`**, nên CI không nhìn thấy cờ
+`features.stack_onboarding`: CI tính ra `content` trong khi orchestrator tính ra `commit` —
+hai tag khác nhau cho một commit, và Fleet apply một image chưa ai đẩy lên. Có test ghim cả hai.
+
+File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
+`platform.env.company.yaml`, `.github/workflows/orchestrator.yaml`,
+`templates/app-ci-mot-service.yaml`, `templates/app-ci-nhieu-service.yaml`,
+`HUONG-DAN-KIEM-THU.md`, `HUONG-DAN-TAO-APP-MOI.md`, `docs/adr/README.md`,
+`docs/adr/0009-stack-catalog-va-phat-trien-local.md` (mới),
+`templates/score-compose/` (mới: `route`, `postgres-application`),
+`templates/stacks/` (mới: 4 stack manifest, 4 component, 1 capability, base files).
+
+Config key mới: `images.node`, `images.nginx`. Lệnh mới: `stack-list`, `stack-new`,
+`stack-validate`, `stack-upgrade`. Cờ dùng đến: `features.stack_onboarding` (chỉ quyết định
+`.idp/stack.yaml` có được nói về `tagStrategy` hay không).
+
+Migration: không có. `--tag-strategy` nay mặc định **rỗng** thay vì `content`, nhưng rỗng
+được phân giải thành `content` cho mọi app không có `.idp/stack.yaml` — tức là mọi app đang
+chạy. Rollback: đặt `features.stack_onboarding: false`; app đã khai `tagStrategy` sẽ nhận
+cảnh báo rõ ràng và quay về `content` chứ không deploy sai im lặng.
+
+Hạn chế còn lại: **chưa deploy app golden path lên cụm thật** — mới render đúng hình dạng,
+chưa có Fleet reconcile + `verify` chạy trên `kind-staging` (cần tạo kho GitHub, thuộc luồng
+Phase 6). Migration chạy lúc khởi động bằng advisory lock, **chưa phải** migration Job theo
+mục 7.4. `stack-upgrade` so kho ứng dụng với phiên bản stack **hiện tại**, không so hai phiên
+bản stack với nhau — nên nó không phân biệt được "stack đổi" và "đội ứng dụng sửa tay"; đó là
+lý do nó chỉ đề xuất diff cho `managedFiles` và không tự ghi. Chưa sinh workflow CI cho app
+mới (thuộc Phase 6). `score-compose` tự thêm một container `wait-for-resources` dùng ảnh
+`alpine` từ Docker Hub — chưa tham số hoá được, cụm/máy không ra được internet phải mirror nó.
+
+Người dùng phải xác nhận lại khi mang vào công ty: `images.node` và `images.nginx` phải mirror
+về Harbor **và máy lập trình viên phải kéo được** (không chỉ runner CI) — nếu không `make dev`
+hỏng ngay ở bước build đầu tiên; `images.postgres` phải cùng major version với
+`database_profiles.*.application.engine_version`; đội nào được phép chạy `stack-new`; và
+`*.localhost` có phân giải về 127.0.0.1 trên máy lập trình viên hay không (đúng với trình
+duyệt hiện đại và systemd-resolved, nhưng một số cấu hình DNS nội bộ chặn).
 
 ### 0.6. Stop conditions
 

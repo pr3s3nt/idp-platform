@@ -1,0 +1,19 @@
+# Gói dùng chung giữa các workload trong cùng một kho (monorepo).
+#
+# Nó tồn tại vì một lý do kiểm chứng được, không phải vì "monorepo thì nên có": nó là thứ
+# CHỨNG MINH `tagStrategy: commit` là lựa chọn đúng. Sửa `shared/` thì cả frontend lẫn
+# backend phải build lại; `tagStrategy: content` băm theo THƯ MỤC của từng workload nên
+# không thấy thay đổi này và sẽ deploy hai ảnh cũ. Xem mục 10.3 của kế hoạch.
+apiVersion: idp.company/v1
+kind: StackComponent
+
+metadata:
+  id: shared-lib
+  archetype: library
+  runtime: node
+  description: Gói npm workspace dùng chung cho các workload Node trong cùng kho.
+
+spec:
+  # Không phải workload: không có score.yaml, không có Dockerfile, không lên cụm.
+  workload: false
+  workspace: true

@@ -102,9 +102,14 @@ jobs:
         run: |
           set -euo pipefail
           pip install --quiet pyyaml
-          python3 platform/orchestrate.py image-plan \
+          # KHÔNG khai --tag-strategy: để platform tự quyết theo .idp/stack.yaml, và mặc
+          # định về `content` cho kho không có file đó. Phải truyền --env-config, vì chiến
+          # lược khai trong .idp/stack.yaml chỉ có hiệu lực khi cờ features.stack_onboarding
+          # bật — không có config thì bước này tính ra `content` trong khi orchestrator tính
+          # ra `commit`, và hai bên lệch tag nghĩa là Fleet apply một image chưa ai đẩy lên.
+          python3 platform/orchestrate.py --env-config platform/platform.env.yaml image-plan \
             --app "$APP" --image "$IMAGE_NAME" --tag "$GITHUB_SHA" \
-            --registry "$REGISTRY" --app-dir . --tag-strategy content > plan.json
+            --registry "$REGISTRY" --app-dir . > plan.json
           cat plan.json
 
           # Chỉ giữ lại những image chưa tồn tại trên registry.
@@ -197,6 +202,6 @@ jobs:
             --arg image "$IMAGE_NAME" \
             '{event_type:"deploy-request",
               client_payload:{app:$app, repo:$repo, sha:$sha, image:$image,
-                              env:$denv, tag_strategy:"content"}}' \
+                              env:$denv}}' \
           | gh api -X POST "/repos/${PLATFORM_REPO}/dispatches" --input -
           echo "==> deploy-request đã gửi (đã build ${{ needs.plan.outputs.count }} service)"

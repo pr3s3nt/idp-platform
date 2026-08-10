@@ -1,0 +1,41 @@
+# Score của __WORKLOAD__ — frontend tĩnh.
+#
+# KHÔNG có biến môi trường nào mang địa chỉ API, và đó là chủ ý chứ không phải thiếu sót:
+# bundle đã build chạy trong trình duyệt, biến của container nginx không với tới nó. Cách
+# duy nhất đúng là gọi đường dẫn tương đối `/api/...` và để platform ghép cùng origin.
+apiVersion: score.dev/v1b1
+
+metadata:
+  name: __WORKLOAD__
+
+containers:
+  __CONTAINER__:
+    image: .
+    livenessProbe:
+      httpGet:
+        path: /
+        port: __PORT__
+    readinessProbe:
+      httpGet:
+        path: /
+        port: __PORT__
+
+service:
+  ports:
+    http:
+      port: __PORT__
+      targetPort: __PORT__
+
+resources:
+  # Chỉ dùng để lấy PUBLIC_HOST cho route bên dưới. Giá trị được thay LÚC RENDER, không
+  # phải lúc chạy — nên nó không mâu thuẫn với đoạn ghi chú ở đầu file.
+  config:
+    type: environment
+  # CÙNG host với API, path `/`. Provisioner route ưu tiên path DÀI hơn, nên `/api` của
+  # backend luôn được xét trước `/` của frontend — kể cả khi hai workload đổi tên.
+  route:
+    type: route
+    params:
+      host: "${resources.config.PUBLIC_HOST}"
+      port: __PORT__
+      path: __ROUTE_PATH__

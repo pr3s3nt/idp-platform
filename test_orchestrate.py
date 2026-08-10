@@ -3394,3 +3394,562 @@ def test_the_development_class_renders_the_demo_database(tmp_path):
         "resources": {"db": {"type": "postgres", "class": "development"}}})
     kinds = {d["kind"] for d in render_env(tmp_path, app_dir, "staging", "w")}
     assert "StatefulSet" in kinds and "Cluster" not in kinds
+
+
+# =====================================================================================
+# PHASE 5 — stack catalog: the catalog itself must stay coherent
+# =====================================================================================
+# These are static checks over templates/stacks/. They are cheap and they catch the class
+# of mistake that only shows up as a broken app repo three steps later: a stack naming a
+# component that does not exist, a workload with no container name, a token nobody fills.
+STACK_IDS = ["node-fullstack", "node-api", "node-worker", "static-frontend"]
+
+
+def test_every_published_stack_loads_and_resolves():
+    """Filename, metadata.id and every referenced component/capability must line up."""
+    ids = [d["metadata"]["id"] for d in orc.list_stacks(CATALOG)]
+    assert sorted(ids) == sorted(STACK_IDS), ids
+    for stack_id in STACK_IDS:
+        stack = orc.load_stack(CATALOG, stack_id)
+        assert stack["metadata"]["version"], stack_id
+        components = orc.stack_components(CATALOG, stack)
+        assert components, stack_id
+        for capability in (stack["spec"].get("capabilities") or []):
+            orc.load_capability(CATALOG, capability)
+
+
+def test_every_workload_component_names_its_container():
+    """`--build` addresses containers, not workloads. A component missing this renders an
+    app whose compose file still says `image: .`, and that only fails inside docker."""
+    for stack_id in STACK_IDS:
+        for component in orc.stack_components(CATALOG, orc.load_stack(CATALOG, stack_id)):
+            if orc._is_workload(component):
+                assert component.get("container"), (stack_id, component["id"])
+
+
+def test_node_fullstack_is_the_sum_of_its_parts():
+    """Section 9.3: node-fullstack = static-frontend + node-api + postgres. If this ever
+    becomes a standalone copy, fixing node-api stops fixing node-fullstack."""
+    stack = orc.load_stack(CATALOG, "node-fullstack")
+    ids = {c["id"] for c in orc.stack_components(CATALOG, stack)}
+    assert {"static-frontend", "node-api"} <= ids
+    assert "database" in stack["spec"]["capabilities"]
+    assert stack["spec"]["tagStrategy"] == "commit"
+
+
+def test_the_golden_path_routes_api_deeper_than_the_frontend():
+    """Same-origin routing only works if the API path is a strict prefix extension of the
+    frontend's. `/` for the frontend and `/api` for the API is the whole contract."""
+    components = orc.stack_components(CATALOG, orc.load_stack(CATALOG, "node-fullstack"))
+    paths = {c["id"]: c.get("routePath") for c in components if orc._is_workload(c)}
+    assert paths["static-frontend"] == "/"
+    assert paths["node-api"] == "/api"
+    assert len(paths["node-api"]) > len(paths["static-frontend"])
+
+
+# ------------------------------------------------- the compose catalog, same class rule
+def test_local_postgres_provisioner_declares_its_class():
+    """The Phase 4 lesson, re-applied to score-compose: a provisioner with no `class`
+    matches EVERY class, and score-compose ships a classless `postgres` of its own. Without
+    an explicit class here, `class: application` would be served by whichever loaded last."""
+    path = CATALOG / "templates" / "score-compose" / "postgres-application.provisioners.yaml"
+    entries = [e for e in yaml.safe_load(path.read_text()) if e.get("type") == "postgres"]
+    assert entries, "no postgres provisioner in the compose catalog"
+    for entry in entries:
+        assert entry.get("class") == "application", entry["uri"]
+
+
+def test_local_and_cluster_postgres_agree_on_the_output_contract():
+    """An app must not be able to tell local from staging. Same output keys, same naming."""
+    local = yaml.safe_load(
+        (CATALOG / "templates" / "score-compose"
+         / "postgres-application.provisioners.yaml").read_text())[0]
+    cluster = yaml.safe_load(
+        (CATALOG / "provisioners" / "postgres-application.provisioners.yaml").read_text())[0]
+    assert set(local["expected_outputs"]) == set(cluster["expected_outputs"])
+    # Both derive database and username the same way, so a migration that hardcodes the
+    # schema owner locally still applies on the cluster.
+    for provisioner in (local, cluster):
+        assert 'print "app_" (.SourceWorkload | replace "-" "_")' in provisioner["state"]
+
+
+def test_the_local_route_provisioner_ranks_by_path_not_by_workload_name():
+    """The measured bug: score-compose's default route provisioner keys its shared map by
+    `.Uid`, so nginx emits locations in WORKLOAD-NAME order — and nginx takes the first
+    matching regex. Name the frontend so it sorts first and `^/` swallows every `/api`
+    request. Gateway API on the cluster ranks by prefix length instead, so the default
+    makes local and staging disagree. Our key carries the rank, so names cannot matter."""
+    path = CATALOG / "templates" / "score-compose" / "route.provisioners.yaml"
+    shared = yaml.safe_load(path.read_text())[0]["shared"]
+    assert "sub 999 (len .Params.path)" in shared
+    assert "dict $rank $inner" in shared, "the shared map must be keyed by rank, not .Uid"
+
+
+def test_the_local_route_provisioner_pins_a_short_dns_ttl():
+    """Also measured: without `valid=`, nginx caches the workload's IP for Docker's TTL, so
+    every `docker compose up --build` leaves the API 502 while its container runs fine."""
+    text = (CATALOG / "templates" / "score-compose" / "route.provisioners.yaml").read_text()
+    assert re.search(r"resolver 127\.0\.0\.11 valid=\d+s", text)
+
+
+def test_local_postgres_major_version_must_match_the_staging_profile(monkeypatch):
+    """`make dev` claims to rehearse staging. Different major versions make that false."""
+    orc.check_local_postgres_image()          # the repo's own config must be consistent
+
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["images"]["postgres"] = "registry.example/postgres:16-alpine"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    with pytest.raises(SystemExit, match="different PostgreSQL major version"):
+        orc.check_local_postgres_image()
+
+
+# =====================================================================================
+# PHASE 5 — the generator
+# =====================================================================================
+@pytest.fixture
+def stack_enabled(monkeypatch):
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("features", {}).update(
+        {"application_values": True, "vault_secrets": True,
+         "postgres_application": True, "stack_onboarding": True})
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    return data
+
+
+def new_app(tmp_path: Path, stack_id: str = "node-fullstack", app: str = "shopdemo",
+            **kw) -> Path:
+    dest = tmp_path / app
+    orc.generate_stack(CATALOG, stack_id, app, dest, owner="team-x", **kw)
+    return dest
+
+
+def test_generated_repo_has_the_layout_section_10_1_describes(tmp_path, stack_enabled):
+    dest = new_app(tmp_path)
+    for rel in ("frontend/Dockerfile", "frontend/score.yaml", "backend/Dockerfile",
+                "backend/score.yaml", ".idp/stack.yaml", ".score-values/values.yaml",
+                "platform.lock", "Makefile", ".env.example", "README.md"):
+        assert (dest / rel).is_file(), rel
+
+
+def test_generated_files_carry_no_unresolved_tokens(tmp_path, stack_enabled):
+    """A `__TOKEN__` that survives into an app repo is a defect nobody notices until a
+    developer reads their own Dockerfile. The generator refuses; this proves it."""
+    dest = new_app(tmp_path)
+    for path in dest.rglob("*"):
+        if path.is_file():
+            assert not orc.STACK_TOKEN.search(path.read_text()), path
+
+
+def test_an_unfillable_token_stops_the_generator():
+    with pytest.raises(SystemExit, match="unresolved template token"):
+        orc._substitute("port: __NOT_A_REAL_TOKEN__", {"__APP__": "x"}, where="t")
+
+
+def test_generated_values_and_stack_files_pass_their_own_validators(tmp_path, stack_enabled):
+    """The generator must not emit something the renderer will later reject."""
+    dest = new_app(tmp_path)
+    spec = orc.load_application_values(dest)
+    assert set(spec["environments"]) == {"staging", "prod"}
+    instance = orc.load_stack_instance(dest)
+    assert instance["stack"] == {"id": "node-fullstack", "version": "1.0.0"}
+    assert instance["tagStrategy"] == "commit"
+
+
+def test_generated_score_files_are_discoverable_and_placeholder_clean(tmp_path,
+                                                                     stack_enabled):
+    dest = new_app(tmp_path)
+    services = orc.discover(dest)
+    assert {s.workload for s in services} == {"backend", "frontend"}
+    for service in services:
+        doc = yaml.safe_load(service.path.read_text())
+        orc.scan_placeholders(doc, where=str(service.path), hard=True)
+
+
+def test_env_example_keys_cannot_drift_from_the_values_file(tmp_path, stack_enabled):
+    """score-compose's environment provisioner turns a MISSING variable into an empty
+    string, not an error, so a drift here starts containers with blank configuration."""
+    dest = new_app(tmp_path)
+    spec = orc.load_application_values(dest)
+    expected = set(orc.resolve_application_values(spec, "staging"))
+    found = {line.split("=", 1)[0]
+             for line in (dest / ".env.example").read_text().splitlines()
+             if line.strip() and not line.startswith("#")}
+    assert found == expected
+
+
+def test_local_values_override_staging_for_the_developer_machine(tmp_path, stack_enabled):
+    """Local is not a third environment; it is staging with the host name swapped, so a
+    browser resolves it without anyone editing /etc/hosts."""
+    dest = new_app(tmp_path)
+    env_example = dict(
+        line.split("=", 1) for line in (dest / ".env.example").read_text().splitlines()
+        if line.strip() and not line.startswith("#"))
+    assert env_example["PUBLIC_HOST"] == "shopdemo.localhost"
+    values = orc.resolve_application_values(orc.load_application_values(dest), "staging")
+    assert values["PUBLIC_HOST"].endswith(orc.CONFIG.get("environments.staging.domain"))
+
+
+def test_rerunning_the_generator_creates_no_duplicates(tmp_path, stack_enabled):
+    """The onboarding workflow retries. A retry must not overwrite a developer's work."""
+    dest = new_app(tmp_path)
+    (dest / "backend" / "src" / "index.js").write_text("// mã của đội ứng dụng\n")
+    again = orc.generate_stack(CATALOG, "node-fullstack", "shopdemo", dest)
+    assert again["created"] == []
+    assert "backend/src/index.js" in again["skipped"]
+    assert (dest / "backend" / "src" / "index.js").read_text() == "// mã của đội ứng dụng\n"
+
+    forced = orc.generate_stack(CATALOG, "node-fullstack", "shopdemo", dest, force=True)
+    assert forced["skipped"] == []
+    assert "mã của đội ứng dụng" not in (dest / "backend" / "src" / "index.js").read_text()
+
+
+@pytest.mark.parametrize("name", ["Shop", "shop_demo", "-shop", "shop-", "s" * 41, ""])
+def test_bad_application_names_are_refused(name):
+    """The name becomes a namespace prefix, an image name and an npm scope at once."""
+    with pytest.raises(SystemExit, match="invalid application name"):
+        orc.validate_app_name(name)
+
+
+def test_the_worker_stack_has_no_route_and_no_service(tmp_path, stack_enabled):
+    """The one shape difference between `worker` and `web-api`. Everything else — config,
+    credentials, render path, verify — goes down the same road."""
+    dest = new_app(tmp_path, "node-worker", "batchdemo")
+    doc = yaml.safe_load((dest / "worker" / "score.yaml").read_text())
+    assert "service" not in doc
+    assert "route" not in doc["resources"]
+    assert "db" in doc["resources"]
+
+
+def test_a_stack_without_the_database_capability_gets_no_db_resource(tmp_path,
+                                                                    stack_enabled):
+    """Capabilities are composed in, not commented out: an unwanted one leaves no trace."""
+    dest = new_app(tmp_path, "static-frontend", "uidemo")
+    doc = yaml.safe_load((dest / "frontend" / "score.yaml").read_text())
+    assert set(doc["resources"]) == {"config", "route"}
+    assert "PGHOST" not in (dest / "frontend" / "score.yaml").read_text()
+
+
+def test_generate_steps_use_one_call_per_score_file(tmp_path, stack_enabled):
+    """score-compose refuses `--build` when several score files are passed at once, so the
+    Makefile must call it once per workload — and address the CONTAINER, not the workload."""
+    components = orc.stack_components(CATALOG, orc.load_stack(CATALOG, "node-fullstack"))
+    steps = orc.stack_generate_steps(components)
+    assert steps.count("score-compose generate") == 2
+    assert "--build 'api=" in steps and "--build 'web=" in steps
+    assert "backend/score.yaml --build" in steps
+
+
+def test_dockerfiles_build_from_the_repo_root_so_they_see_the_shared_package(tmp_path,
+                                                                            stack_enabled):
+    """A monorepo workload importing `shared/` cannot build with its own directory as
+    context; npm fails to resolve the workspace and the error names neither."""
+    dest = new_app(tmp_path)
+    steps = orc.stack_generate_steps(
+        orc.stack_components(CATALOG, orc.load_stack(CATALOG, "node-fullstack")))
+    assert '"context":"."' in steps
+    for rel in ("backend/Dockerfile", "frontend/Dockerfile"):
+        text = (dest / rel).read_text()
+        assert "COPY shared/package.json shared/" in text
+        assert "COPY shared/ ./shared/" in text
+
+
+def test_the_vendored_compose_catalog_carries_no_placeholders(tmp_path, stack_enabled):
+    """`make dev` needs docker and score-compose, nothing else — so the provisioners the
+    app repo receives must already be resolved, never the platform's config file."""
+    dest = new_app(tmp_path)
+    vendored = sorted((dest / ".idp" / "score-compose").glob("*.provisioners.yaml"))
+    assert len(vendored) == 2
+    for path in vendored:
+        assert "%%" not in path.read_text(), path
+
+
+# ------------------------------------------------------------------- tag strategy
+def test_an_app_without_a_stack_file_keeps_the_historical_default(tmp_path):
+    """The brownfield promise: every app deployed before Phase 5 renders exactly as before."""
+    assert orc.resolve_tag_strategy(tmp_path, "") == "content"
+    assert orc.resolve_tag_strategy(None, "") == "content"
+
+
+def test_the_stack_file_supplies_the_strategy_once_the_flag_is_on(tmp_path, stack_enabled):
+    dest = new_app(tmp_path)
+    assert orc.resolve_tag_strategy(dest, "") == "commit"
+
+
+def test_the_declared_strategy_is_inert_and_loud_while_the_flag_is_off(tmp_path, capsys,
+                                                                      values_enabled):
+    """Opt-in means opt-in. But silently ignoring it would ship stale images from a
+    monorepo, so it says so."""
+    dest = new_app(tmp_path)
+    assert orc.resolve_tag_strategy(dest, "") == "content"
+    assert "features.stack_onboarding is off" in capsys.readouterr().err
+
+
+def test_an_explicit_flag_still_wins(tmp_path, stack_enabled):
+    dest = new_app(tmp_path)
+    assert orc.resolve_tag_strategy(dest, "content") == "content"
+
+
+def test_a_broken_stack_file_does_not_take_down_a_deploy(tmp_path):
+    """`.idp/stack.yaml` is not on the deploy critical path. A malformed one is reported by
+    stack-validate; it must not stop a render that never needed it."""
+    (tmp_path / ".idp").mkdir()
+    (tmp_path / ".idp" / "stack.yaml").write_text("this: is: not: valid\n")
+    assert orc.resolve_tag_strategy(tmp_path, "") == "content"
+
+
+# ------------------------------------------------------------------- validate / upgrade
+def test_stack_validate_catches_a_renamed_workload(tmp_path, stack_enabled):
+    """Renaming metadata.name renames the image and the Deployment, so the old workload
+    keeps running beside the new one instead of being replaced."""
+    dest = new_app(tmp_path)
+    doc = yaml.safe_load((dest / "backend" / "score.yaml").read_text())
+    doc["metadata"]["name"] = "backend-v2"
+    write(dest / "backend" / "score.yaml", doc)
+    args = orc.argparse.Namespace(app_dir=str(dest), catalog=str(CATALOG))
+    with pytest.raises(SystemExit, match="metadata.name"):
+        orc.cmd_stack_validate(args)
+
+
+def test_stack_validate_reports_a_capability_whose_flag_is_off(tmp_path, values_enabled):
+    dest = new_app(tmp_path)
+    args = orc.argparse.Namespace(app_dir=str(dest), catalog=str(CATALOG))
+    with pytest.raises(SystemExit, match="features.postgres_application"):
+        orc.cmd_stack_validate(args)
+
+
+def test_stack_upgrade_reports_no_change_for_a_freshly_generated_app(tmp_path, capsys,
+                                                                    stack_enabled):
+    dest = new_app(tmp_path)
+    orc.cmd_stack_upgrade(orc.argparse.Namespace(
+        app_dir=str(dest), catalog=str(CATALOG), app="", write=False, all=False, work=""))
+    assert "không có thay đổi" in capsys.readouterr().err
+
+
+def test_stack_upgrade_diffs_platform_owned_files_without_touching_the_repo(tmp_path,
+                                                                           capsys,
+                                                                           stack_enabled):
+    """Section 9.4: an upgrade is a pull request a human reads, not an overwrite."""
+    dest = new_app(tmp_path)
+    makefile = dest / "Makefile"
+    makefile.write_text(makefile.read_text().replace("ROUTER_PORT ?= 8080",
+                                                     "ROUTER_PORT ?= 9999"))
+    args = orc.argparse.Namespace(app_dir=str(dest), catalog=str(CATALOG), app="",
+                                  write=False, all=False, work="")
+    orc.cmd_stack_upgrade(args)
+    assert "ROUTER_PORT ?= 9999" in makefile.read_text(), "upgrade must not write by default"
+    assert "--- a/Makefile" in capsys.readouterr().out
+
+    args.write = True
+    orc.cmd_stack_upgrade(args)
+    assert "ROUTER_PORT ?= 8080" in makefile.read_text()
+
+
+def test_stack_upgrade_leaves_application_code_alone_by_default(tmp_path, stack_enabled):
+    dest = new_app(tmp_path)
+    mine = dest / "backend" / "src" / "index.js"
+    mine.write_text("// mã của tôi\n")
+    orc.cmd_stack_upgrade(orc.argparse.Namespace(
+        app_dir=str(dest), catalog=str(CATALOG), app="", write=True, all=False, work=""))
+    assert mine.read_text() == "// mã của tôi\n"
+
+
+# =====================================================================================
+# PHASE 5 — integration: the generated app renders to the cluster shape it promises
+# =====================================================================================
+def render_stack_app(tmp_path: Path, app_dir: Path, app: str, env: str, name: str) -> list[dict]:
+    args = orc.argparse.Namespace(
+        app=app, image=app, tag="deadbeef", env=env, registry="h.io/p",
+        catalog=str(CATALOG), app_dir=str(app_dir), work=str(tmp_path / name),
+        out=str(tmp_path / "config" / env / "manifests.yaml"), kubeconfig=None,
+        state_file=str(tmp_path / f"state-{name}.yaml"), no_state=False, tag_strategy="")
+    orc.cmd_render(args)
+    return orc.load_all(Path(args.work) / "manifests.yaml")
+
+
+@needs_score_k8s
+def test_the_golden_path_renders_same_origin_routes(tmp_path, stack_enabled):
+    """The headline gate, on the cluster side: one hostname, two paths, and `/api` more
+    specific than `/`. Gateway API ranks PathPrefix by length, so this is what makes the
+    browser treat the API as same-origin and skip CORS entirely."""
+    dest = new_app(tmp_path)
+    docs = render_stack_app(tmp_path, dest, "shopdemo", "staging", "w")
+    routes = [d for d in docs if d["kind"] == "HTTPRoute"]
+    assert len(routes) == 2
+    assert len({tuple(r["spec"]["hostnames"]) for r in routes}) == 1, "must share one origin"
+    by_path = {r["spec"]["rules"][0]["matches"][0]["path"]["value"]:
+               r["spec"]["rules"][0]["backendRefs"][0] for r in routes}
+    assert set(by_path) == {"/", "/api"}
+    assert by_path["/api"]["name"] == "backend" and by_path["/api"]["port"] == 8080
+    assert by_path["/"]["name"] == "frontend" and by_path["/"]["port"] == 80
+    for route in routes:
+        assert route["spec"]["rules"][0]["matches"][0]["path"]["type"] == "PathPrefix"
+
+
+@needs_score_k8s
+def test_the_monorepo_ships_one_tag_for_every_workload(tmp_path, stack_enabled):
+    """`tagStrategy: commit` from .idp/stack.yaml, with no --tag-strategy on the command
+    line. Under `content` the two workloads would carry different directory hashes and a
+    change to shared/ would retag neither."""
+    dest = new_app(tmp_path)
+    docs = render_stack_app(tmp_path, dest, "shopdemo", "staging", "w")
+    images = {c["image"] for d in docs if d["kind"] == "Deployment"
+              for c in d["spec"]["template"]["spec"]["containers"]}
+    assert images == {"h.io/p/shopdemo-backend:deadbeef", "h.io/p/shopdemo-frontend:deadbeef"}
+
+
+@needs_score_k8s
+def test_the_generated_app_gets_a_managed_database_and_no_plaintext_password(tmp_path,
+                                                                            stack_enabled):
+    dest = new_app(tmp_path)
+    docs = render_stack_app(tmp_path, dest, "shopdemo", "staging", "w")
+    assert any(d["kind"] == "Cluster" for d in docs)
+    backend = next(d for d in docs if d["kind"] == "Deployment"
+                   and d["metadata"]["name"] == "backend")
+    env = {e["name"]: e for e in backend["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert "value" not in env["PGPASSWORD"]
+    assert env["PGPASSWORD"]["valueFrom"]["secretKeyRef"]["key"] == "password"
+    assert env["LOG_LEVEL"]["value"] == "info"
+
+
+@needs_score_k8s
+def test_the_frontend_receives_no_api_address_at_runtime(tmp_path, stack_enabled):
+    """Section 10.2: the bundle is built, shipped to a browser, and cannot read container
+    environment variables. If a stack ever starts injecting one, the same-origin contract
+    has been abandoned without anyone deciding to."""
+    dest = new_app(tmp_path)
+    docs = render_stack_app(tmp_path, dest, "shopdemo", "staging", "w")
+    frontend = next(d for d in docs if d["kind"] == "Deployment"
+                    and d["metadata"]["name"] == "frontend")
+    container = frontend["spec"]["template"]["spec"]["containers"][0]
+    for entry in container.get("env") or []:
+        assert "api" not in (entry.get("value") or "").lower(), entry
+
+
+# =====================================================================================
+# PHASE 5 — integration with the pinned score-compose binary
+# =====================================================================================
+HAS_SCORE_COMPOSE = shutil.which("score-compose") is not None
+HAS_MAKE = shutil.which("make") is not None
+needs_score_compose = pytest.mark.skipif(
+    not (HAS_SCORE_COMPOSE and HAS_MAKE),
+    reason="score-compose or make not installed")
+
+
+def make_generate(app_dir: Path) -> dict:
+    """Run the app's OWN `make generate` — the same recipe a developer runs.
+
+    Driving the generated Makefile rather than reimplementing its steps is the point: the
+    recipe, the vendored provisioners and the pinned binary are exactly what can drift apart,
+    so the test has to exercise all three together. Only `docker compose up` is left out.
+    """
+    (app_dir / ".env").write_text((app_dir / ".env.example").read_text())
+    proc = subprocess.run(["make", "generate"], cwd=app_dir,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return yaml.safe_load((app_dir / "compose.yaml").read_text())
+
+
+def nginx_conf(app_dir: Path) -> str:
+    found = list((app_dir / ".score-compose" / "mounts").glob("routing-*/nginx.conf"))
+    assert len(found) == 1, found
+    return found[0].read_text()
+
+
+@needs_score_compose
+def test_make_dev_generates_a_whole_compose_project_from_score_alone(tmp_path,
+                                                                    stack_enabled):
+    """Gate: `make dev` runs from Score with no hand-written compose file anywhere."""
+    dest = new_app(tmp_path)
+    assert not (dest / "compose.yaml").exists(), "a compose file must never be committed"
+    project = make_generate(dest)
+
+    services = project["services"]
+    # Both workloads build from the repo root, so both see shared/.
+    for name, container in (("backend-api", "backend"), ("frontend-web", "frontend")):
+        assert services[name]["build"]["context"] == "."
+        assert services[name]["hostname"] == container
+    assert any(s.get("image", "").startswith(str(orc.CONFIG.get("images.postgres")))
+               for s in services.values()), "no local postgres provisioned"
+    # The API reads its database through the same variable names it uses on the cluster.
+    env = services["backend-api"]["environment"]
+    assert env["PGDATABASE"] == "app_backend" and env["PGUSER"] == "app_backend"
+    assert env["PGPASSWORD"], "local password must be generated, not blank"
+
+
+@needs_score_compose
+def test_local_routing_puts_api_first_whatever_the_workloads_are_called(tmp_path,
+                                                                       stack_enabled):
+    """The measured regression, end to end through the real binary.
+
+    nginx takes the FIRST matching regex location, so if `^/` is emitted before `^/api/`
+    the frontend answers every API call. Naming the frontend `app-ui` and the backend
+    `orders` is the ordering that broke score-compose's own route provisioner.
+    """
+    dest = new_app(tmp_path)
+    for directory, old, new in (("frontend", "frontend", "app-ui"),
+                                ("backend", "backend", "orders")):
+        score = dest / directory / "score.yaml"
+        doc = yaml.safe_load(score.read_text())
+        doc["metadata"]["name"] = new
+        write(score, doc)
+    make_generate(dest)
+
+    conf = nginx_conf(dest)
+    api = conf.index("location ~ ^/api/")
+    catch_all = conf.index("location ~ ^/\n") if "location ~ ^/\n" in conf \
+        else conf.index("location ~ ^/ ")
+    assert api < catch_all, "the /api locations must precede the frontend catch-all"
+    assert "orders:8080" in conf and "app-ui:80" in conf
+
+
+@needs_score_compose
+def test_the_local_router_re_resolves_dns_so_a_rebuild_is_not_a_502(tmp_path,
+                                                                   stack_enabled):
+    """Rebuilding a workload gives its container a new IP. Without a short resolver TTL
+    nginx keeps the old one for ten minutes and answers 502 while the target runs fine."""
+    dest = new_app(tmp_path)
+    make_generate(dest)
+    conf = nginx_conf(dest)
+    assert re.search(r"resolver 127\.0\.0\.11 valid=\d+s", conf)
+    # proxy_pass through a VARIABLE is what makes nginx consult the resolver at all.
+    assert "set $backend" in conf and "proxy_pass http://$backend;" in conf
+
+
+# ------------------------------------------------- CI and renderer must agree on tags
+@needs_score_k8s
+def test_image_plan_and_render_pin_the_same_images(tmp_path, capsys, stack_enabled):
+    """The mismatch this guards is invisible until a pod dies: an app's CI builds what
+    `image-plan` says, the orchestrator renders what `plan_images` says, and if the two
+    disagree Fleet applies a manifest referencing an image nobody pushed."""
+    dest = new_app(tmp_path)
+    orc.cmd_image_plan(orc.argparse.Namespace(
+        app="shopdemo", image="shopdemo", tag="deadbeef", registry="h.io/p",
+        app_dir=str(dest), tag_strategy=""))
+    planned = json.loads(capsys.readouterr().out)
+    docs = render_stack_app(tmp_path, dest, "shopdemo", "staging", "w")
+    rendered = {d["metadata"]["name"]: d["spec"]["template"]["spec"]["containers"][0]["image"]
+                for d in docs if d["kind"] == "Deployment"}
+    assert planned == rendered
+
+
+def test_the_shipped_ci_templates_let_the_platform_choose_the_strategy():
+    """A template that hardcodes `--tag-strategy` silently overrules `.idp/stack.yaml`.
+    Worse, `image-plan` without --env-config cannot see features.stack_onboarding, so CI
+    would compute `content` while the orchestrator computes `commit` — two different tags
+    for one commit."""
+    for name in ("app-ci-mot-service.yaml", "app-ci-nhieu-service.yaml"):
+        text = (CATALOG / "templates" / name).read_text()
+        # Comments may DISCUSS the flag; what matters is that no command passes it.
+        code = "\n".join(line for line in text.splitlines()
+                         if not line.lstrip().startswith("#"))
+        assert "--tag-strategy" not in code, name
+        assert 'tag_strategy:"' not in code, name
+        assert "image-plan" in code, name
+        plan_call = code[code.index("orchestrate.py"):code.index("image-plan")]
+        assert "--env-config" in plan_call, name
+
+
+def test_the_orchestrator_workflow_defers_to_the_app_when_the_payload_is_silent():
+    text = (CATALOG / ".github" / "workflows" / "orchestrator.yaml").read_text()
+    assert "client_payload.tag_strategy || ''" in text
+    assert "client_payload.tag_strategy || 'content'" not in text

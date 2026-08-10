@@ -1,0 +1,25 @@
+# Worker Node — archetype `worker`. Không có service, không có route, không nhận HTTP.
+#
+# Vì không có cổng nào để gọi, `verify` không thể chứng minh worker "sẵn sàng" bằng probe
+# HTTP. Nó chỉ chờ rollout thật (updatedReplicas/observedGeneration) như mọi workload khác.
+# Nếu cần bằng chứng mạnh hơn thì worker phải tự ghi trạng thái ra database hoặc metric —
+# đó là việc của app, không phải của platform.
+apiVersion: idp.company/v1
+kind: StackComponent
+
+metadata:
+  id: node-worker
+  archetype: worker
+  runtime: node
+  description: Tiến trình nền Node, không nhận HTTP, dùng chung contract database với API.
+
+spec:
+  workload: true
+  workspace: true
+  container: worker
+  # Không có port và không có routePath: đó là điều phân biệt worker với web-api.
+  port: null
+  routePath: null
+  buildContext: "."
+  consumes:
+    - database

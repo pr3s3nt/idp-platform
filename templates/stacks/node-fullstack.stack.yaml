@@ -1,0 +1,69 @@
+# STACK `node-fullstack` v1.0.0 — golden path đầu tiên của platform.
+#
+# Nội bộ nó chỉ là phép cộng, không phải một template độc lập (mục 9.3):
+#
+#   node-fullstack = static-frontend + node-api + shared-lib + capability database
+#
+# Nên sửa `node-api` một lần là cả `node-api` lẫn `node-fullstack` cùng được sửa. Không có
+# template nào bị sao chép, nên không có bản sao nào bị bỏ quên.
+#
+# PHIÊN BẢN STACK TÁCH RỜI PHIÊN BẢN CATALOG. `platform.lock` ghim catalog (cách một resource
+# được hiện thực hoá); `version` ở đây ghim BỘ FILE mà kho ứng dụng được sinh ra từ đó. Nâng
+# stack là một PR có diff trong kho app; nâng catalog thì không đụng vào file của app.
+apiVersion: idp.company/v1
+kind: Stack
+
+metadata:
+  id: node-fullstack
+  version: 1.0.0
+  description: React/Vite + Express API + PostgreSQL, cùng origin, chạy local bằng score-compose.
+
+spec:
+  # `commit` chứ KHÔNG phải `content`, và đây là quyết định có đo đạc (mục 10.3):
+  # `content` băm theo THƯ MỤC của từng workload, nên sửa `shared/` — thư mục nằm ngoài cả
+  # frontend/ lẫn backend/ — không làm đổi tag của workload nào cả. Kết quả là deploy hai
+  # ảnh cũ mà không có lỗi nào. Chỉ bật `content` lại khi image planner hiểu được đồ thị
+  # phụ thuộc giữa các workspace.
+  tagStrategy: commit
+
+  # File do PLATFORM sở hữu. `stack-upgrade` mặc định chỉ đề xuất diff cho các file này,
+  # vì chúng là phần "khung" mà đội ứng dụng không nên sửa tay. Mã nguồn, dependency và
+  # values là của đội ứng dụng — muốn xem diff cả những thứ đó thì dùng --all.
+  managedFiles:
+    - Makefile
+    - .gitignore
+    - .idp/stack.yaml
+    - .idp/score-compose/*.provisioners.yaml
+
+  components:
+    - id: shared-lib
+      dir: shared
+    - id: node-api
+      dir: backend
+      workload: backend
+      consumes:
+        - database
+    - id: static-frontend
+      dir: frontend
+      workload: frontend
+
+  capabilities:
+    - database
+
+  # Giá trị khởi tạo cho .score-values/values.yaml. `application` áp cho mọi môi trường;
+  # khối theo môi trường ghi đè lên nó.
+  values:
+    application:
+      LOG_LEVEL: "info"
+    environments:
+      staging:
+        PUBLIC_HOST: "__APP__.__DOMAIN_STAGING__"
+      prod:
+        PUBLIC_HOST: "__APP__.__DOMAIN_PROD__"
+
+  # Giá trị dành riêng cho `.env.example` (máy lập trình viên). KHÔNG đi vào
+  # `.score-values/values.yaml`: platform có đúng hai môi trường, staging và prod. Local
+  # không phải môi trường thứ ba mà là bản dựng tạm của staging trên máy — nên nó chỉ ghi
+  # đè đúng những khoá phải khác, và `*.localhost` tự phân giải về 127.0.0.1.
+  localValues:
+    PUBLIC_HOST: "__APP__.localhost"

@@ -1,0 +1,29 @@
+# Express API — archetype `web-api`, runtime Node.
+#
+# Mount toàn bộ router tại /api, KHÔNG phải tại /. Đó không phải sở thích: provisioner
+# `route` của platform (cả HTTPRoute trên cụm lẫn nginx local) chuyển tiếp nguyên đường dẫn,
+# KHÔNG cắt tiền tố. Nên nếu Express mount tại / thì request /api/items tới container thành
+# 404, và chỉ phát hiện được sau khi deploy. Xem mục 10.2 của kế hoạch.
+apiVersion: idp.company/v1
+kind: StackComponent
+
+metadata:
+  id: node-api
+  archetype: web-api
+  runtime: node
+  description: API Express, đọc PostgreSQL qua contract postgres class application.
+
+spec:
+  workload: true
+  workspace: true
+  # Tên container trong score.yaml. Cần cho cờ --build của score-compose, vốn đánh địa chỉ
+  # theo TÊN CONTAINER chứ không theo tên workload.
+  container: api
+  port: 8080
+  routePath: /api
+  # Build từ GỐC KHO, không từ thư mục component: Dockerfile phải nhìn thấy shared/.
+  buildContext: "."
+  # Capability mà component này biết tiêu thụ. Stack nào bật `database` thì resource `db`
+  # mới xuất hiện trong score.yaml.
+  consumes:
+    - database

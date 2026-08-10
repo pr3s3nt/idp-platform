@@ -1,0 +1,18 @@
+# Sinh ra từ score.yaml — KHÔNG commit. Commit nó nghĩa là kho này có hai nguồn topology,
+# và bản chép tay sẽ lặng lẽ lệch khỏi bản sinh ra.
+compose.yaml
+
+# State local của score-compose. Nó chứa MẬT KHẨU DATABASE LOCAL dưới dạng rõ. Mật khẩu đó
+# dùng một lần, chỉ cho máy bạn, và không bao giờ được tái sử dụng cho staging/prod.
+.score-compose/
+.score-k8s/
+
+# Bí mật local. .env là nơi khoá của bên thứ ba nằm khi bạn chạy `make dev`;
+# .env.example là bản mẫu được commit và là ngoại lệ duy nhất.
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+*.log

@@ -1,0 +1,22 @@
+# Score của __WORKLOAD__ — tiến trình nền.
+#
+# KHÔNG có khối `service` và KHÔNG có resource `route`. Đó là khác biệt duy nhất về hình
+# dạng giữa worker và web-api; mọi thứ còn lại (cấu hình theo môi trường, credential
+# database, cách render, cách verify) đi chung một đường.
+apiVersion: score.dev/v1b1
+
+metadata:
+  name: __WORKLOAD__
+
+containers:
+  __CONTAINER__:
+    image: .
+    variables:
+      NODE_ENV: production
+      LOG_LEVEL: "${resources.config.LOG_LEVEL}"
+__CAPABILITY_VARIABLES__
+
+resources:
+  config:
+    type: environment
+__CAPABILITY_RESOURCES__

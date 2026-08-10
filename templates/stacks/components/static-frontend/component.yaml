@@ -1,0 +1,23 @@
+# React + Vite, build ra bundle tĩnh, phục vụ bằng nginx — archetype `static-frontend`.
+#
+# CẤU HÌNH CỦA FRONTEND ĐƯỢC QUYẾT ĐỊNH LÚC BUILD, KHÔNG PHẢI LÚC CHẠY. Bundle JavaScript
+# đã build nằm trong trình duyệt người dùng; biến môi trường của container nginx không với
+# tới nó được. Nên stack này KHÔNG bơm địa chỉ API vào runtime: frontend gọi đường dẫn
+# TƯƠNG ĐỐI `/api/...` và platform lo cho `/` với `/api` cùng một origin. Xem mục 10.2.
+apiVersion: idp.company/v1
+kind: StackComponent
+
+metadata:
+  id: static-frontend
+  archetype: static-frontend
+  runtime: node
+  description: Frontend React/Vite build tĩnh, phục vụ bằng nginx, cùng origin với API.
+
+spec:
+  workload: true
+  workspace: true
+  container: web
+  port: 80
+  routePath: /
+  buildContext: "."
+  consumes: []

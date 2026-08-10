@@ -16,5 +16,6 @@ thứ đang giữ cho hệ thống không hỏng — và họ sẽ có lý, vì 
 | [0006](0006-ghim-phien-ban-toolchain.md) | Ghim phiên bản `score-k8s`/`score-compose`/VSO | Accepted |
 | [0007](0007-topo-vso-va-danh-tinh-verify.md) | Mỗi app một danh tính Vault; verify không được đọc Secret | Accepted |
 | [0008](0008-provider-database-va-credential.md) | CloudNativePG cho `class: application`; credential database đi qua Vault | Accepted |
+| [0009](0009-stack-catalog-va-phat-trien-local.md) | Stack là phép cộng component; `make dev` sinh từ chính Score | Accepted |
 
 Định dạng: Bối cảnh → Quyết định → Hệ quả → Đã cân nhắc và loại.

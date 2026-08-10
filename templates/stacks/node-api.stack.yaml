@@ -1,0 +1,52 @@
+# STACK `node-api` v1.0.0 — chỉ API Express + PostgreSQL, không có frontend.
+#
+# Cùng các component với `node-fullstack`, bớt `static-frontend`. Route của nó vẫn là `/api`
+# chứ không phải `/`: dùng chung một quy ước thì sau này thêm frontend vào là một PR thêm
+# component, không phải một lần đổi đường dẫn kéo theo sửa mọi client đang gọi.
+apiVersion: idp.company/v1
+kind: Stack
+
+metadata:
+  id: node-api
+  version: 1.0.0
+  description: API Express + PostgreSQL, không frontend.
+
+spec:
+  tagStrategy: commit
+
+  # File do PLATFORM sở hữu. `stack-upgrade` mặc định chỉ đề xuất diff cho các file này,
+  # vì chúng là phần "khung" mà đội ứng dụng không nên sửa tay. Mã nguồn, dependency và
+  # values là của đội ứng dụng — muốn xem diff cả những thứ đó thì dùng --all.
+  managedFiles:
+    - Makefile
+    - .gitignore
+    - .idp/stack.yaml
+    - .idp/score-compose/*.provisioners.yaml
+
+  components:
+    - id: shared-lib
+      dir: shared
+    - id: node-api
+      dir: backend
+      workload: backend
+      consumes:
+        - database
+
+  capabilities:
+    - database
+
+  values:
+    application:
+      LOG_LEVEL: "info"
+    environments:
+      staging:
+        PUBLIC_HOST: "__APP__.__DOMAIN_STAGING__"
+      prod:
+        PUBLIC_HOST: "__APP__.__DOMAIN_PROD__"
+
+  # Giá trị dành riêng cho `.env.example` (máy lập trình viên). KHÔNG đi vào
+  # `.score-values/values.yaml`: platform có đúng hai môi trường, staging và prod. Local
+  # không phải môi trường thứ ba mà là bản dựng tạm của staging trên máy — nên nó chỉ ghi
+  # đè đúng những khoá phải khác, và `*.localhost` tự phân giải về 127.0.0.1.
+  localValues:
+    PUBLIC_HOST: "__APP__.localhost"

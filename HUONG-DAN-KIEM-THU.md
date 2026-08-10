@@ -48,6 +48,8 @@ Mỗi "mảng" test canh một bất biến. Test đỏ ở mảng nào = bạn 
 | `multi-workload` / `cross-repo service dependencies` | `${resources.x}` chéo workload/repo resolve đúng. |
 | `app-owned secrets` / `vault paths` / `secretRef shape` | **Tính năng secret đang làm** (nhánh `feature/secret-onboarding`): secret ref/Vault path render ra `secretRef`, giá trị **không** vào manifest. |
 | `kiểm cụm sau khi triển khai` | Logic `verify`: chờ rollout thật, không nhìn `availableReplicas`. |
+| `PHASE 5 — stack catalog` | Catalog `templates/stacks/` tự nhất quán; sinh app không để sót `__TOKEN__`; `.env.example` không lệch khỏi values. |
+| `PHASE 5 — tích hợp score-compose` | Chạy **chính `make generate`** của app sinh ra: routing `/api` phải đứng trước `/` bất kể tên workload, và nginx phải re-resolve DNS. |
 
 ## Render/verify cục bộ — KHÔNG cần cụm
 
@@ -101,7 +103,7 @@ lấy trạng thái SỐNG:
 | 2 — Vault/VSO | VSO (CRD `secrets.hashicorp.com`) + một Vault + VaultConnection/Auth | `python3 orchestrate.py preflight --require-cluster --require-vault` (kiểm CRD + phiên bản VSO + hai object nền tảng, một lệnh) |
 | 3 — App secret | Phase 2 chạy được (VSO sync ra Secret trong ns) | `kubectl get vaultstaticsecret,secretstore -A` |
 | 4 — Postgres capability | DB provider/operator production-grade | probe: tìm operator postgres; `kubectl get crd \| grep -iE 'postgres\|cnpg\|zalando'` |
-| 5 — Stack + score-compose | `score-compose` bản đã ghim | `score-compose --version` |
+| 5 — Stack + score-compose | `score-compose` bản đã ghim + `docker` + `make` | `score-compose --version`; `docker info` |
 | chung — deploy tới cụm | Fleet + gateway (traefik) + storageClass | có trong output `thu-thap-ha-tang.sh` |
 
 **Dựng lại Vault/VSO trên harness (Phase 2) — một lệnh, chạy lại được nhiều lần:**
@@ -124,6 +126,23 @@ python3 orchestrate.py vault-onboard --app <app> --env staging --apply  # SA + V
 python3 orchestrate.py vault-onboard --app <app> --env staging          # in policy/role Vault
 python3 orchestrate.py verify-rbac  --app <app> --env staging --apply   # danh tính verify
 ```
+
+**Golden path và phát triển local (Phase 5):**
+
+```bash
+python3 orchestrate.py --env-config platform.env.yaml stack-list
+python3 orchestrate.py --env-config platform.env.yaml stack-new \
+  --stack node-fullstack --app <app> --owner <đội> --out /duong/dan/kho-moi
+cd /duong/dan/kho-moi && make dev          # cần docker + score-compose, KHÔNG cần cụm
+```
+
+`stack-new` **không ghi đè** file đã có (chạy lại được, dùng `--force` để ép).
+`stack-validate --app-dir <kho>` kiểm kho ứng dụng còn khớp stack; `stack-upgrade` in diff
+và chỉ ghi khi có `--write`.
+
+> Ba test tích hợp Phase 5 chạy **chính `make generate` của app sinh ra**, nên chúng cần
+> `make` và `score-compose` trên PATH. Gate `make dev` đầy đủ (dựng container thật) không
+> nằm trong pytest — chạy tay theo lệnh trên rồi kiểm `/` và `/api/health`.
 
 > Thứ chỉ tồn tại ở công ty (Vault addr thật, policy…) thì theo `KE-HOACH...` mục 0.6: tạo
 > config key + validation/preflight + checklist, **không** tự đánh dấu pass, và **không** để

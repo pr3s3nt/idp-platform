@@ -1,0 +1,56 @@
+# Score của __WORKLOAD__ — nguồn topology DUY NHẤT của workload này.
+#
+# File này mô tả HÌNH DẠNG (container gì, cổng nào, cần resource gì). Nó KHÔNG chứa toạ độ
+# hạ tầng: không tên cụm, không storage class, không địa chỉ database. Cùng file này render
+# ra staging và prod, và `score-compose` dùng chính nó để dựng môi trường local — nên không
+# có compose.yaml viết tay nào phải giữ cho khớp.
+#
+# `image: .` là CỐ Ý và đúng: orchestrator ghi đè bằng tham chiếu ảnh thật lúc render (theo
+# tagStrategy ở .idp/stack.yaml), còn score-compose thay bằng build context local.
+apiVersion: score.dev/v1b1
+
+metadata:
+  name: __WORKLOAD__
+
+containers:
+  __CONTAINER__:
+    image: .
+    variables:
+      NODE_ENV: production
+      PORT: "__PORT__"
+      # Giá trị theo môi trường tới từ .score-values/values.yaml qua resource `config`.
+      # Không đọc file cấu hình, không phân nhánh theo tên môi trường trong code.
+      LOG_LEVEL: "${resources.config.LOG_LEVEL}"
+__CAPABILITY_VARIABLES__
+    # Liveness KHÔNG chạm database (xem src/index.js): sự cố database ngắn không được biến
+    # thành việc Kubernetes giết sạch pod. Readiness thì có — đó mới là "nhận traffic được".
+    livenessProbe:
+      httpGet:
+        path: __ROUTE_PATH__/health
+        port: __PORT__
+    readinessProbe:
+      httpGet:
+        path: __ROUTE_PATH__/ready
+        port: __PORT__
+
+service:
+  ports:
+    http:
+      port: __PORT__
+      targetPort: __PORT__
+
+resources:
+  # Cấu hình theo môi trường (literal) và bí mật (secretRef -> Vault). Xem
+  # .score-values/values.yaml.
+  config:
+    type: environment
+__CAPABILITY_RESOURCES__
+  # CÙNG host với frontend, khác path. Đó là toàn bộ lý do frontend gọi được `/api/...`
+  # bằng URL tương đối và không cần CORS. Provisioner route KHÔNG cắt tiền tố `/api`, nên
+  # Express cũng phải mount tại `/api` — hai bên phải khớp.
+  route:
+    type: route
+    params:
+      host: "${resources.config.PUBLIC_HOST}"
+      port: __PORT__
+      path: __ROUTE_PATH__
