@@ -62,12 +62,29 @@ DEFAULTS: dict = {
     "ci": {"score_k8s_version": "", "score_compose_version": ""},
     "vault": {
         "operator_version": "",
+        # No default address on purpose: it is THE coordinate that differs between every
+        # install, and a fallback here is how a render quietly points at the wrong Vault.
+        "address": "",
+        "namespace": "",
+        "skip_tls_verify": False,
+        "ca_cert_secret": "",
+        "tls_server_name": "",
         "kv_mount": "kv",
         "kv_type": "kv-v2",
         "path_template": "apps/{application}/{environment}/{name}",
+        "auth_mount": "kubernetes",
+        "auth_audience": "vault",
+        "auth_role_template": "idp-{application}-{environment}",
+        "policy_template": "idp-{application}-{environment}",
+        "service_account_template": "idp-{application}",
+        "operator_namespace": "vault-secrets-operator-system",
+        "connection_name": "default",
+        "auth_global_name": "default",
+        "allowed_namespaces": [],
         "auth_ref": "app-vault",
         "refresh_after": "5m",
         "initial_sync_timeout_seconds": 60,
+        "token_ttl": "1h",
     },
     "database_profiles": {},
     # Every capability added by the secret/onboarding programme is off until switched on
@@ -705,6 +722,309 @@ def write_environment_provisioner(resolved: dict, dest: Path, *, app: str, env: 
     dest.write_text(doc)
     log(f"generated environment provisioner with {len(literals)} value(s) -> {dest}")
     return dest
+
+
+# --------------------------------------------------------------------------------------
+# Vault foundation
+# --------------------------------------------------------------------------------------
+# The objects below are what must exist BEFORE any app can reference a secret: how the
+# Vault Secrets Operator reaches Vault (VaultConnection), how it authenticates
+# (VaultAuthGlobal plus a VaultAuth in each app namespace), and what one app/environment
+# is allowed to read (a Vault policy and a Kubernetes auth role).
+#
+# Two rules shape all of it:
+#
+# 1. NOTHING HERE CARRIES A SECRET VALUE. These are coordinates and permissions. The value
+#    only ever travels Vault -> VSO -> a runtime Secret; the platform never sees it, so it
+#    cannot leak it into Git, a log or the render state.
+# 2. EVERY COORDINATE COMES FROM platform.env.yaml. Vault address, mount, auth path, role
+#    and policy naming all differ between installs. A default baked in here is a deploy
+#    that authenticates against the wrong Vault while reporting success.
+#
+# Naming: a Kubernetes object name must be a DNS label, but Vault policy and role names
+# accept more, and a company with an existing convention ("platform_payment-api_staging")
+# must be able to keep it. So the two are validated against different alphabets rather
+# than forcing Vault to look like Kubernetes.
+VAULT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+VAULT_API = "secrets.hashicorp.com/v1beta1"
+
+
+def _vault_str(key: str, default: str = "") -> str:
+    value = CONFIG.get(f"vault.{key}", default)
+    return "" if value is None else str(value).strip()
+
+
+def _vault_derive(key: str, default: str, app: str, env: str, *, dns: bool) -> str:
+    """Expand a `vault.*_template` for one app/environment.
+
+    Kept template-driven rather than hardcoded because role and policy names are the
+    boundary between this platform and a Vault someone else administers: they may already
+    have a naming standard, and renaming a role after the fact means every app's auth
+    breaks at once.
+    """
+    validate_secret_name(app)
+    validate_environment(env)
+    template = _vault_str(key, default) or default
+    name = template.replace("{application}", app).replace("{environment}", env)
+    if "{" in name or "}" in name:
+        raise SystemExit(
+            f"vault.{key} has an unknown placeholder: {template!r}. "
+            "Only {application} and {environment} are substituted."
+        )
+    pattern = DNS_LABEL if dns else VAULT_NAME
+    if not pattern.match(name):
+        raise SystemExit(
+            f"vault.{key} produced {name!r}, which is not a valid "
+            f"{'Kubernetes object name' if dns else 'Vault role/policy name'}."
+        )
+    return name
+
+
+def vault_role_name(app: str, env: str) -> str:
+    return _vault_derive("auth_role_template", "idp-{application}-{environment}",
+                         app, env, dns=False)
+
+
+def vault_policy_name(app: str, env: str, *, write: bool = False) -> str:
+    base = _vault_derive("policy_template", "idp-{application}-{environment}",
+                         app, env, dns=False)
+    return f"{base}-{'write' if write else 'read'}"
+
+
+def vault_service_account(app: str, env: str) -> str:
+    """The ServiceAccount in the app namespace that VSO presents to Vault.
+
+    Deliberately NOT `default`: the Vault role is bound to (namespace, serviceAccount), and
+    binding it to `default` would let every pod in that namespace mint a token that reads
+    the app's secrets, whether or not it is part of the app.
+    """
+    return _vault_derive("service_account_template", "idp-{application}",
+                         app, env, dns=True)
+
+
+def vault_policy_prefix(app: str, env: str) -> str:
+    """The KV prefix, inside the mount, that this app/environment owns. Ends with '/'.
+
+    This is the single load-bearing string of the whole secret feature: the policy granted
+    to an app is a prefix policy, so if the prefix does not pin BOTH the application and
+    the environment, one app can read another's secrets — or staging credentials read
+    production's — and nothing anywhere reports an error.
+    """
+    template = _vault_str("path_template") or "apps/{application}/{environment}/{name}"
+    missing = [p for p in ("{application}", "{environment}") if p not in template]
+    if missing:
+        raise SystemExit(
+            f"vault.path_template must contain {' and '.join(missing)}: "
+            f"got {template!r}. Without it every app shares one prefix, and the per-app "
+            "policy generated from it would grant read access to every other app."
+        )
+    if not template.endswith("{name}"):
+        raise SystemExit(
+            f"vault.path_template must end with {{name}}: got {template!r}. The per-app "
+            "policy is a prefix policy, so the app-supplied segment has to be last — "
+            "otherwise the wildcard would have to span a segment the platform derives."
+        )
+    validate_secret_name(app)
+    validate_environment(env)
+    body = (template[: -len("{name}")]
+            .replace("{application}", app)
+            .replace("{environment}", env))
+    mount = _vault_str("kv_mount") or "kv"
+    return f"{mount}/{body}"
+
+
+def vault_policy(app: str, env: str, *, write: bool = False) -> str:
+    """Vault policy HCL scoped to exactly one app/environment prefix.
+
+    kv-v2 splits one logical path into two real ones — `<mount>/data/<path>` for the value
+    and `<mount>/metadata/<path>` for versions — and a policy that only covers `data` makes
+    `vault kv list`/`get` fail in a way that reads like the secret is missing. kv-v1 has
+    neither infix. Getting this wrong surfaces as "permission denied", which sends whoever
+    is debugging to look at the role, not at the mount type.
+    """
+    prefix = vault_policy_prefix(app, env)
+    mount = _vault_str("kv_mount") or "kv"
+    rest = prefix[len(mount) + 1:]
+    kv_type = (_vault_str("kv_type") or "kv-v2").lower()
+    if kv_type not in ("kv-v1", "kv-v2"):
+        raise SystemExit(
+            f"vault.kv_type must be kv-v1 or kv-v2, got {kv_type!r}. VSO reads the two "
+            "through different paths, so a guess here fails as 'permission denied'."
+        )
+    data_caps = '["create", "update", "read"]' if write else '["read"]'
+    header = (
+        f"# GENERATED by orchestrate.py — Vault policy for {app}/{env} "
+        f"({'write' if write else 'read'}).\n"
+        f"# Scope: {prefix}* — one application, one environment, nothing else.\n"
+    )
+    if kv_type == "kv-v2":
+        return header + (
+            f'path "{mount}/data/{rest}*" {{\n'
+            f"  capabilities = {data_caps}\n"
+            "}\n\n"
+            f'path "{mount}/metadata/{rest}*" {{\n'
+            '  capabilities = ["read", "list"]\n'
+            "}\n"
+        )
+    return header + (
+        f'path "{prefix}*" {{\n'
+        f"  capabilities = {'[\"create\", \"update\", \"read\", \"list\"]' if write else '[\"read\", \"list\"]'}\n"
+        "}\n"
+    )
+
+
+def _vault_labels(**extra: str) -> dict:
+    # Not app.kubernetes.io/managed-by: render strips that label so Fleet/Helm can own the
+    # objects it produces, and these are applied directly by an operator instead.
+    labels = {"app.kubernetes.io/part-of": "idp-platform"}
+    labels.update({k: v for k, v in extra.items() if v})
+    return labels
+
+
+def vault_connection_manifest() -> dict:
+    """How VSO reaches Vault. One per cluster, in the operator's namespace."""
+    address = _vault_str("address")
+    if not address:
+        raise SystemExit(
+            "vault.address is empty in platform.env.yaml. It has no default because it is "
+            "the address the CLUSTER uses to reach Vault — an in-cluster Service on one "
+            "install, a company endpoint on the next. Set it before generating the "
+            "Vault foundation."
+        )
+    spec: dict = {"address": address,
+                  "skipTLSVerify": bool(CONFIG.get("vault.skip_tls_verify", False))}
+    if _vault_str("ca_cert_secret"):
+        spec["caCertSecretRef"] = _vault_str("ca_cert_secret")
+    if _vault_str("tls_server_name"):
+        spec["tlsServerName"] = _vault_str("tls_server_name")
+    return {
+        "apiVersion": VAULT_API,
+        "kind": "VaultConnection",
+        "metadata": {
+            "name": _vault_str("connection_name") or "default",
+            "namespace": _vault_str("operator_namespace") or "vault-secrets-operator-system",
+            "labels": _vault_labels(),
+        },
+        "spec": spec,
+    }
+
+
+def vault_auth_global_manifest() -> dict:
+    """Shared auth defaults every app namespace inherits.
+
+    Only what is genuinely global lives here — connection, method, mount, Vault namespace.
+    Role and ServiceAccount are per-app and stay in the per-namespace VaultAuth; putting
+    them here would hand every namespace one shared identity and undo the prefix policy.
+    """
+    # Namespace-QUALIFIED on purpose. An unqualified ref is resolved against the namespace
+    # of the resource doing the referring — the app's namespace, not this one — so a bare
+    # "default" sends VSO looking for a VaultConnection in every app namespace and every
+    # VaultAuth fails with `VaultConnection "default" not found`. Measured on VSO 1.5.0.
+    spec: dict = {
+        "vaultConnectionRef": f"{_vault_str('operator_namespace') or 'vault-secrets-operator-system'}"
+                              f"/{_vault_str('connection_name') or 'default'}",
+        "defaultAuthMethod": "kubernetes",
+        "defaultMount": _vault_str("auth_mount") or "kubernetes",
+    }
+    if _vault_str("namespace"):
+        spec["defaultVaultNamespace"] = _vault_str("namespace")
+    audience = _vault_str("auth_audience")
+    if audience:
+        spec["kubernetes"] = {"audiences": [audience]}
+    allowed = CONFIG.get("vault.allowed_namespaces") or []
+    if allowed:
+        spec["allowedNamespaces"] = [str(ns) for ns in allowed]
+    return {
+        "apiVersion": VAULT_API,
+        "kind": "VaultAuthGlobal",
+        "metadata": {
+            "name": _vault_str("auth_global_name") or "default",
+            "namespace": _vault_str("operator_namespace") or "vault-secrets-operator-system",
+            "labels": _vault_labels(),
+        },
+        "spec": spec,
+    }
+
+
+def vault_foundation_manifests() -> list[dict]:
+    return [vault_connection_manifest(), vault_auth_global_manifest()]
+
+
+def vault_auth_manifests(app: str, env: str) -> list[dict]:
+    """The per-namespace half: a dedicated ServiceAccount and the VaultAuth that uses it.
+
+    Every VaultStaticSecret for this app points at `vault.auth_ref` in its own namespace —
+    never at the VaultAuthGlobal directly, because a VaultStaticSecret that references the
+    global bypasses the per-namespace identity and authenticates as whatever the global
+    happens to name.
+    """
+    namespace = app_namespace(app, env)
+    sa = vault_service_account(app, env)
+    spec: dict = {
+        "method": "kubernetes",
+        "mount": _vault_str("auth_mount") or "kubernetes",
+        "vaultAuthGlobalRef": {
+            "name": _vault_str("auth_global_name") or "default",
+            "namespace": _vault_str("operator_namespace") or "vault-secrets-operator-system",
+        },
+        "kubernetes": {"role": vault_role_name(app, env), "serviceAccount": sa},
+    }
+    if _vault_str("namespace"):
+        spec["namespace"] = _vault_str("namespace")
+    audience = _vault_str("auth_audience")
+    if audience:
+        spec["kubernetes"]["audiences"] = [audience]
+    labels = _vault_labels(**{"idp.platform/application": app, "idp.platform/environment": env})
+    return [
+        {"apiVersion": "v1", "kind": "ServiceAccount",
+         "metadata": {"name": sa, "namespace": namespace, "labels": labels}},
+        {"apiVersion": VAULT_API, "kind": "VaultAuth",
+         "metadata": {"name": _vault_str("auth_ref") or "app-vault",
+                      "namespace": namespace, "labels": labels},
+         "spec": spec},
+    ]
+
+
+# --------------------------------------------------------------------- verify-only access
+# The identity that answers "did the deploy actually come up?" is NOT the identity that
+# performed the deploy. It gets read access to the objects whose status tells the story —
+# and no access to Secrets at all.
+#
+# There is no half-measure available: Kubernetes RBAC has no verb that reveals a Secret's
+# name and keys while hiding its values, so `get secrets` is `get secret values`. Since
+# verification only ever needs to know that VSO reported Ready, the answer is to not grant
+# it. Whoever runs verify with a broader kubeconfig gets the broader access — this
+# generates the narrow one so that is a choice, not an accident.
+VERIFY_RULES = [
+    {"apiGroups": ["secrets.hashicorp.com"],
+     "resources": ["vaultauths", "vaultstaticsecrets", "vaultdynamicsecrets"],
+     "verbs": ["get", "list", "watch"]},
+    {"apiGroups": ["apps"], "resources": ["deployments", "statefulsets", "replicasets"],
+     "verbs": ["get", "list", "watch"]},
+    {"apiGroups": [""], "resources": ["pods", "pods/log", "services", "events"],
+     "verbs": ["get", "list", "watch"]},
+    {"apiGroups": [""], "resources": ["persistentvolumeclaims"], "verbs": ["get", "list", "watch"]},
+    {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["get", "list", "watch"]},
+    {"apiGroups": ["gateway.networking.k8s.io"], "resources": ["httproutes"],
+     "verbs": ["get", "list", "watch"]},
+]
+
+
+def verify_rbac_manifests(app: str, env: str) -> list[dict]:
+    namespace = app_namespace(app, env)
+    name = resource_name(app, env, "verify")
+    labels = _vault_labels(**{"idp.platform/application": app, "idp.platform/environment": env})
+    meta = {"name": name, "namespace": namespace, "labels": labels}
+    return [
+        {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": dict(meta)},
+        {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+         "metadata": dict(meta), "rules": [dict(r) for r in VERIFY_RULES]},
+        {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+         "metadata": dict(meta),
+         "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": name},
+         "subjects": [{"kind": "ServiceAccount", "name": name, "namespace": namespace}]},
+    ]
 
 
 # --------------------------------------------------------------------------------------
@@ -2026,6 +2346,166 @@ def cmd_verify(args) -> None:
     )
 
 
+# --------------------------------------------------------------------------------------
+# vault foundation commands
+# --------------------------------------------------------------------------------------
+# The CRDs and the controller ship as two objects and upgrade separately. A cluster
+# running 1.4 CRDs under a 1.5 controller (or the reverse) accepts a new CR, reports
+# nothing, and never syncs it — so the version check is against BOTH, not just the pod.
+VSO_CRDS = (
+    "vaultconnections.secrets.hashicorp.com",
+    "vaultauthglobals.secrets.hashicorp.com",
+    "vaultauths.secrets.hashicorp.com",
+    "vaultstaticsecrets.secrets.hashicorp.com",
+)
+
+
+def vso_installed_version(kubeconfig: str | None) -> str | None:
+    """Version of the running VSO controller, from its image tag. None if not installed."""
+    ns = _vault_str("operator_namespace") or "vault-secrets-operator-system"
+    cp = kubectl(["-n", ns, "get", "deploy", "-o", "json"],
+                 kubeconfig=kubeconfig, check=False, capture=True)
+    if cp.returncode != 0:
+        return None
+    try:
+        items = json.loads(cp.stdout or "{}").get("items", [])
+    except json.JSONDecodeError:
+        return None
+    for dep in items:
+        for container in dep.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+            image = container.get("image", "")
+            if "vault-secrets-operator" in image and ":" in image:
+                return image.rsplit(":", 1)[1].lstrip("v")
+    return None
+
+
+def check_vault_foundation(kubeconfig: str | None) -> None:
+    """Fail unless VSO is installed at the pinned version and the foundation objects exist.
+
+    Ordered from the failure that is hardest to diagnose to the easiest: a missing CRD at
+    least makes `kubectl apply` fail loudly, whereas a version skew or a missing
+    VaultConnection produces a VaultStaticSecret that simply sits there.
+    """
+    cp = kubectl(["get", "crd", "-o", "name"], kubeconfig=kubeconfig, check=False, capture=True)
+    if cp.returncode != 0:
+        raise SystemExit(f"cannot list CRDs: {(cp.stderr or '').strip()}")
+    present = set((cp.stdout or "").split())
+    missing = [c for c in VSO_CRDS if f"customresourcedefinition.apiextensions.k8s.io/{c}" not in present]
+    if missing:
+        raise SystemExit(
+            f"Vault Secrets Operator CRDs missing: {', '.join(missing)}. Install VSO "
+            f"{_vault_str('operator_version') or '(version unpinned)'} before enabling "
+            "features.vault_secrets."
+        )
+
+    want = _vault_str("operator_version")
+    have = vso_installed_version(kubeconfig)
+    if not want:
+        log("vault.operator_version is empty — VSO version check skipped")
+    elif have is None:
+        raise SystemExit(
+            f"VSO is pinned to {want} but no vault-secrets-operator Deployment was found in "
+            f"namespace {_vault_str('operator_namespace')}. Check vault.operator_namespace."
+        )
+    elif have != want:
+        raise SystemExit(
+            f"VSO version mismatch: cluster runs {have}, platform.env.yaml pins "
+            f"vault.operator_version={want}. Controller and CRDs must be upgraded together "
+            "— a new CR under an old controller is ignored silently."
+        )
+    else:
+        log(f"VSO {have} matches pinned vault.operator_version")
+
+    ns = _vault_str("operator_namespace") or "vault-secrets-operator-system"
+    for kind, name in (("vaultconnection", _vault_str("connection_name") or "default"),
+                       ("vaultauthglobal", _vault_str("auth_global_name") or "default")):
+        cp = kubectl(["-n", ns, "get", kind, name, "-o", "name"],
+                     kubeconfig=kubeconfig, check=False, capture=True)
+        if cp.returncode != 0:
+            raise SystemExit(
+                f"{kind}/{name} not found in namespace {ns}. Run "
+                "`orchestrate.py vault-foundation --apply` with cluster-admin first."
+            )
+        log(f"found {kind}/{name} in {ns}")
+
+
+def _emit(docs: list[dict], args) -> None:
+    """Print manifests, and apply them only when explicitly asked.
+
+    Print-by-default is the point: these objects grant access to secrets, so the normal
+    path is that a human reads the YAML and applies it with their own credentials.
+    """
+    text = "".join("---\n" + yaml.safe_dump(d, sort_keys=False) for d in docs)
+    if not getattr(args, "apply", False):
+        print(text, end="")
+        return
+    cp = kubectl(["apply", "-f", "-"], kubeconfig=args.kubeconfig, stdin=text,
+                 check=False, capture=True)
+    if cp.returncode != 0:
+        raise SystemExit(f"apply failed: {(cp.stderr or '').strip()}")
+    log((cp.stdout or "").strip())
+
+
+def cmd_vault_foundation(args) -> None:
+    """VaultConnection + VaultAuthGlobal — one set per cluster, applied by an operator."""
+    _emit(vault_foundation_manifests(), args)
+
+
+def cmd_vault_onboard(args) -> None:
+    """Everything one app/environment needs to read its own Vault prefix, and nothing else.
+
+    Two halves with two different owners, so this prints rather than performs the Vault
+    half: the Kubernetes objects (ServiceAccount + VaultAuth) belong to the platform, while
+    the policy and role are written by whoever administers Vault. Deliberately no Vault
+    token is used or required here — CI holding a Vault token would defeat the entire
+    arrangement, since that token can read what the policy allows.
+    """
+    app, env = validate_secret_name(args.app), validate_environment(args.env)
+    namespace = app_namespace(app, env)
+    role, sa = vault_role_name(app, env), vault_service_account(app, env)
+    read_policy = vault_policy_name(app, env)
+    write_policy = vault_policy_name(app, env, write=True)
+
+    if args.print_policy:
+        print(vault_policy(app, env, write=args.write))
+        return
+
+    _emit(vault_auth_manifests(app, env), args)
+
+    if getattr(args, "apply", False):
+        return
+    ttl = _vault_str("token_ttl") or "1h"
+    mount = _vault_str("auth_mount") or "kubernetes"
+    print(f"""
+# ---------------------------------------------------------------------------
+# Vault side — run by whoever administers Vault, with THEIR token, not CI's.
+# Writing prod secrets is expected to sit behind your own approval policy;
+# this only prints what to create.
+# ---------------------------------------------------------------------------
+# 1. Policies (see `vault-onboard --app {app} --env {env} --print-policy [--write]`)
+orchestrate.py vault-onboard --app {app} --env {env} --print-policy \\
+  | vault policy write {read_policy} -
+orchestrate.py vault-onboard --app {app} --env {env} --print-policy --write \\
+  | vault policy write {write_policy} -
+
+# 2. Kubernetes auth role, bound to exactly one ServiceAccount in one namespace.
+vault write auth/{mount}/role/{role} \\
+  bound_service_account_names={sa} \\
+  bound_service_account_namespaces={namespace} \\
+  policies={read_policy} \\
+  ttl={ttl}
+
+# 3. Grant the write policy to the humans/automation that store secrets for this app.
+#    VSO itself must NEVER get it: the operator only reads.
+""".rstrip())
+
+
+def cmd_verify_rbac(args) -> None:
+    """A least-privilege identity for post-deploy verification. No access to Secrets."""
+    _emit(verify_rbac_manifests(validate_secret_name(args.app), validate_environment(args.env)),
+          args)
+
+
 def cmd_config(args) -> None:
     """Expose platform.env.yaml to the workflow, so the YAML holds no infrastructure value.
 
@@ -2096,6 +2576,14 @@ def cmd_preflight(args) -> None:
         if cp.returncode != 0:
             raise SystemExit(f"cluster unreachable: {(cp.stderr or '').strip()}")
         log("cluster reachable")
+
+    # Separate flag rather than "check it whenever features.vault_secrets is on": the
+    # foundation is applied by an operator with cluster-admin, so an app's deploy job may
+    # legitimately be unable to read CRDs or the operator namespace.
+    if getattr(args, "require_vault", False):
+        if not args.require_cluster:
+            raise SystemExit("--require-vault needs --require-cluster (it queries the cluster)")
+        check_vault_foundation(args.kubeconfig)
     log("preflight OK")
 
 
@@ -2173,8 +2661,35 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--require-cluster", action="store_true")
     p.add_argument("--require-score-compose", action="store_true",
                    help="also demand score-compose at its pinned version (stack CI, local dev)")
+    p.add_argument("--require-vault", action="store_true",
+                   help="also demand VSO at its pinned version plus VaultConnection/VaultAuthGlobal")
     p.add_argument("--kubeconfig")
     p.set_defaults(func=cmd_preflight)
+
+    p = sub.add_parser("vault-foundation",
+                       help="in VaultConnection + VaultAuthGlobal (một bộ cho mỗi cụm)")
+    p.add_argument("--apply", action="store_true", help="kubectl apply thay vì chỉ in ra")
+    p.add_argument("--kubeconfig")
+    p.set_defaults(func=cmd_vault_foundation)
+
+    p = sub.add_parser("vault-onboard",
+                       help="ServiceAccount + VaultAuth cho một app/env, kèm policy và role Vault")
+    p.add_argument("--app", required=True)
+    p.add_argument("--env", required=True, choices=("staging", "prod"))
+    p.add_argument("--print-policy", action="store_true", help="chỉ in HCL của policy")
+    p.add_argument("--write", action="store_true",
+                   help="với --print-policy: in policy GHI (dành cho người/onboarding, không cho VSO)")
+    p.add_argument("--apply", action="store_true", help="kubectl apply phần Kubernetes")
+    p.add_argument("--kubeconfig")
+    p.set_defaults(func=cmd_vault_onboard)
+
+    p = sub.add_parser("verify-rbac",
+                       help="in danh tính chỉ-đọc dùng để verify (không có quyền đọc Secret)")
+    p.add_argument("--app", required=True)
+    p.add_argument("--env", required=True, choices=("staging", "prod"))
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--kubeconfig")
+    p.set_defaults(func=cmd_verify_rbac)
 
     p = sub.add_parser("render")
     add_render_flags(p, paths_required=True)

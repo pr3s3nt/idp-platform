@@ -233,7 +233,7 @@ AI phải cập nhật bảng này trong quá trình làm. `Blocked` chỉ dùng
 |---|---|---|
 | 0 — ADR, baseline, portability và toolchain | Done | Xem "Nhật ký Phase 0" bên dưới |
 | 1 — Environment Values, ConfigMap và promotion guard | Done | Xem "Nhật ký Phase 1" bên dưới |
-| 2 — Vault/VSO foundation trên harness | Not started | |
+| 2 — Vault/VSO foundation trên harness | Done | Xem "Nhật ký Phase 2" bên dưới |
 | 3 — App secret integration | Not started | |
 | 4 — PostgreSQL capability/profile | Not started | |
 | 5 — Stack catalog và `score-compose` | Not started | |
@@ -335,6 +335,82 @@ mới có allowlist theo vị trí và kiểm tra typed.
 
 Người dùng phải xác nhận lại khi mang vào công ty: không có gì thêm — Phase 1 không chạm
 tới giá trị hạ tầng nào.
+
+#### Nhật ký Phase 2
+
+Branch `feature/secret-onboarding`, verify từ working tree tại SHA `a3a81cb` (sau Phase 1).
+
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **220 passed**
+(180 → 220, thêm 40 test). Không có test nào bị skip.
+
+**Hạ tầng đã dựng thật trên cụm `kind-staging`** (probe trước khi làm xác nhận cả
+`kind-staging` lẫn `kind-prod` đều CHƯA có gì: không CRD `secrets.hashicorp.com`, không
+namespace Vault):
+
+| Thành phần | Phiên bản | Ghi chú |
+|---|---|---|
+| Vault (dev mode) | chart 0.34.0, Vault 2.0.3 | ns `vault`, KV v2 ở `kv`, kubernetes auth, audit device bật |
+| Vault Secrets Operator | 1.5.0 — đúng bản đã ghim | ns `vault-secrets-operator-system` |
+| VaultConnection + VaultAuthGlobal | sinh từ `platform.env.yaml` | `orchestrate.py vault-foundation --apply` |
+
+Dựng lại được bằng một lệnh: `./tools/dung-vault-harness.sh --context kind-staging`
+(idempotent, mọi toạ độ đọc từ config, tự kiểm bằng `preflight` ở bước cuối).
+
+**Ba gate của Phase 2, đo trên cụm sống** (app fixture `vaultdemo`, namespace
+`vaultdemo-staging`, đã xoá sau khi đo):
+
+| Gate | Cách đo | Kết quả |
+|---|---|---|
+| VSO đọc đúng tiền tố app/env | `VaultStaticSecret` → `apps/vaultdemo/staging/demo` | `Synced`, Secret đích `vaultdemo-demo` xuất hiện, owner là VaultStaticSecret |
+| …và **bị từ chối** ở tiền tố app khác | cùng `VaultAuth`, path `apps/otherapp/staging/demo` | **HTTP 403 permission denied**, không có Secret nào được tạo |
+| CI/verify không đọc được Kubernetes Secret | kubeconfig của SA do `verify-rbac` sinh | `can-i get/list secrets` → **no**; `get secret vaultdemo-demo` → **Forbidden** |
+| …nhưng verify được auth/status | cùng kubeconfig | `VaultAuth.Ready=True`, `VaultStaticSecret` reason `Synced` đọc được |
+| verify không nhìn sang namespace khác | `get pods -n sample-nginx-staging` | **Forbidden** (Role, không phải ClusterRole) |
+| CI không cầm Vault token | `vault-onboard` in runbook | output không chứa `VAULT_TOKEN`; công cụ không đọc biến này |
+| Giá trị bí mật không lọt vào output platform | grep giá trị thật trong mọi manifest sinh ra | **0 lần xuất hiện**; giá trị chỉ nằm trong Secret runtime do VSO sở hữu |
+
+`preflight --require-cluster --require-vault` chạy trên cụm thật: fail đúng chỗ khi thiếu
+`VaultConnection`, pass sau khi apply foundation, và phát hiện lệch phiên bản VSO.
+
+**Regression app legacy**: render `examples/simple-nginx` và `examples/app-with-postgres` ở
+cả `staging` và `prod`, một lần bằng worktree tại baseline `36372b9`, một lần bằng HEAD,
+dùng chung state file. Cả 4 cặp **giống nhau từng byte**.
+
+**Một lỗi thật bắt được nhờ chạy trên cụm, không phải nhờ đọc tài liệu**: `vaultConnectionRef`
+không kèm namespace bị VSO 1.5.0 phân giải theo namespace của resource ĐANG THAM CHIẾU
+(namespace app), nên mọi `VaultAuth` fail với `VaultConnection "default" not found` — chỉ
+hiện trong log controller, `kubectl apply` vẫn xanh. Platform nay luôn sinh dạng đầy đủ
+`<operator-ns>/<connection-name>`, có test ghim lại.
+
+File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
+`platform.env.company.yaml`, `tools/dung-vault-harness.sh` (mới),
+`docs/adr/0007-topo-vso-va-danh-tinh-verify.md` (mới), `docs/adr/README.md`,
+`HUONG-DAN-KIEM-THU.md`.
+
+Config key mới (đều dưới `vault.`): `address`, `namespace`, `skip_tls_verify`,
+`ca_cert_secret`, `tls_server_name`, `auth_mount`, `auth_audience`, `auth_role_template`,
+`policy_template`, `service_account_template`, `token_ttl`, `operator_namespace`,
+`connection_name`, `auth_global_name`, `allowed_namespaces`.
+Lệnh mới: `vault-foundation`, `vault-onboard`, `verify-rbac`, và cờ `preflight --require-vault`.
+
+Migration: không có. Không lệnh nào trong luồng deploy hiện tại gọi code mới; `features.
+vault_secrets` vẫn `false`.
+Rollback: các object nền tảng xoá được độc lập (`kubectl delete vaultauthglobal/vaultconnection`),
+app đang chạy không phụ thuộc chúng chừng nào chưa bật `features.vault_secrets`.
+
+Hạn chế còn lại: `VaultStaticSecret` trong gate là viết tay — **Phase 3** mới sinh nó từ
+`secretRef`, kèm `rolloutRestartTargets`, HMAC rotation và `verify` đọc condition của VSO.
+Vault trên harness là **dev mode** (in-memory, unseal sẵn, HTTP): mất dữ liệu khi pod
+restart, và `skip_tls_verify: true` chỉ đúng cho harness. TLS/HA/backup/unseal là
+prerequisite hạ tầng theo mục 7.5, không phải việc của platform. `kind-prod` chưa cài VSO —
+chưa cần, vì fixture prod của Phase 1 cũng chạy trên `kind-staging`.
+
+Người dùng phải xác nhận lại khi mang vào công ty: `vault.address` (bắt buộc, không có mặc
+định) và `skip_tls_verify: false` + `ca_cert_secret`; tên KV mount và v1/v2; tên
+`auth_mount` kubernetes của ĐÚNG cụm đó và `auth_audience` khớp role; quy ước đặt tên
+role/policy của Vault Ops (`auth_role_template`, `policy_template`); ai được cấp policy
+GHI cho `prod`; namespace của VSO nếu công ty cài chỗ khác; `allowed_namespaces` nếu nhiều
+đội dùng chung cụm.
 
 ### 0.6. Stop conditions
 

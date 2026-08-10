@@ -7,6 +7,7 @@ with the catalog in this repo (provisioners/ + patches/).
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
@@ -2280,3 +2281,383 @@ def test_promotion_demands_an_app_dir_once_a_record_exists(tmp_path, values_enab
     render_env(tmp_path, app_dir, "prod", "w")
     with pytest.raises(SystemExit, match="--app-dir"):
         orc.guard_prod_values(promote_args(tmp_path, None, "tag-only"))
+
+
+# =====================================================================================
+# PHASE 2 — Vault foundation: policy scope
+# =====================================================================================
+# The policy generated here is the ONLY thing standing between one app and another app's
+# secrets. Vault enforces it, so a mistake is not caught by anything else in the platform:
+# a too-broad prefix reads as a working deploy. These tests pin the prefix.
+
+
+def vault_config(**overrides) -> orc.EnvConfig:
+    """The repo's real vault block with a few keys changed."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("vault", {}).update(overrides)
+    return orc.EnvConfig(data)
+
+
+@pytest.fixture
+def vault_cfg(monkeypatch):
+    def apply(**overrides):
+        cfg = vault_config(**overrides)
+        monkeypatch.setattr(orc, "CONFIG", cfg)
+        return cfg
+    return apply
+
+
+def test_policy_grants_one_app_in_one_environment_and_nothing_else():
+    """The whole security model in one assertion: the prefix pins app AND environment."""
+    policy = orc.vault_policy("payment-api", "staging")
+    assert 'path "kv/data/apps/payment-api/staging/*"' in policy
+    assert "orders-api" not in policy
+    # A staging role that could read prod is the same failure as reading another app:
+    # production credentials handed to the environment developers deploy to freely.
+    assert "/prod/" not in policy
+
+
+def test_policy_covers_metadata_because_kv_v2_splits_the_path():
+    """Missing metadata makes `kv get`/`list` fail as 'permission denied' — which reads
+    like the role is wrong, not like the policy covers only half of a kv-v2 mount."""
+    policy = orc.vault_policy("payment-api", "staging")
+    assert 'path "kv/metadata/apps/payment-api/staging/*"' in policy
+
+
+def test_kv_v1_policy_has_no_data_or_metadata_infix(vault_cfg):
+    vault_cfg(kv_type="kv-v1")
+    policy = orc.vault_policy("payment-api", "staging")
+    assert 'path "kv/apps/payment-api/staging/*"' in policy
+    assert "/data/" not in policy and "/metadata/" not in policy
+
+
+def test_read_policy_cannot_write(vault_cfg):
+    """VSO only ever reads. A role that can also write turns a compromised operator into
+    a way to overwrite every app's credentials."""
+    policy = orc.vault_policy("payment-api", "staging")
+    assert "create" not in policy and "update" not in policy
+
+
+def test_write_policy_is_a_separate_named_policy():
+    """Humans and the onboarding tool write; the operator does not. Two policies, two
+    names, so granting one never implies the other."""
+    assert orc.vault_policy_name("payment-api", "staging") != \
+        orc.vault_policy_name("payment-api", "staging", write=True)
+    write = orc.vault_policy("payment-api", "staging", write=True)
+    assert "create" in write and "update" in write
+    assert 'path "kv/data/apps/payment-api/staging/*"' in write
+
+
+def test_policy_follows_a_relocated_mount_and_layout(vault_cfg):
+    """Company Vault will not have a mount called `kv` or a prefix called `apps`."""
+    vault_cfg(kv_mount="secret/platform",
+              path_template="teams/{environment}/{application}/{name}")
+    policy = orc.vault_policy("order", "prod")
+    assert 'path "secret/platform/data/teams/prod/order/*"' in policy
+
+
+@pytest.mark.parametrize("template,fragment", [
+    ("apps/{environment}/{name}", "{application}"),
+    ("apps/{application}/{name}", "{environment}"),
+])
+def test_path_template_missing_a_scope_is_refused(vault_cfg, template, fragment):
+    """Silently generating a policy over a prefix that does not pin the app is the one
+    failure this feature must never have, so it is refused at config level."""
+    vault_cfg(path_template=template)
+    with pytest.raises(SystemExit, match=re.escape(fragment)):
+        orc.vault_policy("payment-api", "staging")
+
+
+def test_path_template_must_end_with_the_app_supplied_segment(vault_cfg):
+    vault_cfg(path_template="apps/{application}/{name}/{environment}")
+    with pytest.raises(SystemExit, match="must end with"):
+        orc.vault_policy_prefix("payment-api", "staging")
+
+
+def test_unknown_kv_type_is_fatal_rather_than_assumed(vault_cfg):
+    vault_cfg(kv_type="kv2")
+    with pytest.raises(SystemExit, match="kv_type"):
+        orc.vault_policy("payment-api", "staging")
+
+
+def test_policy_prefix_refuses_an_app_name_that_could_move_it():
+    with pytest.raises(SystemExit, match="invalid secret name"):
+        orc.vault_policy_prefix("../admin", "staging")
+
+
+# =====================================================================================
+# PHASE 2 — Vault foundation: derived names
+# =====================================================================================
+def test_role_policy_and_service_account_names_are_derived_from_config(vault_cfg):
+    assert orc.vault_role_name("payment-api", "staging") == "idp-payment-api-staging"
+    assert orc.vault_service_account("payment-api", "staging") == "idp-payment-api"
+    vault_cfg(auth_role_template="vault_{application}_{environment}",
+              service_account_template="sa-{application}-{environment}")
+    assert orc.vault_role_name("payment-api", "prod") == "vault_payment-api_prod"
+    assert orc.vault_service_account("payment-api", "prod") == "sa-payment-api-prod"
+
+
+def test_service_account_must_still_be_a_kubernetes_name(vault_cfg):
+    """Vault tolerates an underscore in a role name; a ServiceAccount does not, and the
+    error surfaces at apply time in a namespace nobody is watching."""
+    vault_cfg(service_account_template="idp_{application}")
+    with pytest.raises(SystemExit, match="Kubernetes object name"):
+        orc.vault_service_account("payment-api", "staging")
+
+
+def test_service_account_is_never_the_namespace_default():
+    """The Vault role binds (namespace, serviceAccount). Bound to `default`, every pod in
+    the namespace — including one that is not part of this app — can read its secrets."""
+    assert orc.vault_service_account("payment-api", "staging") != "default"
+
+
+def test_unknown_placeholder_in_a_name_template_is_fatal(vault_cfg):
+    vault_cfg(auth_role_template="idp-{application}-{tenant}")
+    with pytest.raises(SystemExit, match="unknown placeholder"):
+        orc.vault_role_name("payment-api", "staging")
+
+
+# =====================================================================================
+# PHASE 2 — Vault foundation: generated manifests
+# =====================================================================================
+def test_vault_connection_has_no_hardcoded_address(vault_cfg):
+    """There is no sensible default for 'where is Vault'. A fallback here is a deploy that
+    authenticates against the wrong Vault and reports success."""
+    vault_cfg(address="")
+    with pytest.raises(SystemExit, match="vault.address"):
+        orc.vault_connection_manifest()
+
+
+def test_vault_connection_carries_the_configured_coordinates(vault_cfg):
+    vault_cfg(address="https://vault.corp.internal:8200", skip_tls_verify=False,
+              ca_cert_secret="vault-ca", tls_server_name="vault.corp.internal",
+              operator_namespace="vso-system", connection_name="corp")
+    doc = orc.vault_connection_manifest()
+    assert doc["metadata"] == {
+        "name": "corp", "namespace": "vso-system",
+        "labels": {"app.kubernetes.io/part-of": "idp-platform"}}
+    assert doc["spec"] == {
+        "address": "https://vault.corp.internal:8200", "skipTLSVerify": False,
+        "caCertSecretRef": "vault-ca", "tlsServerName": "vault.corp.internal"}
+
+
+def test_optional_tls_fields_are_omitted_rather_than_sent_empty(vault_cfg):
+    """An empty string is not the same as unset: VSO would look for a Secret named ''."""
+    vault_cfg(ca_cert_secret="", tls_server_name="")
+    spec = orc.vault_connection_manifest()["spec"]
+    assert "caCertSecretRef" not in spec and "tlsServerName" not in spec
+
+
+def test_auth_global_holds_only_what_is_genuinely_shared(vault_cfg):
+    """Role and ServiceAccount must NOT be here. One shared identity for every namespace
+    would undo the per-app policy without changing anything visible."""
+    vault_cfg(auth_mount="k8s-staging", namespace="", auth_audience="vault")
+    spec = orc.vault_auth_global_manifest()["spec"]
+    assert spec["defaultAuthMethod"] == "kubernetes"
+    assert spec["defaultMount"] == "k8s-staging"
+    assert "role" not in json.dumps(spec) and "serviceAccount" not in json.dumps(spec)
+    assert "defaultVaultNamespace" not in spec
+
+
+def test_enterprise_vault_namespace_reaches_both_objects(vault_cfg):
+    vault_cfg(namespace="platform")
+    assert orc.vault_auth_global_manifest()["spec"]["defaultVaultNamespace"] == "platform"
+    auth = next(d for d in orc.vault_auth_manifests("payment-api", "staging")
+                if d["kind"] == "VaultAuth")
+    assert auth["spec"]["namespace"] == "platform"
+
+
+def test_vault_auth_uses_a_per_namespace_identity_and_the_shared_global(vault_cfg):
+    vault_cfg(operator_namespace="vso-system", auth_global_name="shared")
+    sa, auth = orc.vault_auth_manifests("payment-api", "staging")
+    assert sa["kind"] == "ServiceAccount"
+    assert sa["metadata"]["namespace"] == "payment-api-staging"
+    assert auth["metadata"]["name"] == "app-vault"
+    assert auth["metadata"]["namespace"] == "payment-api-staging"
+    assert auth["spec"]["vaultAuthGlobalRef"] == {"name": "shared", "namespace": "vso-system"}
+    assert auth["spec"]["kubernetes"]["role"] == "idp-payment-api-staging"
+    assert auth["spec"]["kubernetes"]["serviceAccount"] == sa["metadata"]["name"]
+
+
+def test_vault_auth_follows_a_custom_namespace_pattern(monkeypatch):
+    """A team that is granted namespaces rather than allowed to create them renames every
+    namespace. The VaultAuth has to land in the same one as the workload, or the secret
+    syncs into a namespace no pod reads from."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("kubernetes", {})["namespace_pattern"] = "team-x-{app}-{env}"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    for doc in orc.vault_auth_manifests("payment-api", "staging"):
+        assert doc["metadata"]["namespace"] == "team-x-payment-api-staging"
+
+
+def test_foundation_manifests_are_deterministic():
+    """Applied repeatedly by an operator and by CI. Any churn here is a diff nobody made."""
+    assert yaml.safe_dump(orc.vault_foundation_manifests()) == \
+        yaml.safe_dump(orc.vault_foundation_manifests())
+
+
+def test_no_generated_vault_object_carries_a_value():
+    """The platform generates references, never values. If a Secret body ever appears in
+    this output it is in Git a moment later."""
+    docs = orc.vault_foundation_manifests() + orc.vault_auth_manifests("payment-api", "staging")
+    for doc in docs:
+        assert doc["kind"] != "Secret"
+        assert "data" not in doc and "stringData" not in doc
+
+
+# =====================================================================================
+# PHASE 2 — verify identity: read status, never secrets
+# =====================================================================================
+def test_verify_identity_cannot_read_secrets():
+    """Kubernetes RBAC has no verb that shows a Secret's keys but hides its values, so
+    `get secrets` IS `read every secret in the namespace`. Verification never needs it."""
+    for rule in orc.VERIFY_RULES:
+        assert "secrets" not in rule["resources"], rule
+        assert "*" not in rule["resources"] and "*" not in rule["apiGroups"], rule
+
+
+def test_verify_identity_is_read_only():
+    for rule in orc.VERIFY_RULES:
+        assert set(rule["verbs"]) <= {"get", "list", "watch"}, rule
+
+
+def test_verify_identity_can_read_vso_status():
+    """Gate: auth and sync status must be checkable with the restricted kubeconfig."""
+    rule = next(r for r in orc.VERIFY_RULES if r["apiGroups"] == ["secrets.hashicorp.com"])
+    assert {"vaultauths", "vaultstaticsecrets"} <= set(rule["resources"])
+
+
+def test_verify_rbac_binds_only_its_own_namespace():
+    sa, role, binding = orc.verify_rbac_manifests("payment-api", "staging")
+    assert [d["kind"] for d in (sa, role, binding)] == ["ServiceAccount", "Role", "RoleBinding"]
+    assert {d["metadata"]["namespace"] for d in (sa, role, binding)} == {"payment-api-staging"}
+    # Role, not ClusterRole: a cluster-wide read of every app's objects is not needed to
+    # answer "did MY deploy come up".
+    assert binding["roleRef"]["kind"] == "Role"
+    assert binding["subjects"] == [{"kind": "ServiceAccount", "name": sa["metadata"]["name"],
+                                    "namespace": "payment-api-staging"}]
+
+
+def test_verify_rbac_names_are_dns_safe_and_stable():
+    first = orc.verify_rbac_manifests("payment-api", "staging")[0]["metadata"]["name"]
+    again = orc.verify_rbac_manifests("payment-api", "staging")[0]["metadata"]["name"]
+    assert first == again and len(first) <= 63 and orc.DNS_LABEL.match(first)
+
+
+# =====================================================================================
+# PHASE 2 — preflight against a real cluster's VSO
+# =====================================================================================
+# CRDs and controller are two objects that upgrade separately. Skew is silent: the new CR
+# is accepted, no event is emitted, and the destination Secret never appears.
+def fake_cluster(monkeypatch, *, crds=True, version="1.5.0", foundation=True):
+    calls = []
+
+    def fake_kubectl(args, *, kubeconfig=None, **kw):
+        calls.append(args)
+        if args[:2] == ["get", "crd"]:
+            names = "\n".join(
+                f"customresourcedefinition.apiextensions.k8s.io/{c}" for c in orc.VSO_CRDS)
+            return subprocess.CompletedProcess(args, 0, names if crds else "", "")
+        if "deploy" in args and "-o" in args:
+            items = {"items": [{"spec": {"template": {"spec": {"containers": [
+                {"image": f"hashicorp/vault-secrets-operator:{version}"}]}}}}]} if version else {"items": []}
+            return subprocess.CompletedProcess(args, 0, json.dumps(items), "")
+        if any(a.startswith("vault") for a in args):
+            return subprocess.CompletedProcess(args, 0 if foundation else 1, "", "NotFound")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    return calls
+
+
+def test_preflight_accepts_a_matching_cluster(monkeypatch, vault_cfg):
+    vault_cfg(operator_version="1.5.0")
+    fake_cluster(monkeypatch)
+    orc.check_vault_foundation(None)
+
+
+def test_preflight_refuses_a_version_skew(monkeypatch, vault_cfg):
+    vault_cfg(operator_version="1.5.0")
+    fake_cluster(monkeypatch, version="1.4.1")
+    with pytest.raises(SystemExit, match="1.4.1"):
+        orc.check_vault_foundation(None)
+
+
+def test_preflight_refuses_missing_crds(monkeypatch, vault_cfg):
+    vault_cfg(operator_version="1.5.0")
+    fake_cluster(monkeypatch, crds=False)
+    with pytest.raises(SystemExit, match="CRDs missing"):
+        orc.check_vault_foundation(None)
+
+
+def test_preflight_refuses_when_the_foundation_was_never_applied(monkeypatch, vault_cfg):
+    vault_cfg(operator_version="1.5.0")
+    fake_cluster(monkeypatch, foundation=False)
+    with pytest.raises(SystemExit, match="vault-foundation"):
+        orc.check_vault_foundation(None)
+
+
+def test_an_empty_pin_skips_the_version_check_but_not_the_rest(monkeypatch, vault_cfg):
+    """Same brownfield on-ramp as the other pins: empty means 'not checked', and it is
+    still an error for the CRDs or the foundation objects to be missing."""
+    vault_cfg(operator_version="")
+    fake_cluster(monkeypatch, version="0.9.0")
+    orc.check_vault_foundation(None)
+
+
+def test_require_vault_without_a_cluster_is_rejected(monkeypatch):
+    args = argparse.Namespace(require_cluster=False, require_vault=True, kubeconfig=None,
+                              require_score_compose=False)
+    monkeypatch.setattr(orc, "check_tool_versions", lambda *a, **k: None)
+    with pytest.raises(SystemExit, match="--require-cluster"):
+        orc.cmd_preflight(args)
+
+
+# =====================================================================================
+# PHASE 2 — the onboarding tool
+# =====================================================================================
+def test_vault_foundation_prints_and_does_not_touch_the_cluster(monkeypatch, capsys):
+    """Default is print. These objects grant access to secrets, so applying them is a
+    deliberate act by someone holding cluster-admin, not a side effect of running a tool."""
+    def explode(*a, **k):
+        raise AssertionError("kubectl must not run without --apply")
+    monkeypatch.setattr(orc, "kubectl", explode)
+    orc.main(["--env-config", str(CATALOG / "platform.env.yaml"), "vault-foundation"])
+    docs = list(yaml.safe_load_all(capsys.readouterr().out))
+    assert [d["kind"] for d in docs if d] == ["VaultConnection", "VaultAuthGlobal"]
+
+
+def test_onboarding_prints_vault_commands_and_uses_no_vault_token(monkeypatch, capsys):
+    """CI must never hold a Vault token: that token can read everything the policy allows,
+    which makes the split between 'platform generates references' and 'VSO reads values'
+    meaningless. The tool prints commands for a Vault administrator instead."""
+    monkeypatch.delenv("VAULT_TOKEN", raising=False)
+    orc.main(["--env-config", str(CATALOG / "platform.env.yaml"),
+              "vault-onboard", "--app", "payment-api", "--env", "staging"])
+    out = capsys.readouterr().out
+    assert "vault write auth/kubernetes/role/idp-payment-api-staging" in out
+    assert "bound_service_account_names=idp-payment-api" in out
+    assert "bound_service_account_namespaces=payment-api-staging" in out
+    assert "VAULT_TOKEN" not in out
+
+
+def test_onboarding_can_print_the_policy_for_piping_into_vault(capsys):
+    orc.main(["--env-config", str(CATALOG / "platform.env.yaml"),
+              "vault-onboard", "--app", "payment-api", "--env", "staging", "--print-policy"])
+    assert 'path "kv/data/apps/payment-api/staging/*"' in capsys.readouterr().out
+
+
+def test_verify_rbac_command_prints_three_objects(capsys):
+    orc.main(["--env-config", str(CATALOG / "platform.env.yaml"),
+              "verify-rbac", "--app", "payment-api", "--env", "staging"])
+    docs = [d for d in yaml.safe_load_all(capsys.readouterr().out) if d]
+    assert [d["kind"] for d in docs] == ["ServiceAccount", "Role", "RoleBinding"]
+
+
+def test_auth_global_qualifies_the_connection_with_its_namespace(vault_cfg):
+    """Measured against VSO 1.5.0: an unqualified `vaultConnectionRef` is resolved in the
+    namespace of whatever REFERS to it — i.e. each app's namespace — so a bare name makes
+    every VaultAuth in the platform fail with `VaultConnection "default" not found`, in a
+    controller log nobody is watching rather than at apply time."""
+    vault_cfg(operator_namespace="vso-system", connection_name="corp")
+    assert orc.vault_auth_global_manifest()["spec"]["vaultConnectionRef"] == "vso-system/corp"

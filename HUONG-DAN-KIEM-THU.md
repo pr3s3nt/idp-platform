@@ -98,11 +98,32 @@ lấy trạng thái SỐNG:
 
 | Phase | Cần | Kiểm nhanh |
 |---|---|---|
-| 2 — Vault/VSO | VSO (CRD `secrets.hashicorp.com`) + một Vault + VaultConnection/Auth | `kubectl get crd \| grep secrets.hashicorp.com` ; `helm ls -A \| grep -iE 'vault\|vso'` |
+| 2 — Vault/VSO | VSO (CRD `secrets.hashicorp.com`) + một Vault + VaultConnection/Auth | `python3 orchestrate.py preflight --require-cluster --require-vault` (kiểm CRD + phiên bản VSO + hai object nền tảng, một lệnh) |
 | 3 — App secret | Phase 2 chạy được (VSO sync ra Secret trong ns) | `kubectl get vaultstaticsecret,secretstore -A` |
 | 4 — Postgres capability | DB provider/operator production-grade | probe: tìm operator postgres; `kubectl get crd \| grep -iE 'postgres\|cnpg\|zalando'` |
 | 5 — Stack + score-compose | `score-compose` bản đã ghim | `score-compose --version` |
 | chung — deploy tới cụm | Fleet + gateway (traefik) + storageClass | có trong output `thu-thap-ha-tang.sh` |
+
+**Dựng lại Vault/VSO trên harness (Phase 2) — một lệnh, chạy lại được nhiều lần:**
+
+```bash
+./tools/dung-vault-harness.sh --context kind-staging
+```
+
+Nó đọc toạ độ từ `platform.env.yaml` (`vault.address` quyết định Vault nằm ở namespace
+nào), cài Vault **dev mode** + VSO đúng phiên bản đã ghim, bật KV/kubernetes-auth/audit,
+apply `VaultConnection`+`VaultAuthGlobal` sinh từ config, rồi tự kiểm bằng `preflight`.
+Vault dev mode **mất sạch dữ liệu khi pod restart** — chạy lại script để dựng lại mount,
+nhưng secret đã ghi thì phải ghi lại. Công ty đã có Vault thật ⇒ **không** chạy script này,
+chỉ điền `vault.*` rồi chạy `orchestrate.py vault-foundation --apply`.
+
+Onboard một app vào Vault (hai nửa, hai chủ sở hữu — xem ADR `0007`):
+
+```bash
+python3 orchestrate.py vault-onboard --app <app> --env staging --apply  # SA + VaultAuth
+python3 orchestrate.py vault-onboard --app <app> --env staging          # in policy/role Vault
+python3 orchestrate.py verify-rbac  --app <app> --env staging --apply   # danh tính verify
+```
 
 > Thứ chỉ tồn tại ở công ty (Vault addr thật, policy…) thì theo `KE-HOACH...` mục 0.6: tạo
 > config key + validation/preflight + checklist, **không** tự đánh dấu pass, và **không** để
