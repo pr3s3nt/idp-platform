@@ -7,6 +7,7 @@ with the catalog in this repo (provisioners/ + patches/).
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -1783,3 +1784,499 @@ def test_two_renders_of_one_input_are_byte_identical(tmp_path):
         return Path(args.out).read_bytes()
 
     assert render("run1") == render("run2")
+
+
+# =====================================================================================
+# PHASE 1 — ApplicationValues: schema and precedence
+# =====================================================================================
+def values_doc(application=None, staging=None, prod=None) -> dict:
+    spec = {}
+    if application is not None:
+        spec["application"] = application
+    envs = {k: v for k, v in (("staging", staging), ("prod", prod)) if v is not None}
+    if envs:
+        spec["environments"] = envs
+    return {"apiVersion": "idp.company/v1", "kind": "ApplicationValues", "spec": spec}
+
+
+def check(doc) -> dict:
+    return orc.validate_application_values(doc, ".score-values/values.yaml")
+
+
+@pytest.fixture
+def values_enabled(monkeypatch):
+    """The repo's real config with features.application_values switched on."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("features", {})["application_values"] = True
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+
+
+def test_environment_overrides_application():
+    spec = check(values_doc(application={"LOG_LEVEL": "info", "FEATURE_X": "false"},
+                            staging={"LOG_LEVEL": "debug"}))
+    assert orc.resolve_application_values(spec, "staging") == {
+        "LOG_LEVEL": "debug", "FEATURE_X": "false"}
+    assert orc.resolve_application_values(spec, "prod") == {
+        "LOG_LEVEL": "info", "FEATURE_X": "false"}
+
+
+def test_an_environment_with_no_block_still_gets_the_shared_values():
+    spec = check(values_doc(application={"LOG_LEVEL": "info"}, staging={"LOG_LEVEL": "debug"}))
+    assert orc.resolve_application_values(spec, "prod")["LOG_LEVEL"] == "info"
+
+
+@pytest.mark.parametrize("bad_value", [False, True, 8080, 1.10, None, ["a"]])
+def test_non_string_literals_are_refused_with_the_quoting_fix(bad_value):
+    """YAML types `false`, `8080` and `yes` for you. Environment variables are strings, and
+    str()-ing them quietly turns 1.10 into '1.1'."""
+    with pytest.raises(SystemExit, match="not a string|quote it"):
+        check(values_doc(application={"FEATURE_X": bad_value}))
+
+
+def test_yaml_reads_unquoted_no_as_a_boolean_and_we_refuse_it():
+    """The specific trap the docs warn about: yes/no/on/off are YAML 1.1 booleans."""
+    doc = yaml.safe_load("""
+apiVersion: idp.company/v1
+kind: ApplicationValues
+spec:
+  application:
+    ENABLED: no
+""")
+    assert doc["spec"]["application"]["ENABLED"] is False
+    with pytest.raises(SystemExit, match="not a string"):
+        check(doc)
+
+
+def test_quoted_no_is_accepted_as_a_string():
+    spec = check(yaml.safe_load("""
+apiVersion: idp.company/v1
+kind: ApplicationValues
+spec:
+  application:
+    ENABLED: "no"
+"""))
+    assert orc.resolve_application_values(spec, "staging") == {"ENABLED": "no"}
+
+
+def test_unknown_environment_is_refused():
+    with pytest.raises(SystemExit, match="production"):
+        check(values_doc(prod={"A": "b"}) | {"spec": {"environments": {"production": {}}}})
+
+
+def test_wrong_apiversion_or_kind_is_refused():
+    with pytest.raises(SystemExit, match="apiVersion"):
+        check(values_doc(application={"A": "b"}) | {"apiVersion": "v1"})
+    with pytest.raises(SystemExit, match="kind"):
+        check(values_doc(application={"A": "b"}) | {"kind": "ConfigMap"})
+
+
+def test_unknown_top_level_field_is_refused():
+    """A typo'd `enviroments:` would otherwise apply to nothing and report nothing."""
+    with pytest.raises(SystemExit, match="unknown field"):
+        check({"apiVersion": "idp.company/v1", "kind": "ApplicationValues",
+               "spec": {"enviroments": {"staging": {}}}})
+
+
+# ------------------------------------------------------------------------- secretRef shape
+SECRET = {"secretRef": {"name": "stripe", "key": "api_key"}}
+
+
+def test_secret_ref_is_accepted():
+    spec = check(values_doc(staging={"STRIPE_KEY": SECRET}))
+    assert orc.resolve_application_values(spec, "staging")["STRIPE_KEY"] == SECRET
+
+
+def test_secret_ref_rejects_an_app_supplied_vault_path():
+    """The whole per-app policy rests on the app being unable to name its own prefix."""
+    with pytest.raises(SystemExit, match="unknown field"):
+        check(values_doc(staging={"K": {"secretRef": {
+            "name": "stripe", "key": "api_key", "path": "kv/apps/other-app/prod"}}}))
+
+
+def test_secret_ref_requires_both_name_and_key():
+    with pytest.raises(SystemExit, match="missing"):
+        check(values_doc(staging={"K": {"secretRef": {"name": "stripe"}}}))
+
+
+def test_secret_ref_name_goes_through_the_path_validator():
+    with pytest.raises(SystemExit, match="invalid secret name"):
+        check(values_doc(staging={"K": {"secretRef": {"name": "../admin", "key": "k"}}}))
+
+
+def test_a_key_cannot_be_literal_in_one_environment_and_secret_in_another():
+    """Otherwise staging renders `env.value` and prod renders `secretKeyRef` from one Score
+    file — and whatever staging proved says nothing about prod."""
+    with pytest.raises(SystemExit, match="same kind"):
+        check(values_doc(staging={"K": "plain"}, prod={"K": SECRET}))
+
+
+def test_a_key_cannot_be_shared_literal_and_environment_secret():
+    with pytest.raises(SystemExit, match="same kind"):
+        check(values_doc(application={"K": "plain"}, prod={"K": SECRET}))
+
+
+# =====================================================================================
+# PHASE 1 — environment resource alias discovery
+# =====================================================================================
+def score_with_resources(resources: dict) -> dict:
+    return {"apiVersion": "score.dev/v1b1", "metadata": {"name": "web"},
+            "containers": {"main": {"image": "."}}, "resources": resources}
+
+
+def test_alias_is_discovered_not_assumed_to_be_env():
+    """Hardcoding `env` is the same bug as hardcoding the container name `main`: it works
+    for everyone who copied the example and no-ops for everyone who did not."""
+    doc = score_with_resources({"app-config": {"type": "environment"}})
+    assert orc.environment_alias(doc, where="score.yaml") == "app-config"
+
+
+def test_no_environment_resource_is_fine():
+    assert orc.environment_alias(score_with_resources({"db": {"type": "postgres"}}),
+                                 where="score.yaml") is None
+    assert orc.environment_alias({}, where="score.yaml") is None
+
+
+def test_two_environment_resources_fail_early():
+    """With two, which one supplies a given key is undefined — and score would pick one."""
+    doc = score_with_resources({"a": {"type": "environment"}, "b": {"type": "environment"}})
+    with pytest.raises(SystemExit, match="at most one"):
+        orc.environment_alias(doc, where="score.yaml")
+
+
+# =====================================================================================
+# PHASE 1 — placeholder allowlist
+# =====================================================================================
+@pytest.mark.parametrize("path,expected", [
+    (("containers", "main", "variables", "LOG_LEVEL"), "variables"),
+    (("containers", "main", "files", "/etc/a.yaml", "content"), "file"),
+    (("containers", "main", "files", 0, "content"), "file"),
+    (("containers", "main", "volumes", 0, "source"), "volume-source"),
+    (("resources", "route", "params", "host"), "params"),
+    (("resources", "route", "params", "nested", "deep"), "params"),
+    (("containers", "main", "command", 0), None),
+    (("containers", "main", "args", 1), None),
+    (("containers", "main", "image"), None),
+    (("containers", "main", "livenessProbe", "httpGet", "path"), None),
+    (("metadata", "annotations", "x"), None),
+])
+def test_placeholder_positions(path, expected):
+    assert orc.placeholder_position(path) == expected
+
+
+@pytest.mark.parametrize("where,score", [
+    ("command", {"containers": {"main": {"image": ".", "command": ["/app", "--log=${resources.cfg.LOG_LEVEL}"]}}}),
+    ("args", {"containers": {"main": {"image": ".", "args": ["${resources.cfg.PORT}"]}}}),
+    ("probe", {"containers": {"main": {"image": ".", "livenessProbe": {"httpGet": {"path": "/${resources.cfg.P}"}}}}}),
+    ("annotation", {"metadata": {"name": "w", "annotations": {"a": "${resources.cfg.X}"}}}),
+])
+def test_placeholder_outside_the_allowlist_is_fatal(where, score):
+    """score-k8s copies these through verbatim. The pod starts, the app reads the literal
+    string '${resources.cfg.LOG_LEVEL}', and nothing anywhere reports a problem."""
+    with pytest.raises(SystemExit, match="does not substitute"):
+        orc.scan_placeholders(score, where="score.yaml", hard=True)
+
+
+def test_placeholder_scan_only_warns_while_the_feature_is_off(capsys):
+    """An app already deployed with this bug must not have its next deploy fail."""
+    score = {"containers": {"main": {"image": ".", "command": ["${resources.cfg.X}"]}}}
+    orc.scan_placeholders(score, where="score.yaml", hard=False)
+    assert "does not substitute" in capsys.readouterr().err
+
+
+def test_allowed_positions_pass_the_scan():
+    orc.scan_placeholders({
+        "containers": {"main": {
+            "image": ".",
+            "variables": {"L": "${resources.cfg.L}"},
+            "files": {"/etc/a": {"content": "x: ${resources.cfg.L}"}},
+        }},
+        "resources": {"route": {"type": "route", "params": {"host": "${resources.cfg.H}"}}},
+    }, where="score.yaml", hard=True)
+
+
+# =====================================================================================
+# PHASE 1 — secret-in-file rules
+# =====================================================================================
+RESOLVED_WITH_SECRET = {"PRIVATE_KEY": SECRET, "LOG_LEVEL": "debug"}
+
+
+def file_score(content: str, **extra) -> dict:
+    return {"containers": {"main": {"image": ".",
+                                    "files": {"/etc/app/key.pem": {"content": content, **extra}}}}}
+
+
+def test_whole_file_secret_is_allowed():
+    orc.check_file_secrets(file_score("${resources.cfg.PRIVATE_KEY}"),
+                           RESOLVED_WITH_SECRET, where="score.yaml")
+
+
+def test_block_scalar_with_trailing_newline_fails_and_names_the_fix():
+    """`content: |` keeps the trailing newline, so the file is secret + "\\n" — a mix.
+    score-k8s catches it, but says 'mix of secret references and raw content', which does
+    not point at the one character that caused it."""
+    with pytest.raises(SystemExit, match=r"\|-"):
+        orc.check_file_secrets(file_score("${resources.cfg.PRIVATE_KEY}\n"),
+                               RESOLVED_WITH_SECRET, where="score.yaml")
+
+
+def test_secret_mixed_with_literal_text_fails():
+    with pytest.raises(SystemExit, match="exactly one reference"):
+        orc.check_file_secrets(file_score("username=admin\npassword=${resources.cfg.PRIVATE_KEY}"),
+                               RESOLVED_WITH_SECRET, where="score.yaml")
+
+
+def test_literal_only_file_may_mix_freely():
+    """The rule is about secrets. A ConfigMap-backed file is reviewable in git, so there is
+    no reason to restrict its shape."""
+    orc.check_file_secrets(file_score("level: ${resources.cfg.LOG_LEVEL}\nother: x"),
+                           RESOLVED_WITH_SECRET, where="score.yaml")
+
+
+def test_no_expand_and_binary_content_are_left_alone():
+    """Both are verbatim by contract, so a ${...} inside them is data, not a reference."""
+    orc.check_file_secrets(file_score("${resources.cfg.PRIVATE_KEY}\n", noExpand=True),
+                           RESOLVED_WITH_SECRET, where="score.yaml")
+    orc.check_file_secrets(
+        {"containers": {"main": {"image": ".", "files": {"/f": {"binaryContent": "AAAA"}}}}},
+        RESOLVED_WITH_SECRET, where="score.yaml")
+
+
+# =====================================================================================
+# PHASE 1 — missing and unused keys
+# =====================================================================================
+def test_a_referenced_key_that_does_not_resolve_is_fatal():
+    """Left alone, the container receives an empty value and the failure looks like a bug
+    in the application rather than a missing entry in a config file."""
+    score = {"containers": {"main": {"variables": {"L": "${resources.cfg.MISSING}"}}}}
+    with pytest.raises(SystemExit, match="MISSING"):
+        orc.check_referenced_keys(score, "cfg", {"LOG_LEVEL": "debug"}, where="score.yaml")
+
+
+def test_referenced_keys_are_collected_from_every_allowed_position():
+    score = {
+        "containers": {"main": {"variables": {"L": "${resources.cfg.A}"},
+                                "files": {"/f": {"content": "${resources.cfg.B}"}}}},
+        "resources": {"route": {"params": {"host": "${resources.cfg.C}"}}},
+    }
+    assert orc.check_referenced_keys(
+        score, "cfg", {"A": "1", "B": "2", "C": "3"}, where="s") == {"A", "B", "C"}
+
+
+def test_references_through_another_resource_are_not_our_keys():
+    """`${resources.db.host}` comes from the postgres provisioner, not from values."""
+    score = {"containers": {"main": {"variables": {"H": "${resources.db.host}"}}}}
+    assert orc.check_referenced_keys(score, "cfg", {}, where="s") == set()
+
+
+# =====================================================================================
+# PHASE 1 — integration: one Score, two environments
+# =====================================================================================
+def values_app(tmp_path: Path, score: dict, values: dict) -> Path:
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", score)
+    write(app_dir / ".score-values" / "values.yaml", values)
+    return app_dir
+
+
+def render_env(tmp_path: Path, app_dir: Path, env: str, name: str) -> list[dict]:
+    """Render into a config-repo-shaped tree, so the prod digest record lands correctly."""
+    config = tmp_path / "config"
+    args = orc.argparse.Namespace(
+        app="payment-api", image="payment-api", tag="sha1", env=env, registry="h.io/p",
+        catalog=str(CATALOG), app_dir=str(app_dir), work=str(tmp_path / name),
+        out=str(config / env / "manifests.yaml"), kubeconfig=None,
+        state_file=str(tmp_path / "state.yaml"), no_state=False, tag_strategy="commit")
+    orc.cmd_render(args)
+    return orc.load_all(Path(args.work) / "manifests.yaml")
+
+
+def container_env(docs: list[dict]) -> dict:
+    dep = next(d for d in docs if d["kind"] == "Deployment")
+    return {e["name"]: e.get("value")
+            for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+
+ENV_SCORE = {
+    "apiVersion": "score.dev/v1b1",
+    "metadata": {"name": "payment-api"},
+    "containers": {"app": {"image": ".", "variables": {
+        "LOG_LEVEL": "${resources.app-config.LOG_LEVEL}",
+        "FEATURE_X": "${resources.app-config.FEATURE_X}"}}},
+    "service": {"ports": {"http": {"port": 8080, "targetPort": 8080}}},
+    "resources": {"app-config": {"type": "environment"}},
+}
+
+ENV_VALUES = values_doc(
+    application={"LOG_LEVEL": "info", "FEATURE_X": "false"},
+    staging={"LOG_LEVEL": "debug", "FEATURE_X": "true"},
+    prod={"PUBLIC_HOST": "payment-api.internal"})
+
+
+@needs_score_k8s
+def test_one_score_renders_different_values_per_environment(tmp_path, values_enabled):
+    """The headline gate: LOG_LEVEL=debug in staging and info in prod, from ONE score.yaml
+    and one values file, with no branching anywhere in the app."""
+    app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
+    assert container_env(render_env(tmp_path, app_dir, "staging", "w1")) == {
+        "LOG_LEVEL": "debug", "FEATURE_X": "true"}
+    assert container_env(render_env(tmp_path, app_dir, "prod", "w2")) == {
+        "LOG_LEVEL": "info", "FEATURE_X": "false"}
+
+
+@needs_score_k8s
+def test_an_app_without_a_values_file_is_untouched(tmp_path):
+    """The brownfield promise. Same fixture the legacy tests use, feature flag off."""
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", score_spec("nginx", container="web"))
+    docs = render_env(tmp_path, app_dir, "staging", "w")
+    assert any(d["kind"] == "Deployment" for d in docs)
+    assert not (tmp_path / "config" / ".platform" / "prod.values.sha256").exists()
+
+
+@needs_score_k8s
+def test_using_the_feature_while_it_is_off_fails_with_the_actual_fix(tmp_path):
+    """score-k8s would say "not supported by any provisioner. Please implement a custom
+    resource provisioner" — which sends the reader off to write one, when the answer is a
+    one-line platform config change they cannot guess from that text."""
+    app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
+    with pytest.raises(SystemExit, match="features.application_values"):
+        render_env(tmp_path, app_dir, "staging", "w")
+
+
+def test_a_values_file_nobody_consumes_only_warns(tmp_path, capsys):
+    """No `type: environment` anywhere, so nothing is broken — but an inert config file
+    that reports nothing is its own trap."""
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", score_spec("web"))
+    write(app_dir / ".score-values" / "values.yaml", ENV_VALUES)
+    assert orc.apply_application_values(
+        orc.discover(app_dir), app_dir, tmp_path, app="web", env="staging") == []
+    assert "features.application_values is off" in capsys.readouterr().err
+
+
+def test_environment_resource_without_a_values_file_fails(tmp_path, values_enabled):
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", ENV_SCORE)
+    with pytest.raises(SystemExit, match="no .score-values"):
+        orc.apply_application_values(
+            orc.discover(app_dir), app_dir, tmp_path, app="web", env="staging")
+
+
+@needs_score_k8s
+def test_literal_file_is_mounted_from_a_configmap(tmp_path, values_enabled):
+    """Gate: non-secret file config becomes a ConfigMap without the developer writing one."""
+    score = json.loads(json.dumps(ENV_SCORE))
+    score["containers"]["app"]["files"] = {"/etc/app/application.yaml": {
+        "content": "logLevel: ${resources.app-config.LOG_LEVEL}\nfeatureX: ${resources.app-config.FEATURE_X}"}}
+    docs = render_env(tmp_path, values_app(tmp_path, score, ENV_VALUES), "staging", "w")
+
+    cm = next(d for d in docs if d["kind"] == "ConfigMap")
+    blob = (cm.get("data") or {}) | {
+        k: base64.b64decode(v).decode() for k, v in (cm.get("binaryData") or {}).items()}
+    body = "\n".join(blob.values())
+    assert "logLevel: debug" in body and "featureX: true" in body
+
+    dep = next(d for d in docs if d["kind"] == "Deployment")
+    volumes = dep["spec"]["template"]["spec"]["volumes"]
+    assert any(v.get("configMap", {}).get("name") == cm["metadata"]["name"] for v in volumes)
+    assert not any(d["kind"] == "Secret" for d in docs), "literal config must not become a Secret"
+
+
+@needs_score_k8s
+def test_a_secret_value_is_refused_while_vault_is_off(tmp_path, values_enabled):
+    """Phase 3 wires these to Vault. Until then, refusing beats rendering a workload whose
+    variable is simply absent."""
+    app_dir = values_app(tmp_path, ENV_SCORE, values_doc(
+        application={"LOG_LEVEL": "info", "FEATURE_X": "false"},
+        staging={"STRIPE_KEY": SECRET}))
+    with pytest.raises(SystemExit, match="features.vault_secrets is off"):
+        render_env(tmp_path, app_dir, "staging", "w")
+
+
+@needs_score_k8s
+def test_values_render_is_deterministic(tmp_path, values_enabled):
+    app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
+    first = (tmp_path / "config" / "staging" / "manifests.yaml")
+    render_env(tmp_path, app_dir, "staging", "w1")
+    one = first.read_bytes()
+    render_env(tmp_path, app_dir, "staging", "w2")
+    assert first.read_bytes() == one
+
+
+# =====================================================================================
+# PHASE 1 — prod values digest guard
+# =====================================================================================
+@needs_score_k8s
+def test_prod_render_records_a_values_digest(tmp_path, values_enabled):
+    app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
+    render_env(tmp_path, app_dir, "prod", "w")
+    record = tmp_path / "config" / ".platform" / "prod.values.sha256"
+    assert record.is_file()
+    assert record.read_text().strip() == orc.values_digest(
+        orc.load_application_values(app_dir))
+
+
+@needs_score_k8s
+def test_staging_render_records_nothing(tmp_path, values_enabled):
+    """A staging deploy must not move the record a prod promotion is checked against."""
+    app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
+    render_env(tmp_path, app_dir, "staging", "w")
+    assert not (tmp_path / "config" / ".platform" / "prod.values.sha256").exists()
+
+
+def promote_args(tmp_path, app_dir, mode, **kw):
+    return orc.argparse.Namespace(
+        config_dir=str(tmp_path / "config"), app_dir=str(app_dir) if app_dir else None,
+        mode=mode, app="payment-api", image="payment-api", tag="v2", **kw)
+
+
+@needs_score_k8s
+@pytest.mark.parametrize("mode", ["tag-only", "from-staging"])
+def test_promotion_refuses_when_prod_values_moved(tmp_path, values_enabled, mode):
+    """The gate. Both fast modes rewrite image tags in an existing manifest and never run
+    the renderer, so an edited prod value would not reach production while the promotion
+    reported success."""
+    app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
+    render_env(tmp_path, app_dir, "prod", "w")
+
+    changed = json.loads(json.dumps(ENV_VALUES))
+    changed["spec"]["environments"]["prod"]["PUBLIC_HOST"] = "moved.internal"
+    write(app_dir / ".score-values" / "values.yaml", changed)
+
+    with pytest.raises(SystemExit, match="re-render"):
+        orc.cmd_promote(promote_args(tmp_path, app_dir, mode))
+
+
+@needs_score_k8s
+def test_promotion_allows_a_pure_tag_bump(tmp_path, values_enabled):
+    """The guard must not cry wolf, or the first thing anyone does is stop trusting it."""
+    app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
+    render_env(tmp_path, app_dir, "prod", "w")
+    orc.cmd_promote(promote_args(tmp_path, app_dir, "tag-only"))
+    manifests = orc.load_all(tmp_path / "config" / "prod" / "manifests.yaml")
+    dep = next(d for d in manifests if d["kind"] == "Deployment")
+    assert dep["spec"]["template"]["spec"]["containers"][0]["image"].endswith(":v2")
+
+
+@needs_score_k8s
+def test_a_staging_only_edit_does_not_block_promotion(tmp_path, values_enabled):
+    app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
+    render_env(tmp_path, app_dir, "prod", "w")
+    changed = json.loads(json.dumps(ENV_VALUES))
+    changed["spec"]["environments"]["staging"]["LOG_LEVEL"] = "trace"
+    write(app_dir / ".score-values" / "values.yaml", changed)
+    orc.cmd_promote(promote_args(tmp_path, app_dir, "tag-only"))
+
+
+def test_promotion_without_a_record_is_unguarded(tmp_path):
+    """Every app deployed before this feature existed. No record, nothing to compare."""
+    (tmp_path / "config").mkdir()
+    orc.guard_prod_values(promote_args(tmp_path, None, "tag-only"))
+
+
+@needs_score_k8s
+def test_promotion_demands_an_app_dir_once_a_record_exists(tmp_path, values_enabled):
+    app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
+    render_env(tmp_path, app_dir, "prod", "w")
+    with pytest.raises(SystemExit, match="--app-dir"):
+        orc.guard_prod_values(promote_args(tmp_path, None, "tag-only"))

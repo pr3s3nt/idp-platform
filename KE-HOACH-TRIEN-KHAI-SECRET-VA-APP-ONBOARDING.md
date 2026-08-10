@@ -232,7 +232,7 @@ AI phải cập nhật bảng này trong quá trình làm. `Blocked` chỉ dùng
 | Phase | Trạng thái | Evidence/ghi chú |
 |---|---|---|
 | 0 — ADR, baseline, portability và toolchain | Done | Xem "Nhật ký Phase 0" bên dưới |
-| 1 — Environment Values, ConfigMap và promotion guard | Not started | |
+| 1 — Environment Values, ConfigMap và promotion guard | Done | Xem "Nhật ký Phase 1" bên dưới |
 | 2 — Vault/VSO foundation trên harness | Not started | |
 | 3 — App secret integration | Not started | |
 | 4 — PostgreSQL capability/profile | Not started | |
@@ -283,6 +283,58 @@ lên harness, sẽ xác minh ở Phase 2. `database_profiles` chưa có provisio
 Người dùng phải xác nhận lại khi mang vào công ty: phiên bản score-k8s/score-compose trên
 runner `platform-orchestrator`; tên KV mount và kv v1/v2 của Vault công ty; phiên bản VSO
 được duyệt; profile prod (instances/storage/retention) do DBA chốt.
+
+#### Nhật ký Phase 1
+
+Branch `feature/secret-onboarding`, verify từ working tree tại SHA `3713b36` (Phase 0).
+
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **180 passed**
+(117 → 180, thêm 63 test). Không có test nào bị skip.
+
+**Deploy và smoke test thật trên cụm `kind-staging`**, render bằng
+`python3 orchestrate.py` gọi trực tiếp từ working tree của feature branch — không dùng
+`repository_dispatch`, không dùng workflow chạy `main`. Namespace fixture riêng
+`valuesdemo-staging` / `valuesdemo-prod`, đã xoá sau khi đo xong:
+
+| Kiểm chứng | Kết quả đo được trong pod đang chạy |
+|---|---|
+| staging từ `score.yaml` chung | `LOG_LEVEL=debug FEATURE_X=true GREETING=shared` |
+| prod từ **cùng** `score.yaml` | `LOG_LEVEL=info FEATURE_X=false GREETING=prod-only` |
+| file cấu hình literal | mount từ ConfigMap `valuesdemo-app-file-…`, nội dung `level=debug feature=true`, phục vụ được qua HTTP |
+| không rò bí mật | `kubectl get secrets` trong namespace: rỗng |
+| rollout | staging 1/1, prod 3/3 (đúng `replicas` theo môi trường) |
+
+Promotion guard đo qua CLI thật:
+
+| Tình huống | Kết quả |
+|---|---|
+| `tag-only`, values không đổi | cho qua, retag 1 ảnh |
+| `tag-only`, sửa khối `prod` | **chặn**, exit 1, in digest cũ/mới và bảo dùng `re-render` |
+| `tag-only`, chỉ sửa khối `staging` | cho qua — guard không kêu oan |
+
+**Regression app legacy** (bằng chứng mạnh nhất của lời hứa brownfield): render
+`examples/simple-nginx` và `examples/app-with-postgres` ở cả `staging` và `prod`, một lần
+bằng worktree tại baseline `36372b9`, một lần bằng HEAD, dùng chung state file. Cả 4 cặp
+**giống nhau từng byte**.
+
+File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`,
+`HUONG-DAN-CAU-HINH-UNG-DUNG.md` (mới).
+
+Config key mới: không có ngoài Phase 0. Tính năng bật bằng
+`features.application_values: true`.
+
+Migration: app hiện có không cần làm gì. Opt-in bằng cách thêm
+`.score-values/values.yaml` và một resource `type: environment`.
+Rollback: đặt `features.application_values: false`. App đã opt-in sẽ fail rõ ràng
+("features.application_values is off") chứ không deploy thiếu biến — có chủ ý.
+
+Hạn chế còn lại: `secretRef` mới được validate đầy đủ (schema, tính nhất quán loại, quy
+tắc file) nhưng chưa sinh output — render fail rõ ràng với "features.vault_secrets is off".
+Phase 3 nối phần này vào VSO. Scanner defense-in-depth theo entropy ở mục 6 chưa làm; hiện
+mới có allowlist theo vị trí và kiểm tra typed.
+
+Người dùng phải xác nhận lại khi mang vào công ty: không có gì thêm — Phase 1 không chạm
+tới giá trị hạ tầng nào.
 
 ### 0.6. Stop conditions
 

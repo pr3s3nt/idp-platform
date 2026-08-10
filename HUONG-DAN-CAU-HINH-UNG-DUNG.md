@@ -1,0 +1,234 @@
+# Cấu hình ứng dụng theo môi trường
+
+Dành cho người phát triển ứng dụng. Trả lời đúng một câu hỏi: **làm sao để app chạy với
+cấu hình khác nhau ở `staging` và `prod` mà chỉ có một `score.yaml`.**
+
+> Tính năng này nằm sau cờ `features.application_values` trong `platform.env.yaml`. App
+> không có `.score-values/values.yaml` giữ nguyên hành vi cũ, không cần đọc tài liệu này.
+
+---
+
+## 1. Ba bước
+
+### Bước 1 — khai một resource `environment` trong `score.yaml`
+
+```yaml
+resources:
+  app-config:            # tên tuỳ bạn đặt: cfg, config, env… đều được
+    type: environment
+```
+
+Mỗi workload được có **0 hoặc 1** resource loại này. Hai cái trở lên là lỗi lúc render —
+vì khi đó không có câu trả lời đúng cho việc cái nào cấp một khoá nào.
+
+### Bước 2 — tham chiếu giá trị trong container
+
+```yaml
+containers:
+  app:
+    image: .
+    variables:
+      LOG_LEVEL: "${resources.app-config.LOG_LEVEL}"
+      PUBLIC_HOST: "${resources.app-config.PUBLIC_HOST}"
+```
+
+### Bước 3 — tạo `.score-values/values.yaml` ở gốc repo
+
+```yaml
+apiVersion: idp.company/v1
+kind: ApplicationValues
+
+spec:
+  application:                 # dùng chung mọi môi trường
+    LOG_LEVEL: info
+    FEATURE_X: "false"
+
+  environments:
+    staging:                   # đè lên application
+      LOG_LEVEL: debug
+      FEATURE_X: "true"
+      PUBLIC_HOST: payment-api.staging.internal
+    prod:
+      PUBLIC_HOST: payment-api.internal
+```
+
+Thứ tự ưu tiên, chỉ hai tầng:
+
+```text
+spec.application  <  spec.environments.<môi-trường>
+```
+
+Kết quả: cùng một `score.yaml` cho `LOG_LEVEL=debug` ở staging và `info` ở prod.
+
+---
+
+## 2. Quy tắc phải nhớ
+
+### Mọi giá trị literal PHẢI là chuỗi
+
+Biến môi trường trong Kubernetes là chuỗi, không có kiểu nào khác. Renderer từ chối
+mọi thứ không phải string thay vì tự ép kiểu.
+
+```yaml
+FEATURE_X: false      # LỖI — YAML đọc thành boolean
+PORT: 8080            # LỖI — YAML đọc thành số
+VERSION: 1.10         # LỖI — và ép kiểu sẽ cho ra "1.1", không phải "1.10"
+
+FEATURE_X: "false"    # đúng
+PORT: "8080"          # đúng
+VERSION: "1.10"       # đúng
+```
+
+Cái bẫy ít ai ngờ: YAML đọc `yes`, `no`, `on`, `off` **thành boolean**.
+
+```yaml
+ENABLED: no           # LỖI — đây là false, không phải chuỗi "no"
+ENABLED: "no"         # đúng
+```
+
+### Chỉ có `staging` và `prod`
+
+`production` không phải bí danh của `prod`. Viết `production:` là lỗi — và đó là chủ ý:
+nếu chấp nhận, một khối viết sai tên sẽ không áp dụng cho môi trường nào và cũng không
+báo gì.
+
+### Một khoá giữ nguyên loại ở mọi môi trường
+
+Literal ở staging và `secretRef` ở prod là lỗi. Nếu cho phép, hai môi trường render ra hai
+hình dạng manifest khác nhau từ một file Score — và thứ staging kiểm chứng không còn là
+thứ prod chạy.
+
+### Khoá được tham chiếu mà không resolve được là lỗi
+
+Không phải chuỗi rỗng. Một biến rỗng trông giống lỗi trong code app, và người ta sẽ đi tìm
+ở nhầm chỗ.
+
+---
+
+## 3. Cấu hình dạng file
+
+Không cần tự viết ConfigMap. Khai thẳng trong Score:
+
+```yaml
+containers:
+  app:
+    files:
+      /etc/app/application.yaml:
+        content: |-
+          logLevel: ${resources.app-config.LOG_LEVEL}
+          featureX: ${resources.app-config.FEATURE_X}
+```
+
+Platform sinh ConfigMap và mount vào đúng đường dẫn. Nội dung nằm trong repo cấu hình nên
+review được bằng mắt.
+
+Muốn đọc từ file có sẵn trong repo thì dùng `source` thay cho `content`. `binaryContent`
+và `noExpand: true` được giữ nguyên văn, không thay thế placeholder.
+
+---
+
+## 4. Bí mật
+
+Khai `secretRef` thay cho giá trị:
+
+```yaml
+spec:
+  environments:
+    staging:
+      STRIPE_KEY:
+        secretRef:
+          name: stripe
+          key: api_key
+```
+
+Chỉ có `name` và `key`. **Không có mount, không có path** — platform tự suy ra đường dẫn
+Vault. Đó là điều làm cho phân quyền theo app có hiệu lực: nếu app tự khai được path thì
+app A đọc được bí mật của app B chỉ bằng cách gõ đúng chuỗi.
+
+Ghi giá trị vào Vault là việc riêng, không đi qua Git và không đi qua CI. Xem
+`docs/adr/0002-vault-only-secret-store.md`.
+
+### Bí mật trong file
+
+File lấy từ bí mật được mount thẳng từ Kubernetes Secret, nên nội dung phải là **đúng một
+tham chiếu và không có gì khác**:
+
+```yaml
+content: "${resources.app-config.PRIVATE_KEY}"     # đúng
+
+content: |-                                         # đúng
+  ${resources.app-config.PRIVATE_KEY}
+
+content: |                                          # LỖI
+  ${resources.app-config.PRIVATE_KEY}
+```
+
+Khác biệt giữa `|` và `|-` là một ký tự xuống dòng ở cuối. `|` giữ nó lại, nên file thành
+"bí mật + newline" — tức là trộn. Dùng `|-`.
+
+Trộn bí mật với chữ thường cũng là lỗi:
+
+```yaml
+content: |-
+  username=admin
+  password=${resources.app-config.PASSWORD}         # LỖI
+```
+
+Nếu cho phép, phần `username=admin` phải được ghi vào manifest trong Git bên cạnh tham
+chiếu bí mật. Tách thành hai file, hoặc để app tự ghép từ hai biến môi trường.
+
+---
+
+## 5. Placeholder chỉ hoạt động ở 4 chỗ
+
+| Vị trí | Có thay thế |
+|---|---|
+| `containers.*.variables` | có |
+| Nội dung `containers.*.files.*` | có |
+| `containers.*.volumes.*.source` | có |
+| `resources.*.params` | có |
+| `command`, `args`, `image`, probe, annotation… | **không** |
+
+Viết `${resources.…}` ở `command` hoặc `args` là lỗi lúc render. Lý do phải chặn: nếu
+không chặn, chuỗi đó được chép nguyên văn vào manifest, pod khởi động bình thường, và app
+đọc được đúng chuỗi `${resources.config.LOG_LEVEL}` làm mức log. Không có lỗi ở bất cứ đâu.
+
+---
+
+## 6. Promotion và prod
+
+Sau mỗi lần render `prod`, platform ghi vào repo cấu hình:
+
+```text
+.platform/prod.values.sha256
+```
+
+Đây là dấu vân tay của cấu hình prod tại lần render đó. Khi promote bằng `--mode tag-only`
+hoặc `--mode from-staging` — hai chế độ chỉ đổi tag ảnh mà **không chạy lại renderer** —
+platform so lại dấu vân tay này.
+
+Nếu bạn đã sửa khối `prod` trong values file thì promotion bị **chặn**, kèm hướng dẫn dùng
+`--mode re-render`. Nếu không chặn, promotion sẽ báo thành công trong khi cấu hình mới
+không hề tới production.
+
+Sửa riêng khối `staging` không ảnh hưởng dấu vân tay prod.
+
+---
+
+## 7. Chẩn đoán nhanh
+
+| Thông báo | Nguyên nhân |
+|---|---|
+| `value of 'X' is bool, not a string` | Thiếu dấu nháy. Chú ý `yes`/`no`/`on`/`off`. |
+| `'X' is a literal in … but a secret in …` | Một khoá đổi loại giữa các môi trường. |
+| `references ['X'], but no such key resolves` | Thiếu khoá trong values file cho môi trường đang render. |
+| `does not substitute there` | Placeholder nằm ngoài 4 vị trí ở mục 5. |
+| `mixes a secret reference with other content` | Xem mục 4 — thường là `\|` thay vì `\|-`. |
+| `declare a 'type: environment' resource, but features.application_values is off` | Platform chưa bật cờ. Liên hệ Platform team. |
+| `prod values have changed since the last prod render` | Dùng `--mode re-render`. |
+
+---
+
+Chi tiết quyết định thiết kế: [`docs/adr/0001`](docs/adr/0001-application-values-v1.md),
+[`0002`](docs/adr/0002-vault-only-secret-store.md),
+[`0004`](docs/adr/0004-placeholder-matrix.md).

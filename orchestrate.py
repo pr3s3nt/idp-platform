@@ -353,6 +353,361 @@ def values_digest(spec: dict, env: str = "prod") -> str:
 
 
 # --------------------------------------------------------------------------------------
+# ApplicationValues — per-environment configuration
+# --------------------------------------------------------------------------------------
+# See docs/adr/0001-application-values-v1.md. One file at the root of an app repo carries
+# the values that differ between staging and prod; a `type: environment` resource hands
+# them to a workload. An app with no such file behaves exactly as it did before.
+VALUES_REL = ".score-values/values.yaml"
+VALUES_API_VERSION = "idp.company/v1"
+VALUES_KIND = "ApplicationValues"
+
+# ${resources.<alias>.<KEY>} — score's own reference syntax.
+RESOURCE_REF = re.compile(r"\$\{resources\.([A-Za-z0-9_.-]+)\.([A-Za-z0-9_.-]+)\}")
+# Cheap pre-check used to decide whether a string is worth parsing at all.
+ANY_RESOURCE_REF = "${resources."
+
+
+def _values_type_error(key: str, value, where: str) -> SystemExit:
+    """YAML's implicit typing is the trap here, so the message has to name it.
+
+    `FEATURE_X: false` is a bool, `PORT: 8080` is an int, and `ENABLED: yes` is ALSO a bool
+    — YAML 1.1 treats yes/no/on/off as booleans. All three become environment variables,
+    which are strings and nothing else. Silently calling str() on them would work until the
+    day someone writes `VERSION: 1.10` and the container sees "1.1".
+    """
+    return SystemExit(
+        f"{where}: value of {key!r} is {type(value).__name__}, not a string. Environment "
+        f"variables are strings — quote it: {key}: \"{value}\". (YAML also reads yes, no, "
+        "on and off as booleans, so those need quoting too.)"
+    )
+
+
+def _entry_kind(key: str, value, where: str) -> str:
+    """Classify one values entry as 'literal' or 'secret', rejecting anything else."""
+    if isinstance(value, str):
+        return "literal"
+    if isinstance(value, dict) and "secretRef" in value:
+        extra = set(value) - {"secretRef"}
+        if extra:
+            raise SystemExit(
+                f"{where}: {key!r} mixes secretRef with other fields: {sorted(extra)}. "
+                "A value is either a literal string or exactly one secretRef."
+            )
+        ref = value["secretRef"]
+        if not isinstance(ref, dict):
+            raise SystemExit(f"{where}: {key!r} has a secretRef that is not a mapping.")
+        missing = {"name", "key"} - set(ref)
+        unknown = set(ref) - {"name", "key"}
+        if missing:
+            raise SystemExit(
+                f"{where}: secretRef for {key!r} is missing {sorted(missing)}. "
+                "It takes exactly two fields: name and key."
+            )
+        if unknown:
+            # Refusing unknown fields is what keeps the Vault path derivable. A tolerated
+            # `path:` or `mount:` here would be the app choosing its own prefix, and the
+            # per-app policy stops meaning anything.
+            raise SystemExit(
+                f"{where}: secretRef for {key!r} has unknown field(s) {sorted(unknown)}. "
+                "Only name and key are accepted — the Vault mount and path are derived by "
+                "the platform and cannot be set by an app."
+            )
+        validate_secret_name(ref["name"])
+        if not isinstance(ref["key"], str) or not ref["key"]:
+            raise SystemExit(f"{where}: secretRef.key for {key!r} must be a non-empty string.")
+        return "secret"
+    if isinstance(value, dict):
+        raise SystemExit(
+            f"{where}: {key!r} is a mapping but has no secretRef. Nested structures are not "
+            "supported — values are flat strings or secret references."
+        )
+    raise _values_type_error(key, value, where)
+
+
+def validate_application_values(doc, where: str) -> dict:
+    """Check the whole document and return `spec`. Every failure here is a fail-fast."""
+    if not isinstance(doc, dict):
+        raise SystemExit(f"{where}: expected a YAML mapping.")
+    if doc.get("apiVersion") != VALUES_API_VERSION:
+        raise SystemExit(
+            f"{where}: apiVersion must be {VALUES_API_VERSION!r}, got {doc.get('apiVersion')!r}."
+        )
+    if doc.get("kind") != VALUES_KIND:
+        raise SystemExit(f"{where}: kind must be {VALUES_KIND!r}, got {doc.get('kind')!r}.")
+    spec = doc.get("spec") or {}
+    if not isinstance(spec, dict):
+        raise SystemExit(f"{where}: spec must be a mapping.")
+    if unknown := set(spec) - {"application", "environments"}:
+        raise SystemExit(f"{where}: unknown field(s) under spec: {sorted(unknown)}.")
+
+    blocks = {"application": spec.get("application") or {}}
+    environments = spec.get("environments") or {}
+    if not isinstance(environments, dict):
+        raise SystemExit(f"{where}: spec.environments must be a mapping.")
+    if bad := set(environments) - set(ENVIRONMENTS):
+        raise SystemExit(
+            f"{where}: unknown environment(s) {sorted(bad)}. This platform has exactly two: "
+            f"{', '.join(ENVIRONMENTS)}. ('production' is not an alias for 'prod'; a block "
+            "under the wrong name applies to nothing and reports no error.)"
+        )
+    for env, block in environments.items():
+        blocks[f"environments.{env}"] = block or {}
+
+    # A key must be the SAME kind everywhere it appears. A literal in staging and a
+    # secretRef in prod renders two different manifest shapes from one Score file, so the
+    # thing staging tested is not the thing prod runs.
+    kinds: dict[str, tuple[str, str]] = {}
+    for block_name, block in blocks.items():
+        if not isinstance(block, dict):
+            raise SystemExit(f"{where}: spec.{block_name} must be a mapping.")
+        for key, value in block.items():
+            kind = _entry_kind(key, value, f"{where} (spec.{block_name})")
+            if key in kinds and kinds[key][0] != kind:
+                first_block, first_kind = kinds[key][1], kinds[key][0]
+                raise SystemExit(
+                    f"{where}: {key!r} is a {first_kind} in spec.{first_block} but a {kind} "
+                    f"in spec.{block_name}. A key must keep the same kind in every "
+                    "environment, or staging and prod render different manifest shapes."
+                )
+            kinds.setdefault(key, (kind, block_name))
+    return spec
+
+
+def load_application_values(app_dir: Path) -> dict | None:
+    """Validated spec, or None when the app has no values file (the legacy path)."""
+    path = Path(app_dir) / VALUES_REL
+    if not path.is_file():
+        return None
+    doc = yaml.safe_load(path.read_text())
+    return validate_application_values(doc, VALUES_REL)
+
+
+def resolve_application_values(spec: dict, env: str) -> dict:
+    """Flatten to {KEY: literal-or-secretRef} for one environment.
+
+    Two tiers, environment wins. Deliberately a flat overwrite rather than a deep merge:
+    values are scalars and secret references, and a deep merge of a secretRef onto a
+    literal would produce a half-secret nobody wrote.
+    """
+    validate_environment(env)
+    resolved = dict((spec or {}).get("application") or {})
+    resolved.update(((spec or {}).get("environments") or {}).get(env) or {})
+    return resolved
+
+
+def environment_alias(score: dict, *, where: str) -> str | None:
+    """Which resource alias, if any, is this workload's `type: environment`.
+
+    Deliberately looked up rather than assumed to be `env`. Hardcoding the alias is the
+    same class of bug as assuming a container is called `main`: it works for every app that
+    copied the example and silently no-ops for the one that did not.
+    """
+    aliases = [name for name, res in ((score or {}).get("resources") or {}).items()
+               if isinstance(res, dict) and res.get("type") == "environment"]
+    if len(aliases) > 1:
+        raise SystemExit(
+            f"{where}: workload declares {len(aliases)} resources of type 'environment' "
+            f"({', '.join(sorted(aliases))}). A workload gets at most one — with two, which "
+            "one supplies a given key is undefined."
+        )
+    return aliases[0] if aliases else None
+
+
+# ------------------------------------------------------------------ placeholder scanning
+def _string_leaves(node, path: tuple = ()):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _string_leaves(value, path + (str(key),))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _string_leaves(value, path + (index,))
+    elif isinstance(node, str):
+        yield path, node
+
+
+def placeholder_position(path: tuple) -> str | None:
+    """Which of the four substituting positions is this, or None for 'nowhere valid'.
+
+    An ALLOWLIST, not a list of known-bad fields — see docs/adr/0004. The difference shows
+    up on the next score-k8s upgrade: a new field defaults to refused and gets looked at,
+    instead of quietly joining the set of places a placeholder is copied through verbatim.
+    """
+    if len(path) == 4 and path[0] == "containers" and path[2] == "variables":
+        return "variables"
+    if len(path) == 5 and path[0] == "containers" and path[2] == "files" and path[4] == "content":
+        return "file"
+    if len(path) == 5 and path[0] == "containers" and path[2] == "volumes" and path[4] == "source":
+        return "volume-source"
+    if len(path) >= 4 and path[0] == "resources" and path[2] == "params":
+        return "params"
+    return None
+
+
+def _fmt_path(path: tuple) -> str:
+    return ".".join(str(p) for p in path)
+
+
+def scan_placeholders(score: dict, *, where: str, hard: bool) -> None:
+    """Refuse `${resources.…}` outside the four positions score-k8s actually substitutes.
+
+    The failure this prevents is completely silent. score-k8s copies `command`, `args`,
+    `image` and probe fields straight through, so:
+
+        command: ["/app", "--log=${resources.config.LOG_LEVEL}"]
+
+    applies cleanly, the pod starts, and the process parses the literal string
+    "${resources.config.LOG_LEVEL}" as its log level. Nothing anywhere reports a problem.
+
+    `hard` is False while features.application_values is off, so an existing app gets a
+    warning rather than a failed deploy for something that was already broken before this
+    check existed.
+    """
+    for path, text in _string_leaves(score):
+        if ANY_RESOURCE_REF not in text:
+            continue
+        if placeholder_position(path):
+            continue
+        message = (
+            f"{where}: '{_fmt_path(path)}' contains a ${{resources.…}} reference, but "
+            "score-k8s does not substitute there — the literal text would be copied into "
+            "the manifest and used as-is, with no error. Placeholders work in "
+            "containers.*.variables, container file contents, containers.*.volumes.*.source "
+            "and resources.*.params."
+        )
+        if hard:
+            raise SystemExit(message)
+        warn(message)
+
+
+def _effective_file_content(entry: dict) -> str | None:
+    """The text score-k8s will substitute into, or None when it substitutes nothing."""
+    if not isinstance(entry, dict):
+        return None
+    # Both are verbatim by contract: binary content has no placeholders to expand, and
+    # noExpand is the escape hatch for a file that legitimately contains ${...}.
+    if entry.get("noExpand") or "binaryContent" in entry:
+        return None
+    content = entry.get("content")
+    return content if isinstance(content, str) else None
+
+
+def check_file_secrets(score: dict, resolved: dict, *, where: str) -> None:
+    """A file holding a secret must hold the secret and NOTHING else.
+
+    score-k8s already refuses the mixed case, but its message is 'contained a mix of secret
+    references and raw content', which does not hint at the actual cause most of the time.
+    That cause is almost always one character:
+
+        content: |            <- keeps the trailing newline, so the file is secret + "\\n"
+          ${resources.cfg.KEY}
+
+        content: |-           <- strips it; this is the one that works
+
+    Someone hitting that at 2am reads 'mix of secret references and raw content', looks at
+    a file containing exactly one reference and nothing else, and concludes the tool is
+    broken. So the check runs here, before score-k8s, and names the fix.
+    """
+    secret_keys = {k for k, v in resolved.items() if isinstance(v, dict) and "secretRef" in v}
+    if not secret_keys:
+        return
+    for container, spec in ((score or {}).get("containers") or {}).items():
+        files = (spec or {}).get("files") or {}
+        entries = files.items() if isinstance(files, dict) else enumerate(files)
+        for target, entry in entries:
+            content = _effective_file_content(entry)
+            if content is None:
+                continue
+            refs = RESOURCE_REF.findall(content)
+            if not any(key in secret_keys for _, key in refs):
+                continue
+            if RESOURCE_REF.fullmatch(content.strip()) and content == content.strip():
+                continue
+            hint = ""
+            if RESOURCE_REF.fullmatch(content.strip()):
+                # Only whitespace differs, so this is the block-scalar case.
+                hint = (" The content is exactly one reference plus surrounding whitespace "
+                        "— use `content: |-` (strips the trailing newline) instead of "
+                        "`content: |`, or put the reference on one line in quotes.")
+            raise SystemExit(
+                f"{where}: containers.{container}.files.{target} mixes a secret reference "
+                f"with other content. A file fed from a secret is mounted straight from the "
+                f"Kubernetes Secret, so its content must be exactly one reference and "
+                f"nothing else — otherwise the literal part would have to be written into "
+                f"the manifest in git alongside it.{hint}"
+            )
+
+
+def check_referenced_keys(score: dict, alias: str | None, resolved: dict, *,
+                          where: str) -> set[str]:
+    """Every key a workload asks the environment resource for must exist. Returns them."""
+    used: set[str] = set()
+    for path, text in _string_leaves(score):
+        if ANY_RESOURCE_REF not in text or not placeholder_position(path):
+            continue
+        for ref_alias, key in RESOURCE_REF.findall(text):
+            if alias and ref_alias == alias:
+                used.add(key)
+    if missing := sorted(used - set(resolved)):
+        raise SystemExit(
+            f"{where}: references {missing} through '{alias}', but no such key resolves for "
+            f"this environment. Add it under spec.application or spec.environments in "
+            f"{VALUES_REL}. (An unresolved key would otherwise reach the container as an "
+            "empty value, which reads like a config bug in the app.)"
+        )
+    return used
+
+
+# ------------------------------------------------------- generated environment provisioner
+def _go_template_safe(text: str) -> str:
+    """Neutralise `{{` in a value that is about to be embedded in a Go template.
+
+    Provisioner `outputs` is a Go template, so a literal value containing `{{ .Foo }}` —
+    entirely plausible in a config string for some other templating system — would be
+    evaluated by score-k8s instead of passed through.
+    """
+    return text.replace("{{", '{{"{{"}}')
+
+
+def write_environment_provisioner(resolved: dict, dest: Path, *, app: str, env: str) -> Path:
+    """Materialise a provisioner for `type: environment` carrying this app's values.
+
+    Generated per render rather than shipped in the catalog because the values ARE the
+    app's, and the catalog is shared and version-pinned. It lands in the work directory
+    next to the resolved catalog, so a failed render leaves behind exactly the files
+    score-k8s was handed.
+    """
+    literals = {}
+    for key, value in sorted(resolved.items()):
+        if isinstance(value, dict) and "secretRef" in value:
+            # Phase 3 turns these into encodeSecretRef outputs backed by a VaultStaticSecret.
+            # Until then, refusing beats rendering a workload with the variable missing.
+            if not feature("vault_secrets"):
+                raise SystemExit(
+                    f"{VALUES_REL}: {key!r} is a secretRef, but features.vault_secrets is "
+                    "off for this platform. Enable it (and install the Vault Secrets "
+                    "Operator) or use a literal value."
+                )
+            raise SystemExit(f"internal: secretRef output for {key!r} is not implemented yet")
+        literals[key] = value
+
+    body = yaml.safe_dump(literals, sort_keys=True, default_flow_style=False,
+                          allow_unicode=True) if literals else "{}\n"
+    doc = (
+        f"# GENERATED by orchestrate.py for {app}/{env} — do not edit, do not commit.\n"
+        f"# Source: {VALUES_REL}. Values are literals only; nothing here is a secret.\n"
+        "- uri: template://platform/environment\n"
+        "  type: environment\n"
+        f"  description: ApplicationValues for {app} in {env}\n"
+        "  outputs: |\n"
+        + "".join(f"    {line}\n" for line in _go_template_safe(body).splitlines())
+    )
+    dest.write_text(doc)
+    log(f"generated environment provisioner with {len(literals)} value(s) -> {dest}")
+    return dest
+
+
+# --------------------------------------------------------------------------------------
 # toolchain pinning
 # --------------------------------------------------------------------------------------
 # score-k8s decides the SHAPE of every manifest this platform produces. Two runners on two
@@ -968,6 +1323,140 @@ def cmd_ensure_gitrepo(args) -> None:
     )
 
 
+def apply_application_values(services: list[Service], app_dir: Path, catalog_dir: Path, *,
+                             app: str, env: str) -> list[Path]:
+    """Validate an app's Score against ApplicationValues and emit the environment provisioner.
+
+    Returns extra provisioner files for score-k8s, empty when the app does not use the
+    feature. Runs BEFORE score-k8s so every diagnostic here names the app's own file rather
+    than a generated manifest.
+    """
+    spec = load_application_values(app_dir)
+    hard = feature("application_values")
+
+    # The placeholder scan runs for every app, values file or not — a `${resources.…}` in
+    # command or args is broken regardless. It only WARNS while the feature is off, because
+    # such an app is already deployed and already broken in that spot, and turning a
+    # long-standing latent bug into a failed deploy is not this change's job.
+    scores = []
+    for service in services:
+        doc = yaml.safe_load(service.path.read_text()) or {}
+        scores.append((service, doc))
+        scan_placeholders(doc, where=f"{service.path.name} ({service.workload})", hard=hard)
+
+    aliases = [(service, doc, environment_alias(doc, where=f"{service.path.name} "
+                                                             f"({service.workload})"))
+               for service, doc in scores]
+    wants_environment = [s.workload for s, _, alias in aliases if alias]
+
+    if not hard:
+        # Fail here rather than letting score-k8s do it. Its message for an unprovisioned
+        # type is "resource 'environment.default#web.cfg' is not supported by any
+        # provisioner. Please implement a custom resource provisioner", which sends the
+        # reader off to write one — when the actual answer is a one-line platform config
+        # change they have no way to guess from that text.
+        if wants_environment:
+            raise SystemExit(
+                f"workload(s) {wants_environment} declare a `type: environment` resource, "
+                "but features.application_values is off for this platform. Set "
+                "features.application_values: true in platform.env.yaml to enable "
+                f"{VALUES_REL}, or remove the resource."
+            )
+        if spec is not None:
+            warn(f"{VALUES_REL} is present but features.application_values is off — the "
+                 "file is being ignored. Enable the flag in platform.env.yaml to use it.")
+        return []
+    if spec is None:
+        if wants_environment:
+            raise SystemExit(
+                f"workload(s) {wants_environment} declare a `type: environment` resource, "
+                f"but the app has no {VALUES_REL} to fill it from."
+            )
+        return []
+
+    resolved = resolve_application_values(spec, env)
+    used: set[str] = set()
+    consumers = 0
+    for service, doc, alias in aliases:
+        if alias is None:
+            continue
+        where = f"{service.path.name} ({service.workload})"
+        consumers += 1
+        check_file_secrets(doc, resolved, where=where)
+        used |= check_referenced_keys(doc, alias, resolved, where=where)
+
+    if not consumers:
+        warn(f"{VALUES_REL} defines {len(resolved)} value(s) for {env}, but no workload "
+             "declares a `type: environment` resource, so none of them reach a container.")
+        return []
+    if unused := sorted(set(resolved) - used):
+        # A warning, not an error: a key can legitimately serve only one of several
+        # environments, or be staged ahead of the code that will read it.
+        warn(f"{VALUES_REL}: value(s) not referenced by any workload in {env}: {unused}")
+
+    return [write_environment_provisioner(
+        resolved, catalog_dir / "generated.environment.provisioners.yaml", app=app, env=env)]
+
+
+# ------------------------------------------------------------------- prod values digest
+def prod_values_record(config_dir: Path) -> Path:
+    return Path(config_dir) / sha_record_dir() / "prod.values.sha256"
+
+
+def record_prod_values_digest(app_dir: Path, config_dir: Path, env: str) -> None:
+    """After rendering prod, record which values that render was built from.
+
+    Only prod, and only for apps that use the feature — an app with no values file leaves
+    no record and is therefore never subject to the guard below.
+    """
+    if env != "prod" or not feature("application_values"):
+        return
+    spec = load_application_values(app_dir)
+    if spec is None:
+        return
+    record = prod_values_record(config_dir)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(values_digest(spec) + "\n")
+    log(f"recorded prod values digest -> {record}")
+
+
+def guard_prod_values(args) -> None:
+    """Refuse a no-render promotion when the prod values have moved since the last render.
+
+    `tag-only` and `from-staging` are fast because they rewrite image tags in a manifest
+    that already exists — they never run the renderer. That is correct for a pure version
+    bump and WRONG the moment someone also edited the prod values block: the promotion
+    reports success, production keeps the old configuration, and the edit appears to have
+    been applied. Comparing digests turns that silent skip into a refusal that names the
+    fix.
+
+    An app with no record has never rendered prod through this feature, so there is nothing
+    to compare and nothing to guard — that is the entire legacy fleet, left alone.
+    """
+    record = prod_values_record(Path(args.config_dir))
+    if not record.is_file():
+        return
+    recorded = record.read_text().strip()
+    app_dir = getattr(args, "app_dir", None)
+    if not app_dir:
+        raise SystemExit(
+            f"{record} exists, so this app's prod render depends on {VALUES_REL}, but "
+            "--app-dir was not supplied. Promotion cannot check whether those values "
+            "changed without a checkout of the app at the tag being promoted."
+        )
+    current = values_digest(load_application_values(Path(app_dir)) or {})
+    if current != recorded:
+        raise SystemExit(
+            f"prod values have changed since the last prod render.\n"
+            f"  recorded: {recorded[:16]}…\n"
+            f"  current:  {current[:16]}…\n"
+            f"--mode {args.mode} only rewrites image tags in the existing manifest, so the "
+            "new values would NOT reach production while the promotion reported success. "
+            "Use --mode re-render."
+        )
+    log("prod values digest matches the last render")
+
+
 def cmd_render(args) -> None:
     # Checked here and not only in preflight. preflight is a separate workflow step, so it
     # proves the runner was sane at the top of the job — not that THIS render used the
@@ -1001,8 +1490,11 @@ def cmd_render(args) -> None:
     # storage class). Keeping the two apart is what lets one catalog serve every environment.
     resolved = materialise_catalog(provisioners, patch, work / "catalog", args.env)
 
+    extra_provisioners = apply_application_values(services, app_dir, work / "catalog",
+                                                  app=args.app, env=args.env)
+
     init = ["score-k8s", "init", "--no-sample"]
-    for p in resolved["provisioners"]:
+    for p in list(resolved["provisioners"]) + extra_provisioners:
         init += ["--provisioners", str(p.resolve())]
     init += ["--patch-templates", str(resolved["patch"].resolve())]
     run(init, cwd=work)
@@ -1022,6 +1514,7 @@ def cmd_render(args) -> None:
     shutil.copyfile(public, out)
     log(f"wrote {out}")
     ensure_fleet_yaml(out.parent, args.app, args.env)
+    record_prod_values_digest(app_dir, out.parent.parent, args.env)
 
     store.push(work / ".score-k8s" / "state.yaml")
 
@@ -1409,6 +1902,10 @@ def copy_images(src: Path, dst: Path, image: str) -> int:
 def cmd_promote(args) -> None:
     config = Path(args.config_dir)
     target = config / "prod" / "manifests.yaml"
+
+    if args.mode in ("from-staging", "tag-only"):
+        # Both modes skip the renderer, so both can silently ship stale prod values.
+        guard_prod_values(args)
 
     if args.mode == "from-staging":
         # Prod runs exactly what staging runs. The only mode that is correct when each
