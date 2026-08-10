@@ -3065,3 +3065,332 @@ def test_secret_set_keeps_a_trailing_space_in_the_value(monkeypatch):
     monkeypatch.setattr(orc.sys, "stdin",
                         type("S", (), {"read": staticmethod(lambda: "sk_live_1 \n")})())
     assert orc.read_secret_value(argparse.Namespace(stdin=True, key="api_key")) == "sk_live_1 "
+
+
+# =====================================================================================
+# PHASE 4 — postgres class `application`: profile per environment
+# =====================================================================================
+# Same contract in both environments, different capacity. The failure this guards against
+# is subtle: if staging and prod diverge in anything but capacity — a different major
+# version, a different auth flow — then staging has stopped being evidence about prod,
+# which is the only reason staging exists.
+@pytest.fixture
+def postgres_enabled(monkeypatch):
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("features", {}).update(
+        {"application_values": True, "vault_secrets": True, "postgres_application": True})
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    return data
+
+
+PG_SCORE = {
+    "apiVersion": "score.dev/v1b1",
+    "metadata": {"name": "api"},
+    "containers": {"main": {"image": ".", "variables": {
+        "PGHOST": "${resources.db.host}",
+        "PGUSER": "${resources.db.username}",
+        "PGPASSWORD": "${resources.db.password}"}}},
+    "service": {"ports": {"http": {"port": 8080, "targetPort": 8080}}},
+    "resources": {"db": {"type": "postgres", "class": "application"}},
+}
+
+
+def test_profile_of_the_active_environment_is_exposed_to_the_catalog():
+    """A provisioner cannot name the environment it renders for — one catalog serves both —
+    so the active profile is flattened under one stable prefix instead."""
+    staging = orc.CONFIG.for_env("staging")
+    prod = orc.CONFIG.for_env("prod")
+    assert staging["computed.database.instances"] == 1
+    assert prod["computed.database.instances"] == 3
+    assert staging["computed.database.storage"] == "10Gi"
+    assert prod["computed.database.storage"] == "100Gi"
+    assert staging["computed.database.backup.retention_days"] == 3
+    assert prod["computed.database.backup.retention_days"] == 30
+
+
+def test_engine_version_is_identical_across_environments():
+    """The one profile field that must NOT differ. A prod-only major version means every
+    staging test ran against a different database than the one it was meant to prove."""
+    assert (orc.CONFIG.for_env("staging")["computed.database.engine_version"]
+            == orc.CONFIG.for_env("prod")["computed.database.engine_version"])
+
+
+def test_database_image_is_repository_from_config_plus_version_from_profile():
+    """Registry is infrastructure, major version is a platform decision; neither is
+    hardcoded, and they are combined in exactly one place."""
+    table = orc.CONFIG.for_env("staging")
+    assert table["computed.database.image"] == \
+        f"{orc.CONFIG.get('database.image_repository')}:{table['computed.database.engine_version']}"
+
+
+def test_database_image_is_empty_when_the_repository_is_unset(monkeypatch):
+    """An empty repository must not silently produce ':17', which resolves to a public
+    image on whatever registry the node happens to default to."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["image_repository"] = ""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    assert orc.CONFIG.for_env("staging")["computed.database.image"] == ""
+
+
+def test_database_storage_class_falls_back_to_the_cluster_default(monkeypatch):
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["storage_class"] = ""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    assert orc.CONFIG.for_env("staging")["computed.database.storage_class"] == \
+        orc.CONFIG.get("kubernetes.storage_class")
+    data["database"]["storage_class"] = "fast-ssd"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    assert orc.CONFIG.for_env("staging")["computed.database.storage_class"] == "fast-ssd"
+
+
+# ---------------------------------------------------------------- the demo-grade guard
+def pg_service(tmp_path, klass=None, workload="api"):
+    resource = {"type": "postgres"}
+    if klass:
+        resource["class"] = klass
+    doc = {"apiVersion": "score.dev/v1b1", "metadata": {"name": workload},
+           "containers": {"main": {"image": "."}}, "resources": {"db": resource}}
+    path = tmp_path / f"{workload}.yaml"
+    write(path, doc)
+    return [(orc.Service(path=path, workload=workload, container="main"), doc)]
+
+
+@pytest.mark.parametrize("klass", [None, "development"])
+def test_the_demo_database_is_refused_in_prod(tmp_path, postgres_enabled, klass):
+    """Single replica, 1Gi volume, no HA, no backup, password in render state. Nothing
+    about a running deploy distinguishes it from a real database until data is lost."""
+    with pytest.raises(SystemExit, match="refused in prod"):
+        orc.check_database_classes(pg_service(tmp_path, klass), "prod")
+
+
+@pytest.mark.parametrize("klass", [None, "development"])
+def test_the_demo_database_is_still_allowed_in_staging(tmp_path, postgres_enabled, klass):
+    orc.check_database_classes(pg_service(tmp_path, klass), "staging")
+
+
+@pytest.mark.parametrize("klass", [None, "development"])
+def test_the_guard_is_inert_until_the_platform_adopts_the_capability(tmp_path, klass):
+    """The brownfield promise: apps deployed before this existed keep rendering prod
+    exactly as they always have, with features.postgres_application off."""
+    orc.check_database_classes(pg_service(tmp_path, klass), "prod")
+
+
+def test_prod_without_a_backup_target_is_refused(tmp_path, postgres_enabled):
+    """Fail closed. A production database nobody can restore is not a database that is
+    running; it is one that has not failed yet."""
+    with pytest.raises(SystemExit, match="backup.object_store_url"):
+        orc.check_database_classes(pg_service(tmp_path, "application"), "prod")
+
+
+def test_prod_with_a_backup_target_is_allowed(tmp_path, monkeypatch, postgres_enabled):
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["backup"]["object_store_url"] = "s3://backups/idp"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    orc.check_database_classes(pg_service(tmp_path, "application"), "prod")
+
+
+def test_staging_needs_no_backup_target(tmp_path, postgres_enabled):
+    orc.check_database_classes(pg_service(tmp_path, "application"), "staging")
+
+
+# --------------------------------------------------------------- verify waits for Ready
+CLUSTER_DOC = {"apiVersion": "postgresql.cnpg.io/v1", "kind": "Cluster",
+               "metadata": {"name": "pg-api-1234"}}
+
+
+def cluster_cluster(monkeypatch, payload, returncode=0):
+    def fake_kubectl(args, *, kubeconfig=None, **kw):
+        return subprocess.CompletedProcess(args, returncode, json.dumps(payload), "")
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+
+
+def test_verify_accepts_a_ready_cluster(monkeypatch):
+    cluster_cluster(monkeypatch, {"spec": {"instances": 3}, "status": {
+        "readyInstances": 3, "phase": "Cluster in healthy state",
+        "conditions": [{"type": "Ready", "status": "True"}]}})
+    orc.wait_for_databases([CLUSTER_DOC], "ns", verify_args())
+
+
+def test_verify_does_not_mistake_running_pods_for_a_ready_cluster(monkeypatch):
+    """A three-replica cluster has pods up long before the replicas have joined, and an app
+    that connects then gets 'the database system is starting up' — which reads like a
+    config error, not like a database that is still coming up."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"database": {"ready_timeout_seconds": 0}}))
+    cluster_cluster(monkeypatch, {"spec": {"instances": 3}, "status": {
+        "readyInstances": 1, "phase": "Setting up primary",
+        "conditions": [{"type": "Ready", "status": "False", "reason": "Creating"}]}})
+    with pytest.raises(SystemExit, match="chưa Ready"):
+        orc.wait_for_databases([CLUSTER_DOC], "ns", verify_args())
+
+
+def test_verify_is_inert_for_an_app_with_no_database(monkeypatch):
+    def explode(*a, **k):
+        raise AssertionError("must not query the cluster when there is no database")
+    monkeypatch.setattr(orc, "kubectl", explode)
+    orc.wait_for_databases([{"kind": "Deployment"}], "ns", verify_args())
+
+
+def test_verify_ignores_a_cluster_from_another_api(monkeypatch):
+    """`Cluster` is a popular kind. Matching on kind alone would make verify wait forever
+    on someone else's CR."""
+    def explode(*a, **k):
+        raise AssertionError("must not query a Cluster from an unrelated API group")
+    monkeypatch.setattr(orc, "kubectl", explode)
+    orc.wait_for_databases([{"apiVersion": "cluster.x-k8s.io/v1beta1", "kind": "Cluster",
+                             "metadata": {"name": "other"}}], "ns", verify_args())
+
+
+# ------------------------------------------------------- generated credentials go to Vault
+def test_generated_password_is_never_returned_to_a_caller_twice_the_same():
+    """Platform-owned credentials nobody should see, type or paste."""
+    args = argparse.Namespace(generate=True, stdin=False, key="password")
+    first, second = orc.read_secret_value(args), orc.read_secret_value(args)
+    assert first != second
+    assert len(first) >= 32 and first.isalnum()
+
+
+# =====================================================================================
+# PHASE 4 — integration: one Score, two profiles, no credential in state
+# =====================================================================================
+@needs_score_k8s
+def test_application_class_renders_a_managed_cluster(tmp_path, postgres_enabled):
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    docs = render_env(tmp_path, app_dir, "staging", "w")
+    cluster = next(d for d in docs if d["kind"] == "Cluster")
+    assert cluster["apiVersion"] == "postgresql.cnpg.io/v1"
+    assert cluster["spec"]["instances"] == 1
+    assert cluster["spec"]["storage"]["size"] == "10Gi"
+    # The app's user is created FROM the Vault-backed Secret, so there is exactly one
+    # credential and no second copy for the operator.
+    vss = next(d for d in docs if d["kind"] == "VaultStaticSecret")
+    assert cluster["spec"]["bootstrap"]["initdb"]["secret"]["name"] == \
+        vss["spec"]["destination"]["name"]
+    assert vss["spec"]["destination"]["type"] == "kubernetes.io/basic-auth"
+    assert vss["spec"]["path"] == "apps/payment-api/staging/database"
+
+
+@needs_score_k8s
+def test_the_database_password_never_reaches_git_or_state(tmp_path, postgres_enabled):
+    """The defect the old provisioner has by construction: it generates the password during
+    render, so the password IS the render state. Here the platform never sees one."""
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    docs = render_env(tmp_path, app_dir, "staging", "w")
+    dep = next(d for d in docs if d["kind"] == "Deployment")
+    env = {e["name"]: e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert "value" not in env["PGPASSWORD"]
+    assert env["PGPASSWORD"]["valueFrom"]["secretKeyRef"]["key"] == "password"
+
+    state = yaml.safe_load((tmp_path / "state.yaml").read_text())
+    stored = next(v["state"] for k, v in state["resources"].items() if "postgres" in k)
+    assert set(stored) == {"cluster", "database", "username"}, stored
+
+
+@needs_score_k8s
+def test_same_contract_different_profile_across_environments(tmp_path, monkeypatch,
+                                                             postgres_enabled):
+    """The headline gate: identical everything except capacity, HA and retention."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["backup"]["object_store_url"] = "s3://backups/idp"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    staging = next(d for d in render_env(tmp_path, app_dir, "staging", "w1")
+                   if d["kind"] == "Cluster")
+    prod = next(d for d in render_env(tmp_path, app_dir, "prod", "w2")
+                if d["kind"] == "Cluster")
+
+    assert staging["spec"]["imageName"] == prod["spec"]["imageName"]
+    assert staging["spec"]["bootstrap"] == prod["spec"]["bootstrap"]
+    assert staging["spec"]["enableSuperuserAccess"] == prod["spec"]["enableSuperuserAccess"]
+
+    assert (staging["spec"]["instances"], prod["spec"]["instances"]) == (1, 3)
+    assert (staging["spec"]["storage"]["size"], prod["spec"]["storage"]["size"]) == \
+        ("10Gi", "100Gi")
+    # Same backup MECHANISM, different retention — the profile difference, stated exactly.
+    assert staging["spec"]["backup"]["barmanObjectStore"] == \
+        prod["spec"]["backup"]["barmanObjectStore"]
+    assert (staging["spec"]["backup"]["retentionPolicy"],
+            prod["spec"]["backup"]["retentionPolicy"]) == ("3d", "30d")
+
+
+@needs_score_k8s
+def test_two_renders_of_a_database_are_byte_identical(tmp_path, postgres_enabled):
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    render_env(tmp_path, app_dir, "staging", "w1")
+    first = (tmp_path / "config" / "staging" / "manifests.yaml").read_text()
+    render_env(tmp_path, app_dir, "staging", "w2")
+    assert (tmp_path / "config" / "staging" / "manifests.yaml").read_text() == first
+
+
+@needs_score_k8s
+def test_the_legacy_postgres_class_still_renders_a_stateful_set(tmp_path):
+    """Compatibility, stated as a test: every app using `type: postgres` today keeps the
+    behaviour it has, feature flag off."""
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", {
+        "apiVersion": "score.dev/v1b1", "metadata": {"name": "api"},
+        "containers": {"main": {"image": ".", "variables": {
+            "PGHOST": "${resources.db.host}"}}},
+        "resources": {"db": {"type": "postgres"}}})
+    kinds = {d["kind"] for d in render_env(tmp_path, app_dir, "staging", "w")}
+    assert "StatefulSet" in kinds and "Cluster" not in kinds
+
+
+def test_a_configured_zero_timeout_means_zero(monkeypatch):
+    """`int(CONFIG.get(k) or default)` reads naturally and is wrong: 0 is falsy, so a
+    timeout set to zero silently becomes the default, and the symptom is a command that
+    hangs for ten minutes instead of failing immediately."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"database": {"ready_timeout_seconds": 0}}))
+    assert orc.config_int("database.ready_timeout_seconds", 600) == 0
+    assert orc.config_int("database.missing_key", 600) == 600
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"database": {"ready_timeout_seconds": ""}}))
+    assert orc.config_int("database.ready_timeout_seconds", 600) == 600
+
+
+@needs_score_k8s
+def test_no_object_store_means_no_backup_block_at_all(tmp_path, postgres_enabled):
+    """Not an empty `backup:` — CNPG rejects a partial one at cluster level. Either a real
+    backup target, or the section is absent and prod rendering is refused earlier."""
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    cluster = next(d for d in render_env(tmp_path, app_dir, "staging", "w")
+                   if d["kind"] == "Cluster")
+    assert "backup" not in cluster["spec"]
+
+
+def test_every_postgres_provisioner_declares_its_class():
+    """A provisioner without `class` matches EVERY class, and when several match, the one
+    score-k8s happens to load last wins — an order that depends on temp filenames it
+    generates itself. Measured on 0.15.0: the same input rendered `class: application` as
+    the demo StatefulSet on some runs and as a managed Cluster on others, with nothing
+    changed in between. For a database that means the data is in two different places.
+
+    So: every postgres provisioner in the catalog names its class, and this test fails if
+    anyone adds one that does not."""
+    entries = []
+    for path in (CATALOG / "provisioners").glob("*.provisioners.yaml"):
+        entries += [e for e in (yaml.safe_load(path.read_text()) or [])
+                    if e.get("type") == "postgres"]
+    assert entries, "no postgres provisioner found — did the catalog move?"
+    for entry in entries:
+        assert entry.get("class"), f"{entry['uri']} does not declare a class"
+    classes = [e["class"] for e in entries]
+    assert len(classes) == len(set(classes)), f"two provisioners share a class: {classes}"
+
+
+@needs_score_k8s
+def test_the_development_class_renders_the_demo_database(tmp_path):
+    """`class: development` is the same demo database under its real name."""
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", {
+        "apiVersion": "score.dev/v1b1", "metadata": {"name": "api"},
+        "containers": {"main": {"image": ".", "variables": {
+            "PGHOST": "${resources.db.host}"}}},
+        "resources": {"db": {"type": "postgres", "class": "development"}}})
+    kinds = {d["kind"] for d in render_env(tmp_path, app_dir, "staging", "w")}
+    assert "StatefulSet" in kinds and "Cluster" not in kinds

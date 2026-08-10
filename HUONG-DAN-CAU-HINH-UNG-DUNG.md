@@ -219,6 +219,53 @@ chiếu bí mật. Tách thành hai file, hoặc để app tự ghép từ hai b
 
 ---
 
+## 4b. Cơ sở dữ liệu PostgreSQL
+
+Khai đúng ba dòng, giống hệt nhau ở staging và prod:
+
+```yaml
+resources:
+  db:
+    type: postgres
+    class: application
+```
+
+và dùng đúng bộ output cũ:
+
+```yaml
+containers:
+  backend:
+    variables:
+      PGHOST: "${resources.db.host}"
+      PGPORT: "${resources.db.port}"
+      PGDATABASE: "${resources.db.database}"
+      PGUSER: "${resources.db.username}"
+      PGPASSWORD: "${resources.db.password}"
+```
+
+`class: application` = database do operator production-grade quản lý. Số bản sao, CPU/RAM,
+dung lượng, HA và retention **do platform quyết theo môi trường** (`database_profiles`), app
+không thấy và không sửa được. Cùng major version ở cả hai môi trường — đó là lý do staging
+còn nói được điều gì về prod.
+
+**Không có `class`** (hoặc `class: development`) = database demo cũ: một bản sao, 1Gi,
+không HA, không backup, mật khẩu nằm trong state. Dùng để chạy thử thì được; **render
+`prod` với nó sẽ bị chặn** khi platform đã bật `features.postgres_application`.
+
+Mật khẩu: bạn **không** đặt và **không** cần biết. Platform sinh ngẫu nhiên khi onboard,
+ghi thẳng vào Vault; database tạo user từ chính secret đó và app đọc cũng từ đó. Đổi mật
+khẩu = ghi lại vào Vault, không sửa gì trong repo.
+
+Chẩn đoán:
+
+| Thông báo | Nguyên nhân |
+|---|---|
+| `is \`type: postgres\` with class … refused in prod` | Dùng database demo ở prod. Đổi sang `class: application`. |
+| `database.backup.object_store_url is empty` | Platform chưa cấu hình kho backup cho prod. Việc của Platform team, không phải của app. |
+| `cơ sở dữ liệu chưa Ready sau …s` | Thường là credential chưa được ghi vào Vault trước khi render — cluster không bootstrap được. |
+
+---
+
 ## 5. Placeholder chỉ hoạt động ở 4 chỗ
 
 | Vị trí | Có thay thế |

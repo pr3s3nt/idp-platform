@@ -1,0 +1,139 @@
+# `postgres` class `application` — cơ sở dữ liệu do operator production-grade quản lý.
+#
+# VÌ SAO CÓ CLASS RIÊNG
+# Provisioner `postgres` cũ (local.provisioners.yaml) tạo một StatefulSet 1 bản sao, PVC
+# 1Gi, không HA, không backup, và mật khẩu nằm trong Score state. Nó hữu ích để chạy thử,
+# nhưng nếu prod dùng nhầm nó thì không có gì báo — app vẫn kết nối được, cho tới ngày mất
+# dữ liệu. Nên: implementation mới nằm ở CLASS KHÁC, còn class cũ bị chặn ở prod.
+#
+# App khai đúng ba dòng, giống hệt nhau ở mọi môi trường:
+#   resources:
+#     db:
+#       type: postgres
+#       class: application
+#
+# và nhận đúng bộ output cũ (host/port/database/username/password), nên đổi từ class cũ
+# sang class này KHÔNG phải sửa code app.
+#
+# KHÁC BIỆT STAGING/PROD NẰM HẾT Ở platform.env.yaml (`database_profiles`), không ở đây:
+# số bản sao, CPU/RAM, dung lượng, HA, retention. Cùng major version, cùng cách xác thực,
+# cùng output — đó là toàn bộ lý do staging còn kiểm chứng được prod.
+#
+# MẬT KHẨU KHÔNG BAO GIỜ Ở TRONG ĐÂY, cũng không ở trong Score state. Nó nằm trong Vault
+# tại `<app>/<env>/<database.credential_secret>`; VSO đồng bộ ra một Secret dạng
+# basic-auth; CNPG dùng chính Secret đó để tạo user, và app đọc cùng Secret đó qua
+# encodeSecretRef. Một nguồn sự thật, không có bản sao nào ở nơi khác.
+- uri: template://platform/postgres-application
+  type: postgres
+  class: application
+  description: PostgreSQL do CloudNativePG quản lý, profile theo môi trường.
+  init: |
+    {{ if not "%%computed.database.image%%" }}{{ fail "database.image_repository hoặc engine_version của profile đang rỗng — xem platform.env.yaml" }}{{ end }}
+    {{ if not "%%computed.database.instances%%" }}{{ fail "database_profiles.<env>.application.instances chưa được đặt" }}{{ end }}
+  # Tên object suy ra từ Guid của resource và được GIỮ trong state, giống provisioner cũ:
+  # đổi tên một Cluster là tạo mới một cơ sở dữ liệu rỗng bên cạnh cái đang có dữ liệu.
+  state: |
+    cluster: pg-{{ .SourceWorkload }}-{{ substr 0 8 .Guid | lower }}
+    database: {{ dig "database" (print "app_" (.SourceWorkload | replace "-" "_")) .State | quote }}
+    username: {{ dig "username" (print "app_" (.SourceWorkload | replace "-" "_")) .State | quote }}
+  outputs: |
+    host: {{ .State.cluster }}-rw
+    port: 5432
+    name: {{ .State.database }}
+    database: {{ .State.database }}
+    username: {{ .State.username }}
+    password: {{ encodeSecretRef (print .State.cluster "-cred") "password" }}
+  manifests: |
+    # Credential: Vault -> VSO -> Secret dạng basic-auth. CNPG đọc Secret này để tạo user,
+    # app đọc cùng Secret đó. Không có đường nào khác cho mật khẩu đi.
+    - apiVersion: secrets.hashicorp.com/v1beta1
+      kind: VaultStaticSecret
+      metadata:
+        name: {{ .State.cluster }}-cred
+        {{ if ne .Namespace "" }}
+        namespace: {{ .Namespace }}
+        {{ end }}
+        annotations:
+          k8s.score.dev/source-workload: {{ .SourceWorkload }}
+          k8s.score.dev/resource-uid: {{ .Uid }}
+          k8s.score.dev/resource-guid: {{ .Guid }}
+          idp.platform/logical-secret: %%database.credential_secret%%
+        labels:
+          app.kubernetes.io/name: {{ .State.cluster }}
+          app.kubernetes.io/part-of: idp-platform
+      spec:
+        vaultAuthRef: %%vault.auth_ref%%
+        mount: %%vault.kv_mount%%
+        type: %%vault.kv_type%%
+        path: apps/%%computed.app%%/%%env.name%%/%%database.credential_secret%%
+        refreshAfter: %%vault.refresh_after%%
+        hmacSecretData: true
+        destination:
+          name: {{ .State.cluster }}-cred
+          create: true
+          # CNPG yêu cầu đúng kiểu này cho bootstrap.initdb.secret; sai kiểu thì operator
+          # bỏ qua trong im lặng và cluster khởi tạo với user mặc định.
+          type: kubernetes.io/basic-auth
+          transformation:
+            excludeRaw: true
+            includes:
+            - ^username$
+            - ^password$
+    - apiVersion: postgresql.cnpg.io/v1
+      kind: Cluster
+      metadata:
+        name: {{ .State.cluster }}
+        {{ if ne .Namespace "" }}
+        namespace: {{ .Namespace }}
+        {{ end }}
+        annotations:
+          k8s.score.dev/source-workload: {{ .SourceWorkload }}
+          k8s.score.dev/resource-uid: {{ .Uid }}
+          k8s.score.dev/resource-guid: {{ .Guid }}
+        labels:
+          app.kubernetes.io/name: {{ .State.cluster }}
+          app.kubernetes.io/part-of: idp-platform
+      spec:
+        instances: %%computed.database.instances%%
+        imageName: %%computed.database.image%%
+        # Superuser tắt: app chỉ cần user của chính nó. Bật lên là tạo thêm một credential
+        # nữa mà không ai xoay vòng.
+        enableSuperuserAccess: false
+        bootstrap:
+          initdb:
+            database: {{ .State.database }}
+            owner: {{ .State.username }}
+            secret:
+              name: {{ .State.cluster }}-cred
+        storage:
+          size: %%computed.database.storage%%
+          storageClass: %%computed.database.storage_class%%
+        resources:
+          requests:
+            cpu: %%computed.database.cpu_request%%
+            memory: %%computed.database.memory_request%%
+        {{ if ne "%%database.backup.object_store_url%%" "" }}
+        # Backup chỉ xuất hiện khi đã cấu hình kho object. Không có kho thì KHÔNG sinh
+        # khối rỗng: một `backup:` không đầy đủ làm CNPG báo lỗi cluster-level, còn ở đây
+        # ta muốn hoặc backup thật, hoặc không có backup và render prod bị chặn từ trước.
+        backup:
+          retentionPolicy: "%%computed.database.backup.retention_days%%d"
+          barmanObjectStore:
+            destinationPath: %%database.backup.object_store_url%%
+            {{ if ne "%%database.backup.credentials_secret%%" "" }}
+            s3Credentials:
+              accessKeyId:
+                name: %%database.backup.credentials_secret%%
+                key: ACCESS_KEY_ID
+              secretAccessKey:
+                name: %%database.backup.credentials_secret%%
+                key: ACCESS_SECRET_KEY
+            {{ end }}
+        {{ end }}
+  expected_outputs:
+    - host
+    - port
+    - name
+    - database
+    - username
+    - password

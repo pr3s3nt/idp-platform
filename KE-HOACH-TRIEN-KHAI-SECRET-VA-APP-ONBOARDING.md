@@ -235,7 +235,7 @@ AI phải cập nhật bảng này trong quá trình làm. `Blocked` chỉ dùng
 | 1 — Environment Values, ConfigMap và promotion guard | Done | Xem "Nhật ký Phase 1" bên dưới |
 | 2 — Vault/VSO foundation trên harness | Done | Xem "Nhật ký Phase 2" bên dưới |
 | 3 — App secret integration | Done | Xem "Nhật ký Phase 3" bên dưới |
-| 4 — PostgreSQL capability/profile | Not started | |
+| 4 — PostgreSQL capability/profile | Done | Xem "Nhật ký Phase 4" bên dưới |
 | 5 — Stack catalog và `score-compose` | Not started | |
 | 6 — Onboarding workflow/state machine | Not started | |
 | 7 — Pilot, migration và hardening local | Not started | |
@@ -480,6 +480,104 @@ Người dùng phải xác nhận lại khi mang vào công ty: `refreshAfter` p
 ty; ai được cấp policy ghi cho `prod`; Vault công ty có bật kv-v2 patch không (nếu chỉ cho
 `create/update`, dùng `--replace`); và `rolloutRestartTargets` chỉ hỗ trợ
 Deployment/StatefulSet/DaemonSet — workload dạng khác cần cách khác.
+
+#### Nhật ký Phase 4
+
+Branch `feature/secret-onboarding`, verify từ working tree tại SHA `0d808a4` (Phase 3).
+
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **275 passed**
+(247 → 275, thêm 28 test). Không có test nào bị skip.
+
+Provider: **CloudNativePG** (chart 0.29.0 / operator 1.30.0) — đã cài lên `kind-staging`
+bằng `./tools/dung-database-harness.sh` (idempotent, đọc toạ độ từ config). Probe trước khi
+làm xác nhận cụm chưa có operator database nào.
+
+Class mới `postgres.application` (`provisioners/postgres-application.provisioners.yaml`)
+sinh một `Cluster` của CNPG + một `VaultStaticSecret` cho credential. App khai ba dòng và
+nhận **đúng bộ output cũ**, nên đổi từ class cũ sang class mới không phải sửa code app.
+
+**Đo trên cụm `kind-staging`** (app fixture `pgdemo`, namespace riêng, đã xoá sau khi đo):
+
+| Kiểm chứng | Kết quả đo được |
+|---|---|
+| App kết nối được bằng credential từ Vault | `psql` trong pod: `current_user=app_api`, `current_database=app_api`, **PostgreSQL 17.10** |
+| Credential **không** nằm trong Score state | state chỉ có `cluster`, `database`, `username`; mật khẩu thật xuất hiện **0 lần** trong state và **0 lần** trong manifest |
+| Đối chứng: provisioner CŨ | vẫn ghi `password: <giá trị thật>` thẳng vào state — đúng khiếm khuyết mà class mới sinh ra để loại bỏ |
+| Một credential duy nhất | `bootstrap.initdb.secret` và `secretKeyRef` của app trỏ **cùng một Secret** (kiểu `kubernetes.io/basic-auth`) do VSO tạo |
+| `verify` chờ đúng thứ tự | VaultStaticSecret đồng bộ → Cluster `Ready` → rollout; exit 0 |
+| Mật khẩu do platform sinh | `secret-set --generate` ghi thẳng Vault, không in ra, không trả về, không ghi file |
+
+**Gate profile (staging vs prod), đo trên manifest render thật:**
+
+| | staging | prod |
+|---|---|---|
+| instances | 1 | **3** |
+| storage | 10Gi | **100Gi** |
+| cpu/memory request | 250m / 512Mi | **1 / 2Gi** |
+| backup retention | 3d | **30d** |
+| imageName | `…/postgresql:17` | **giống hệt** |
+| bootstrap (database/owner/secret) | | **giống hệt** |
+| `enableSuperuserAccess` | false | **false** |
+
+Tức là: khác đúng ở capacity/HA/retention, giống ở engine version, luồng xác thực và output
+— điều kiện để staging còn là bằng chứng về prod.
+
+**Guard đã đo:**
+
+| Tình huống | Kết quả |
+|---|---|
+| `class: application` ở prod, chưa cấu hình kho object | **chặn**, "database.backup.object_store_url is empty" |
+| `class: application` ở prod, đã cấu hình kho object | render, kèm `barmanObjectStore` + retention 30d |
+| `type: postgres` không class (hoặc `development`) ở **prod** | **chặn** khi `features.postgres_application` bật |
+| …ở **staging** | cho qua |
+| …ở prod khi cờ **tắt** | cho qua — lời hứa brownfield, có test riêng |
+
+**Regression app legacy**: 4 cặp render (`simple-nginx`, `app-with-postgres` × staging/prod)
+baseline `36372b9` vs HEAD, render từ bản sao thư mục app: **giống nhau từng byte**.
+
+**Lỗi thật thứ tư, và là lỗi nguy hiểm nhất bắt được trong cả chương trình**: một
+provisioner KHÔNG khai `class` thì khớp với **mọi** class, và khi nhiều provisioner cùng
+khớp thì bản score-k8s NẠP SAU thắng — thứ tự nạp phụ thuộc tên file tạm score-k8s tự sinh.
+Hậu quả: cùng một input, `class: application` có lần render ra `Cluster` của CNPG, có lần
+render ra StatefulSet demo, **không đổi gì ở giữa**. Với database thì "có lần" nghĩa là dữ
+liệu nằm ở hai nơi khác nhau. Phát hiện vì test suite fail ngẫu nhiên ở các test khác nhau
+giữa các lần chạy — nếu chỉ chạy một lần rồi commit thì nó đã lọt. Nay `local.provisioners.yaml`
+khai `class: default` tường minh (+ alias `class: development` bằng YAML merge key, không
+nhân đôi 100 dòng), và có test tĩnh chặn việc thêm provisioner postgres thiếu class. Đã chạy
+lại full suite **ba lần liên tiếp: 273/273/273 passed**.
+
+**Lỗi thật thứ ba, lần này trong code của chính tôi**: `int(CONFIG.get(k) or default)` biến
+một timeout được cấu hình bằng `0` thành giá trị mặc định — 0 là falsy. Triệu chứng không
+phải sai số liệu mà là **lệnh treo 10 phút thay vì fail ngay**; nó đã âm thầm cộng 60 giây
+vào mỗi lần chạy test suite từ Phase 3. Nay có `config_int()` và một test ghim.
+
+File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
+`platform.env.company.yaml`, `HUONG-DAN-CAU-HINH-UNG-DUNG.md`, `docs/adr/README.md`,
+`provisioners/postgres-application.provisioners.yaml` (mới),
+`provisioners/local.provisioners.yaml` (khai class tường minh),
+`tools/dung-database-harness.sh` (mới),
+`docs/adr/0008-provider-database-va-credential.md` (mới).
+
+Config key mới: khối `database.*` (`provider`, `operator_version`, `operator_namespace`,
+`image_repository`, `storage_class`, `credential_secret`, `ready_timeout_seconds`,
+`backup.*`). Placeholder mới cho catalog: `%%computed.app%%` và `%%computed.database.*%%`
+(profile của môi trường ĐANG render, phẳng hoá). Cờ mới dùng đến: `features.postgres_application`.
+
+Migration: không có. App hiện dùng `type: postgres` giữ nguyên StatefulSet cũ.
+Rollback: đặt `features.postgres_application: false` — guard prod tắt, class `application`
+vẫn render được nhưng không app nào đang dùng.
+
+Hạn chế còn lại: **backup/restore chưa kiểm chứng được trên harness** vì WSL2 không có kho
+object; platform bù bằng cách CHẶN render prod khi thiếu cấu hình. Xoay vòng mật khẩu
+database (CNPG đọc lại Secret và đổi mật khẩu role) cũng chỉ kiểm được ở nơi có prod thật.
+`high_availability` trong profile hiện chỉ là dữ liệu — CNPG suy ra HA từ `instances`;
+nếu muốn synchronous replication thì phải map thêm. Chưa có migration Job contract (mục 7.4).
+
+Người dùng phải xác nhận lại khi mang vào công ty: `database.image_repository` (ảnh postgres
+đã mirror về Harbor); `database.backup.object_store_url` + credential — **bắt buộc, prod bị
+chặn nếu thiếu**; DBA chốt `instances`/`storage`/retention của prod; storage class dành cho
+database (phải là ổ đĩa mạng gắn lại được, không phải local no-provisioner); và **chạy thật
+một lần restore** trước khi cho app đầu tiên lên prod.
 
 ### 0.6. Stop conditions
 

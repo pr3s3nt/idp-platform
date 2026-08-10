@@ -45,8 +45,15 @@
     - host
     - port
     - path
-- uri: template://custom/postgres
+# CLASS PHẢI KHAI TƯỜNG MINH. Đo trên score-k8s 0.15.0: một provisioner KHÔNG có `class`
+# khớp với MỌI class, và khi nhiều provisioner cùng khớp thì bản NẠP SAU thắng — thứ tự nạp
+# lại phụ thuộc tên file tạm score-k8s sinh ra. Hệ quả: `class: application` có lúc được
+# phục vụ bởi provisioner demo này, có lúc bởi provisioner CNPG, giữa hai lần render không
+# đổi gì. Với database, "có lúc" nghĩa là dữ liệu nằm ở hai nơi khác nhau.
+- &postgres_local
+  uri: template://custom/postgres
   type: postgres
+  class: default
   description: Postgres tự host (image Harbor + StorageClass Ceph) cho cụm on-prem.
   init: |
     randomDatabase: db-{{ randAlpha 8 }}
@@ -199,3 +206,10 @@
     - database
     - username
     - password
+
+# Cùng một thứ, gọi bằng tên thật của nó. App mới muốn database dùng-thử thì khai
+# `class: development` cho rõ ràng; renderer CHẶN class này ở prod khi platform đã bật
+# features.postgres_application. `class: default` giữ nguyên để app đang chạy không đổi gì.
+- <<: *postgres_local
+  uri: template://custom/postgres-development
+  class: development

@@ -28,7 +28,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import string
 import subprocess
 import sys
 import time
@@ -91,6 +93,24 @@ DEFAULTS: dict = {
         "token_ttl": "1h",
     },
     "database_profiles": {},
+    "database": {
+        # Which operator provides `class: application`. Named in config because the choice
+        # is an infrastructure decision: a company with a DBA-run service replaces this
+        # provisioner wholesale rather than running an operator at all.
+        "provider": "cloudnative-pg",
+        "operator_version": "",
+        "operator_namespace": "cnpg-system",
+        # No default: the postgres image lives in whichever registry this install pulls
+        # from. Combined with the profile's engine_version to form the full reference.
+        "image_repository": "",
+        "storage_class": "",
+        # The logical secret name, under the app's own Vault prefix, holding the database
+        # username and password. Same prefix as every other app secret, so the same policy
+        # already grants it.
+        "credential_secret": "database",
+        "backup": {"object_store_url": "", "credentials_secret": "", "destination_path": ""},
+        "ready_timeout_seconds": 600,
+    },
     # Every capability added by the secret/onboarding programme is off until switched on
     # per environment. The existing platform must render byte-identically with these unset.
     "features": {
@@ -145,9 +165,15 @@ class EnvConfig:
             )
         return value
 
-    def for_env(self, env: str) -> dict:
+    def for_env(self, env: str, app: str | None = None) -> dict:
         """Flat {dotted key: value}, with the chosen environment exposed under `env.`."""
         flat: dict[str, object] = {}
+        # The application being rendered is not configuration, but a provisioner that
+        # derives a Vault path needs it, and score-k8s only ever tells a provisioner the
+        # WORKLOAD name. Exposing it here keeps the path derivation in one place instead of
+        # making every app pass its own name as a resource param it could get wrong.
+        if app:
+            flat["computed.app"] = app
 
         def walk(node, prefix=""):
             for key, value in (node or {}).items():
@@ -173,16 +199,40 @@ class EnvConfig:
         flat["computed.namespace_go_template"] = (
             pattern.replace("{env}", env).replace("{app}", "{{ .Params.app }}")
         )
+
+        # The ACTIVE environment's database profile, flattened under one stable prefix.
+        # A provisioner cannot name the environment it is being rendered for — that is the
+        # whole point of one catalog serving both — so `%%database_profiles.prod.…%%` would
+        # have to be written into a file that also renders for staging. Resolving it here
+        # means the provisioner says `%%computed.database.instances%%` and the difference
+        # between one replica and three stays entirely in platform.env.yaml.
+        profile = (self.get(f"database_profiles.{env}.application") or {})
+
+        def walk_profile(node, prefix="computed.database."):
+            for key, value in (node or {}).items():
+                if isinstance(value, dict):
+                    walk_profile(value, f"{prefix}{key}.")
+                else:
+                    flat[f"{prefix}{key}"] = value
+
+        walk_profile(profile)
+        # CNPG-style image reference: repository from config, tag from the profile, so a
+        # company mirror is a config edit and the major version stays one number in one place.
+        repo = self.get("database.image_repository") or ""
+        version = profile.get("engine_version") or ""
+        flat["computed.database.image"] = f"{repo}:{version}" if repo and version else ""
+        storage_class = self.get("database.storage_class") or self.get("kubernetes.storage_class") or ""
+        flat["computed.database.storage_class"] = storage_class
         return flat
 
-    def render(self, text: str, env: str, *, where: str) -> str:
+    def render(self, text: str, env: str, *, where: str, app: str | None = None) -> str:
         """Substitute %%key%% placeholders. An unknown key is fatal, never silent.
 
         Silence is how this whole project's worst bugs behaved — a wrong gateway name or a
         wrong storage class produces no error anywhere, just a route that never attaches or
         a volume that never binds. A typo'd placeholder must not join that club.
         """
-        table = self.for_env(env)
+        table = self.for_env(env, app)
 
         def replace(match: re.Match) -> str:
             key = match.group(1)
@@ -237,6 +287,19 @@ def app_namespace(app: str, env: str) -> str:
     """
     pattern = CONFIG.get("kubernetes.namespace_pattern", "{app}-{env}") or "{app}-{env}"
     return pattern.replace("{app}", app).replace("{env}", env)
+
+
+def config_int(key: str, default: int) -> int:
+    """An integer from config, where a configured 0 MEANS 0.
+
+    `int(CONFIG.get(key) or default)` reads naturally and is wrong: 0 is falsy, so setting
+    a timeout to zero — "do not wait, fail immediately" — silently gets the default back,
+    and the only symptom is a command that hangs for ten minutes instead of failing.
+    """
+    value = CONFIG.get(key, default)
+    if value is None or value == "":
+        return default
+    return int(value)
 
 
 def feature(name: str) -> bool:
@@ -700,6 +763,51 @@ def _go_template_safe(text: str) -> str:
     evaluated by score-k8s instead of passed through.
     """
     return text.replace("{{", '{{"{{"}}')
+
+
+# ------------------------------------------------------------------ database capability
+# `class: application` is a different provisioner from the `postgres` this platform has
+# always had, on purpose. The old one makes a single-replica StatefulSet with a 1Gi volume,
+# no HA, no backup, and the password in Score state. It is fine for trying something out
+# and catastrophic in production — and nothing about a running deploy tells the two apart.
+#
+# So the guard is by CLASS, and it only bites once the platform has adopted the new
+# capability. With features.postgres_application off, every existing app renders exactly as
+# before: the promise this whole programme is built on.
+DEV_POSTGRES_CLASSES = ("default", "development")
+
+
+def check_database_classes(scores: list[tuple], env: str) -> None:
+    """Refuse the demo-grade postgres in prod, and refuse prod without a backup target."""
+    if not feature("postgres_application"):
+        return
+    application_users = []
+    for service, doc in scores:
+        for name, resource in ((doc or {}).get("resources") or {}).items():
+            if (resource or {}).get("type") != "postgres":
+                continue
+            klass = (resource or {}).get("class") or "default"
+            if klass == "application":
+                application_users.append((service.workload, name))
+                continue
+            if env == "prod" and klass in DEV_POSTGRES_CLASSES:
+                raise SystemExit(
+                    f"{service.path.name} ({service.workload}): resource {name!r} is "
+                    f"`type: postgres` with class {klass!r}, which is the single-replica "
+                    "demo database — no HA, no backup, password in render state. It is "
+                    "refused in prod. Use `class: application`, which reads its capacity, "
+                    "HA and retention from database_profiles in platform.env.yaml."
+                )
+
+    # Fail-closed rather than deploying a production database nobody can restore. The
+    # object store is infrastructure, so it is a config value, not a code path.
+    if application_users and env == "prod" and not (CONFIG.get("database.backup.object_store_url") or ""):
+        raise SystemExit(
+            f"workload(s) {[w for w, _ in application_users]} ask for a production "
+            "database, but database.backup.object_store_url is empty in platform.env.yaml "
+            "— the cluster would run with no backup at all. Configure the object store "
+            "(and verify a restore) before rendering prod."
+        )
 
 
 # ------------------------------------------------------------------- app secret bindings
@@ -1634,7 +1742,7 @@ def split_manifests(manifests: Path, work: Path) -> tuple[Path, Path]:
 
 
 def materialise_catalog(
-    provisioners: list[Path], patch: Path, dest: Path, env: str,
+    provisioners: list[Path], patch: Path, dest: Path, env: str, app: str | None = None,
 ) -> dict[str, object]:
     """Copy the catalog into `dest` with every %%placeholder%% resolved for `env`.
 
@@ -1646,10 +1754,10 @@ def materialise_catalog(
     out_provisioners = []
     for src in provisioners:
         target = dest / src.name
-        target.write_text(CONFIG.render(src.read_text(), env, where=str(src)))
+        target.write_text(CONFIG.render(src.read_text(), env, where=str(src), app=app))
         out_provisioners.append(target)
     out_patch = dest / patch.name
-    out_patch.write_text(CONFIG.render(patch.read_text(), env, where=str(patch)))
+    out_patch.write_text(CONFIG.render(patch.read_text(), env, where=str(patch), app=app))
     log(f"resolved {len(out_provisioners)} provisioner(s) + patch for env={env} -> {dest}")
     return {"provisioners": out_provisioners, "patch": out_patch}
 
@@ -1816,6 +1924,8 @@ def apply_application_values(services: list[Service], app_dir: Path, catalog_dir
         scores.append((service, doc))
         scan_placeholders(doc, where=f"{service.path.name} ({service.workload})", hard=hard)
 
+    check_database_classes(scores, env)
+
     aliases = [(service, doc, environment_alias(doc, where=f"{service.path.name} "
                                                              f"({service.workload})"))
                for service, doc in scores]
@@ -1966,7 +2076,8 @@ def cmd_render(args) -> None:
     # The catalog stores the SHAPE of a resource (a route becomes an HTTPRoute); this fills
     # in the COORDINATES of the cluster it is being rendered for (which gateway, which
     # storage class). Keeping the two apart is what lets one catalog serve every environment.
-    resolved = materialise_catalog(provisioners, patch, work / "catalog", args.env)
+    resolved = materialise_catalog(provisioners, patch, work / "catalog", args.env,
+                                   app=args.app)
 
     extra_provisioners = apply_application_values(services, app_dir, work / "catalog",
                                                   app=args.app, env=args.env)
@@ -2462,7 +2573,7 @@ def wait_for_vault_secrets(docs: list[dict], ns: str, args) -> None:
     targets = [d for d in docs if d.get("kind") == "VaultStaticSecret"]
     if not targets:
         return
-    timeout = int(CONFIG.get("vault.initial_sync_timeout_seconds", 60) or 60)
+    timeout = config_int("vault.initial_sync_timeout_seconds", 60)
     log(f"chờ {len(targets)} VaultStaticSecret trong {ns} đồng bộ (tối đa {timeout}s)")
     deadline = time.time() + timeout
     while True:
@@ -2481,6 +2592,55 @@ def wait_for_vault_secrets(docs: list[dict], ns: str, args) -> None:
         "CreateContainerConfigError chừng nào Secret đích chưa tồn tại. Kiểm theo thứ tự: "
         "secret đã được ghi vào đúng đường dẫn Vault ở trên chưa; role/policy của app có "
         "đọc được tiền tố đó không; VaultAuth trong namespace có Ready không."
+    )
+
+
+def wait_for_databases(docs: list[dict], ns: str, args) -> None:
+    """Chờ mọi Cluster (CloudNativePG) vừa render báo Ready.
+
+    Đọc condition `Ready` chứ không đếm pod: một cluster ba bản sao có pod chạy từ sớm
+    trong khi bootstrap/join replica còn chưa xong, và app kết nối vào lúc đó thì gặp
+    "the database system is starting up" — trông y hệt một lỗi cấu hình.
+    """
+    targets = [d for d in docs if d.get("kind") == "Cluster"
+               and str(d.get("apiVersion", "")).startswith("postgresql.cnpg.io/")]
+    if not targets:
+        return
+    timeout = config_int("database.ready_timeout_seconds", 600)
+    log(f"chờ {len(targets)} Cluster postgres trong {ns} sẵn sàng (tối đa {timeout}s)")
+    deadline = time.time() + timeout
+    while True:
+        pending = []
+        for doc in targets:
+            name = doc["metadata"]["name"]
+            cp = kubectl(["get", "cluster.postgresql.cnpg.io", name, "-n", ns, "-o", "json"],
+                         kubeconfig=args.kubeconfig, check=False, capture=True)
+            if cp.returncode != 0:
+                pending.append(f"{name}: Cluster chưa tồn tại trên cụm")
+                continue
+            obj = json.loads(cp.stdout or "{}")
+            status = obj.get("status") or {}
+            ready = next((c for c in status.get("conditions") or []
+                          if c.get("type") == "Ready"), None)
+            if ready and ready.get("status") == "True":
+                continue
+            want_instances = (obj.get("spec") or {}).get("instances", 1)
+            pending.append(
+                f"{name}: {status.get('readyInstances', 0)}/{want_instances} bản sao sẵn "
+                f"sàng, phase={status.get('phase', '?')} "
+                f"reason={(ready or {}).get('reason', '?')}")
+        if not pending:
+            log(f"tất cả {len(targets)} Cluster postgres đã Ready")
+            return
+        if time.time() >= deadline:
+            break
+        time.sleep(10)
+    for line in pending:
+        print(f"::error::{line}", file=sys.stderr, flush=True)
+    raise SystemExit(
+        f"{args.app}/{args.env}: cơ sở dữ liệu chưa Ready sau {timeout}s. Kiểm: Secret "
+        "credential đã được VSO đồng bộ chưa (nó là nguồn user/password của initdb), "
+        "PVC có bound không, và image postgres có kéo được từ registry không."
     )
 
 
@@ -2504,6 +2664,10 @@ def cmd_verify(args) -> None:
     # ready" — true, useless, and it sends whoever is paged to look at the image. Checking
     # the VaultStaticSecret first turns the same failure into "Vault path X, reason Y".
     wait_for_vault_secrets(docs, ns, args)
+    # Then the database, for the same reason: an app whose database has not finished
+    # bootstrapping crash-loops on connection refused, and the rollout check would report
+    # that as "0 replicas ready" without ever mentioning the database.
+    wait_for_databases(docs, ns, args)
 
     want: dict[str, list[str]] = {}
     for doc in docs:
@@ -2745,6 +2909,12 @@ def read_secret_value(args) -> str:
     other user on the box can read it with `ps`, and in the CI log if this is ever scripted.
     None of those are things you can un-leak, so the flag simply does not exist.
     """
+    if getattr(args, "generate", False):
+        # For credentials the PLATFORM owns — a database password nobody should ever see,
+        # type or paste. Generated here and written straight to Vault; it is never printed,
+        # never returned to a caller, and never written to a file.
+        alphabet = string.ascii_letters + string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(32))
     if args.stdin:
         value = sys.stdin.read()
         # Only the trailing newline the shell/pipe adds — a secret may legitimately end in
@@ -3007,6 +3177,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--name", required=True, help="tên secret logic, vd: stripe")
     p.add_argument("--key", required=True, help="khoá bên trong secret đó, vd: api_key")
     p.add_argument("--stdin", action="store_true", help="đọc giá trị từ stdin thay vì nhập ẩn")
+    p.add_argument("--generate", action="store_true",
+                   help="sinh ngẫu nhiên (dùng cho credential do PLATFORM sở hữu, vd mật "
+                        "khẩu database). Giá trị không bao giờ được in ra.")
     p.add_argument("--replace", action="store_true",
                    help="ghi đè toàn bộ secret (mặc định chỉ vá đúng khoá này)")
     p.set_defaults(func=cmd_secret_set)
