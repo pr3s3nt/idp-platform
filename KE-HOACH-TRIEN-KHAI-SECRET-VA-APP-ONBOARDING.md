@@ -159,6 +159,51 @@ Sau đó AI dừng ở trạng thái `Ready for review` và cung cấp một tro
 
 Không merge vào `main` trước khi người dùng review và yêu cầu rõ ràng. Nếu `main` đã thay đổi trong thời gian phát triển, fetch/merge/rebase và xử lý conflict là một task riêng; không tự làm trong bước hoàn tất này.
 
+#### 0.3.4. Verification phải thực sự dùng code trên feature branch
+
+Repository hiện có hai hành vi cố ý dùng default branch:
+
+- GitHub chạy workflow `repository_dispatch` của platform từ default branch `main`.
+- App CI templates checkout platform code bằng `ref: main` để image planning và renderer không lệch phiên bản.
+
+Vì vậy một deploy-request thành công không chứng minh code mới trên `feature/secret-onboarding` đã được chạy. Trong thời gian phát triển, AI phải verify bằng source đang checkout trên harness WSL2:
+
+```text
+git branch --show-current phải là feature/secret-onboarding
+→ gọi trực tiếp orchestrate.py từ working tree hiện tại
+→ render bằng config local
+→ apply/để Fleet reconcile vào namespace fixture local
+→ chạy verify và smoke tests local
+```
+
+Trước mỗi integration/E2E run, log ít nhất:
+
+```bash
+git branch --show-current
+git rev-parse HEAD
+```
+
+Evidence phải ghi branch và SHA đã được test. Không được dùng kết quả của một workflow chạy `main` làm evidence cho feature branch.
+
+Nếu dùng GitHub Actions để test, chỉ dùng `workflow_dispatch` và chọn rõ ref `feature/secret-onboarding`; job đầu tiên phải in/xác nhận `github.ref` và commit SHA. `repository_dispatch` vẫn được giữ nguyên để bảo vệ luồng đang chạy trên `main`.
+
+Không sửa tạm app templates từ `ref: main` sang feature branch rồi commit thay đổi đó. Nếu thật sự cần một workflow test branch, tạo test harness/workflow opt-in tách biệt và không ảnh hưởng app hiện tại.
+
+GitHub repository/organization Secrets không cần và không được copy giữa các branch. Secret chỉ có thể không được inject vì scope repository, GitHub Environment protection, fork PR hoặc reusable-workflow forwarding; đó là cấu hình GitHub, không phải dữ liệu thuộc branch.
+
+Phase 0 phải kiểm tra `.gitignore` và bổ sung tối thiểu các local artifact có thể chứa credential nếu chưa có:
+
+```text
+.env
+.env.*
+!.env.example
+.score-compose/
+.score-k8s/
+kubeconfig-*
+```
+
+Vault root token, unseal key, bootstrap output và Helm-generated credential phải được lưu ngoài repository hoặc trong đường dẫn local đã ignore. Test chỉ được kiểm tra tên secret/config key và quyền truy cập; không in giá trị vào log/evidence.
+
 ### 0.4. Compatibility và rollout rules
 
 - Mọi tính năng mới phải opt-in và/hoặc nằm sau feature flag.
