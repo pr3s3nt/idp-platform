@@ -76,8 +76,41 @@ Mỗi "mảng" test canh một bất biến. Test đỏ ở mảng nào = bạn 
   `repository_dispatch` chạy `orchestrator.yaml`. Muốn kiểm tới cụm thì đối chiếu trực tiếp
   (`kubectl`, `gh api`) — xem `docs/orchestrator-contract.md`.
 
+## Môi trường verify & hạ tầng (đọc trước khi làm phase cần cụm)
+
+Một số phase (Vault/VSO, DB provider, score-compose…) cần hạ tầng thật, không chỉ pytest.
+**Đừng tin bất kỳ ảnh chụp trạng thái nào chép trong tài liệu — nó lỗi thời ngay.** Luôn tự
+lấy trạng thái SỐNG:
+
+- **Cụm verify** trên máy này: `kind-staging`, `kind-prod` (và `kind-v2`) — context `kind-*`.
+  Xem có gì: `kubectl config get-contexts` / `kind get clusters`.
+- **Probe hạ tầng (nguồn sự thật LIVE, CHỈ ĐỌC, an toàn cả trên prod):**
+  ```bash
+  ./tools/thu-thap-ha-tang.sh                                   # cụm đang trỏ tới
+  KUBECONFIG=... ./tools/thu-thap-ha-tang.sh                    # chạy cho TỪNG cụm
+  ```
+  Nó in node, storageClass, Gateway API/gateway, traefik, Fleet, CRD… **không in secret**.
+  Chạy cái này TRƯỚC khi kết luận "phải dựng mới" hay "đã có sẵn".
+- **Công cụ đã ghim** (ADR `0006`): kiểm bằng `preflight` + `--version`:
+  `score-k8s`, `score-compose`, `helm`, `kubectl`, `vault`. Sai version = render/deploy lệch.
+
+**Phase nào cần hạ tầng gì (để biết phải dựng hay đã có — tự kiểm bằng lệnh, đừng đoán):**
+
+| Phase | Cần | Kiểm nhanh |
+|---|---|---|
+| 2 — Vault/VSO | VSO (CRD `secrets.hashicorp.com`) + một Vault + VaultConnection/Auth | `kubectl get crd \| grep secrets.hashicorp.com` ; `helm ls -A \| grep -iE 'vault\|vso'` |
+| 3 — App secret | Phase 2 chạy được (VSO sync ra Secret trong ns) | `kubectl get vaultstaticsecret,secretstore -A` |
+| 4 — Postgres capability | DB provider/operator production-grade | probe: tìm operator postgres; `kubectl get crd \| grep -iE 'postgres\|cnpg\|zalando'` |
+| 5 — Stack + score-compose | `score-compose` bản đã ghim | `score-compose --version` |
+| chung — deploy tới cụm | Fleet + gateway (traefik) + storageClass | có trong output `thu-thap-ha-tang.sh` |
+
+> Thứ chỉ tồn tại ở công ty (Vault addr thật, policy…) thì theo `KE-HOACH...` mục 0.6: tạo
+> config key + validation/preflight + checklist, **không** tự đánh dấu pass, và **không** để
+> nó chặn phần verify được ở local.
+
 ## Tài liệu gốc liên quan
 
+- `KE-HOACH-TRIEN-KHAI-SECRET-VA-APP-ONBOARDING.md` — master plan; **bảng trạng thái phase ở mục 0.5** (đã làm tới đâu).
 - `TAI-LIEU-DU-AN.md` — thiết kế + lý do từng quyết định.
 - `docs/adr/` — quyết định kiến trúc (vd `0002-vault-only-secret-store.md` cho tính năng secret).
 - `docs/orchestrator-contract.md` — hợp đồng portal ↔ orchestrator, kèm cách verify trên cụm thật.

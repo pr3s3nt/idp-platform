@@ -28,7 +28,8 @@ Nền tảng phải mang sang công ty khác **chỉ bằng sửa `platform.env.
 - Giữ **tương thích ngược**; **đừng xóa các comment "vì sao"**.
 
 ## Tài liệu gốc
-- `HUONG-DAN-KIEM-THU.md` — harness kiểm thử (cách chạy, nó canh gì, ranh giới).
+- `HUONG-DAN-KIEM-THU.md` — harness kiểm thử (cách chạy, nó canh gì) **+ môi trường/cụm verify
+  và cách probe hạ tầng sống** (`tools/thu-thap-ha-tang.sh`) trước khi làm phase cần cụm.
 - `TAI-LIEU-DU-AN.md` — thiết kế + lý do từng quyết định.
 - `docs/adr/` — quyết định kiến trúc (vd `0002-vault-only-secret-store.md`).
 - `docs/orchestrator-contract.md` — hợp đồng portal ↔ orchestrator + cách verify trên cụm thật.
