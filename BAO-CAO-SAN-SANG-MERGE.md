@@ -21,12 +21,12 @@ Ngày: 2026-08-11 · Baseline: `36372b9` · Đã push lên `origin`.
 ## 2. Phạm vi thay đổi
 
 ```text
-git log --oneline 36372b9..feature/secret-onboarding   ->  18 commit
-git diff --stat 36372b9...feature/secret-onboarding    ->  73 file, +15875 / -955
+git log --oneline 36372b9..feature/secret-onboarding   ->  22 commit
+git diff --stat 36372b9...feature/secret-onboarding    ->  75 files changed, 16516 insertions(+), 956 deletions(-)
 git status --short                                     ->  (rỗng)
 ```
 
-Riêng Phase 7 (`b608a96..715fd9d`, 6 commit): `orchestrate.py`, `test_orchestrate.py`,
+Riêng Phase 7 (`b608a96..351a92c`, 10 commit): `orchestrate.py`, `test_orchestrate.py`,
 `provisioners/postgres-application.provisioners.yaml`, `platform.env*.yaml`, và 13 file tài
 liệu/công cụ mới.
 
@@ -121,7 +121,7 @@ CI xanh nhưng tính tag khác orchestrator.
 
 ## 8. Đề xuất
 
-Nhánh đã có trên `origin` tại `715fd9d`. Khi người dùng muốn:
+Nhánh đã có trên `origin` tại `351a92c`. Khi người dùng muốn:
 
 ```bash
 gh pr create --base main --head feature/secret-onboarding \
