@@ -838,8 +838,8 @@ chỉ hữu ích khi có người đọc log.
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `b608a96` (Phase 6).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **408 passed**
-(384 → 408, thêm 24 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** ở mỗi lần
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **414 passed**
+(384 → 414, thêm 30 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** ở mỗi lần
 chạm provisioner: 390/390/390 rồi 397/397/397.
 
 **Gate của Phase 7 — phase này không có gate sẵn trong kế hoạch, nên tự đề xuất rồi đo:**
@@ -971,6 +971,50 @@ KHÔNG có triệu chứng phía người dùng; nó nổ ra ở lần restart p
 runbook 3. Cũng đo được: một `VaultStaticSecret` tạo **sau** khi Vault trở lại đồng bộ
 ngay, một cái có **từ trước** thì phải chờ hết backoff.
 
+**Món nợ cũ đã trả (2): `--images ci` nay đã đo với CI THẬT.** Ban đầu tôi ghi nó vào "hạn
+chế còn lại" — sai, và người dùng chỉ ra đúng: mục 0.3.4 đã mô tả sẵn quy trình (ghim `ref:`
+trong bản sao `ci.yaml` của chính kho fixture, tắt tạm workflow orchestrator, bật lại ngay
+sau), mục 0.6 nói rõ "công việc lớn" không phải stop condition, và quyền tạo kho đã được
+cấp. Không có gì cản; đó là đúng loại việc mà lỗi 8, 11 và 12 đều đã sinh ra.
+
+Đo bằng kho fixture `pr3s3nt/banggia` (đã xoá sau khi đo): CI **success cả 4 job**, đẩy hai
+ảnh lên GHCR với tag theo commit SHA. Rồi `onboard --images ci` in ra đúng ba dòng cần
+thấy: `kho ứng dụng đã có commit mới (4e4dc5b3 -> e47c670b) -> đi tiếp với commit mới nhất`,
+`tag_strategy=commit (from .idp/stack.yaml)` khớp cái CI đã tính, và **`mọi ảnh đã có trên
+registry -> không build lại`**. Sau đó Fleet deploy, hai pod Running bằng **ảnh của CI**, và
+app trả 200 ở `/`, `/api/health`, `/api/ready` qua Gateway.
+
+**Lỗi thật thứ mười sáu — `registry-pull` được tạo bằng credential rỗng, và trông như đã
+cấu hình đầy đủ.** Chỉ lộ ra khi chạy trọn đường onboard trên một registry PRIVATE. Thiếu
+`REGISTRY_USER`/`REGISTRY_PASS` trong môi trường mà vẫn gọi `create secret docker-registry`
+thì Python nội suy `None` thành CHUỖI `"None"`. Cụm nhận một credential mà `kubectl get
+secret` thấy đầy đủ: đúng tên, đúng kiểu `dockerconfigjson`, có dữ liệu. Ảnh thì không kéo
+được, và lỗi là `403 Forbidden` từ ghcr.io — không một chữ nào nhắc tới biến còn thiếu. Đo
+được: 2 workload đứng `ImagePullBackOff` 10 phút trong khi ảnh nằm sẵn trên registry và
+database đã `Ready`. Tệ hơn: `apply-secrets` là create-if-missing nên Secret hỏng đó sống
+mãi. Nay không đủ user+pass thì **không tạo gì cả**, và nói thẳng thiếu biến nào — không có
+Secret thì kubelet báo `FailedToRetrieveImagePullSecret`, một thông báo trung thực.
+
+**Lỗi thật thứ mười bảy — Cluster tham chiếu một Secret mà không ai tạo.** Provisioner sinh
+`barmanObjectStore` trỏ vào `database.backup.credentials_secret`, nhưng không bước nào tạo
+Secret đó trong namespace onboarding vừa dựng — và **CNPG không đọc chéo namespace**.
+`tools/dung-object-store-harness.sh` chỉ phát Secret cho các namespace ĐANG CÓ lúc nó chạy;
+một app onboard sau đó không bao giờ nhận được. Đo trên app `sinhvien`: `ScheduledBackup`
+được tạo và chạy ngay như thiết kế, nhưng Backup đứng ở `walArchivingFailing`,
+`firstRecoverabilityPoint` không bao giờ xuất hiện — trong khi Cluster vẫn `Ready` và app
+vẫn phục vụ bình thường. **Trước Phase 7 việc này trôi qua trong im lặng**; nay `verify`
+chặn đúng chỗ, nên gốc rễ được sửa chứ không phải nới cái chặn. `apply-secrets` nay tạo
+Secret đó với cùng kỷ luật như registry-pull. Một chi tiết phải biết khi vá cụm đang chạy:
+tạo Secret SAU khi Cluster đã tồn tại thì instance manager vẫn hỏng với `failed to get envs:
+cache miss` — nó cache lúc khởi động, phải restart instance.
+
+**Pilot thật (mục 14, "pilot một app demo"):** app `sinhvien` — quản lý sinh viên có
+thêm/sửa/xoá, database CNPG, biến môi trường khác nhau giữa staging và prod, và một bí mật
+lấy từ Vault **có tác dụng thật** (mọi thao tác ghi đòi `X-API-Key`). Đo trên staging:
+`/api/thong-tin` trả đúng giá trị của môi trường staging (`(STAGING)`, `logLevel=debug`,
+`maxSinhVien=20`), ghi không kèm khoá → **401**, có khoá → **201**, sửa → 200, xoá → 204,
+xoá id không tồn tại → 404. Đường đi đầy đủ viết thành `add_app_guide.md`.
+
 **Món nợ cũ đã trả:** `docs/orchestrator-contract.md` — CLAUDE.md và HUONG-DAN-KIEM-THU.md
 đều trỏ tới file này nhưng nó chưa bao giờ tồn tại. Nay có: hợp đồng "portal gửi Ý ĐỊNH,
 không gửi toạ độ", những gì nền tảng đảm bảo, những gì nó **không** hứa, và quy trình verify
@@ -991,7 +1035,9 @@ File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.ya
 Config key mới: `database.backup.schedule`, `database.backup.first_backup_timeout_seconds`,
 và `database_profiles.<env>.application.backup.schedule` (tuỳ chọn, ghi đè). Placeholder
 mới: `%%computed.database.backup.schedule%%`. Lệnh mới: `offboard`,
-`rotate-db-credential`; cờ mới `render --accept-empty-database`.
+`rotate-db-credential`; cờ mới `render --accept-empty-database` và
+`apply-secrets --backup-key-id/--backup-secret-key`. Biến môi trường mới mà onboarding đọc:
+`BACKUP_ACCESS_KEY_ID`, `BACKUP_ACCESS_SECRET_KEY` (cùng họ với `REGISTRY_USER/PASS`).
 
 Migration: không có cho app đang chạy. App dùng `class: application` **cần render lại và
 apply** để nhận `ScheduledBackup` và `managed.roles` — không có hai thứ đó thì backup không
@@ -1000,9 +1046,7 @@ Cluster render bằng catalog cũ, trước khi ghi bất cứ thứ gì vào Va
 Rollback: `database.backup.schedule` rỗng + không có kho object cho ra đúng manifest như
 trước; `offboard` và `rotate-db-credential` là lệnh mới, không nằm trên đường deploy.
 
-Hạn chế còn lại: **`--images ci` vẫn chưa đo với một CI thật** — vẫn chỉ chạy đường "chưa có
-ảnh → dừng có trạng thái"; phase này không tạo kho GitHub nào nên không có CI thật để đo.
-`offboard` chưa có bước tự archive kho GitHub (in ra lệnh `gh repo archive` để người chạy
+Hạn chế còn lại: `offboard` chưa có bước tự archive kho GitHub (in ra lệnh `gh repo archive` để người chạy
 tự làm) và chưa xoá package trên registry. Cảnh báo mục 17 về **thời lượng onboarding theo
 bước** (D3) mới có nguồn dữ liệu (`history[]` trong bản ghi state), chưa có ngưỡng — cố ý,
 vì một ngưỡng đoán mò sẽ bị tắt sau tuần đầu. Kho object của harness vẫn là một MinIO đơn

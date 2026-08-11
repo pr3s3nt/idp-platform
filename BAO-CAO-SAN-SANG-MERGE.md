@@ -2,7 +2,7 @@
 
 **Trạng thái: `Ready for review`. Chưa merge, và sẽ không tự merge.**
 
-Ngày: 2026-08-11 · Baseline: `36372b9` · HEAD: `715fd9d` · Đã push lên `origin`.
+Ngày: 2026-08-11 · Baseline: `36372b9` · Đã push lên `origin`.
 
 ---
 
@@ -11,7 +11,7 @@ Ngày: 2026-08-11 · Baseline: `36372b9` · HEAD: `715fd9d` · Đã push lên `o
 | Điều kiện | Trạng thái | Bằng chứng |
 |---|---|---|
 | Tất cả phase local ở mục 0.5 là `Done` | ✅ | Phase 0–7 đều `Done`, mỗi phase có nhật ký riêng |
-| Full unit/integration/smoke suite pass | ✅ | **408 passed, 0 skipped**; chạy 3 lần liên tiếp ở mỗi lần chạm provisioner |
+| Full unit/integration/smoke suite pass | ✅ | **414 passed, 0 skipped**; chạy 3 lần liên tiếp ở mỗi lần chạm provisioner |
 | Legacy regression pass khi feature flags tắt | ✅ | 4 cặp render baseline `36372b9` vs HEAD **giống nhau từng byte** |
 | Không có secret/credential trong diff hoặc history | ✅ | quét toàn diff nhánh: không có key, token, mật khẩu thật |
 | Có migration, configuration và rollback checklist | ✅ | mục 3–5 dưới đây + "Migration/Rollback" trong từng nhật ký phase |
@@ -40,6 +40,16 @@ liệu/công cụ mới.
 | `database.backup.schedule` | có mặc định `"0 0 2 * * *"` | **cron CNPG có SÁU trường** (giây đứng đầu). `"0 2 * * *"` kiểu Unix ⇒ chụp **mỗi giờ** |
 | `database.backup.first_backup_timeout_seconds` | mặc định 600 | base backup prod thật lâu hơn harness nhiều |
 | `database_profiles.<env>.application.backup.schedule` | tuỳ chọn | ghi đè lịch theo môi trường |
+
+Và bốn biến MÔI TRƯỜNG mà onboarding đọc (không phải khoá config — chúng là credential):
+
+| Biến | Thiếu thì |
+|---|---|
+| `REGISTRY_USER` / `REGISTRY_PASS` | không tạo `registry-pull`; ảnh không kéo được nếu registry private |
+| `BACKUP_ACCESS_KEY_ID` / `BACKUP_ACCESS_SECRET_KEY` | không tạo credential kho object; WAL archiving hỏng, không có base backup, và `verify` chặn |
+
+Cả hai nay **từ chối tạo Secret rỗng** và nói thẳng biến nào thiếu — trước đây chúng tạo ra
+một credential chứa chuỗi `"None"`, trông như đã cấu hình đầy đủ.
 
 Toàn bộ khoá của các phase trước vẫn giữ nguyên ý nghĩa.
 
@@ -76,7 +86,7 @@ destroy), và dữ liệu đã ghi. Chi tiết: `docs/runbook/rollback-nang-cap-
 
 AI **không** chạy các bước này.
 
-1. Checkout đúng commit đã pass harness: `715fd9d`.
+1. Checkout commit đầu nhánh đã pass harness (xem `git log -1 feature/secret-onboarding`).
 2. Điền `platform.env.company.yaml` (mục 3 ở trên + các khoá của phase trước). **Không sửa
    source.**
 3. `preflight --require-cluster --require-vault` — và `verify-rbac` cho một app mẫu.
@@ -96,8 +106,6 @@ CI xanh nhưng tính tag khác orchestrator.
 
 ## 7. Còn nợ, nói thẳng
 
-- **`--images ci` chưa đo với CI thật.** Vẫn chỉ chạy đường "chưa có ảnh → dừng có trạng
-  thái". Phase 7 không tạo kho GitHub nào nên không có CI thật để đo.
 - **`offboard` chưa tự archive kho GitHub và chưa xoá package trên registry** — nó in ra
   lệnh để người chạy tự làm. Cố ý: cả hai đều cần scope token rộng hơn và đều không hoàn
   tác được.
