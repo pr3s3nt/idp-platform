@@ -2958,6 +2958,49 @@ def ensure_namespace(ns: str, kubeconfig: str | None) -> None:
     )
 
 
+def ensure_backup_credentials(ns: str, args) -> None:
+    """Credential kho object cho CNPG, TRONG namespace của app.
+
+    Lỗi thật thứ mười bảy. Provisioner sinh `barmanObjectStore` tham chiếu Secret
+    `database.backup.credentials_secret`, nhưng KHÔNG có ai tạo Secret đó trong namespace
+    mà onboarding vừa dựng — và **CNPG không đọc chéo namespace**. Kết quả đo được trên
+    cụm: `ScheduledBackup` chạy ngay như thiết kế, nhưng Backup đứng ở
+    `walArchivingFailing`, `firstRecoverabilityPoint` không bao giờ xuất hiện, và database
+    thì vẫn `Ready` và vẫn phục vụ bình thường.
+
+    Trước Phase 7 việc này trôi qua trong im lặng — không ai kiểm base backup. Nay `verify`
+    chặn đúng chỗ, nên gốc rễ phải được sửa chứ không phải nới cái chặn.
+
+    Cùng kỷ luật với registry-pull: KHÔNG tạo Secret rỗng. Một credential sai còn tệ hơn
+    không có, vì `create-if-missing` khiến nó sống mãi.
+    """
+    name = str(CONFIG.get("database.backup.credentials_secret") or "")
+    if not name or not (CONFIG.get("database.backup.object_store_url") or ""):
+        return
+    cp = kubectl(["get", "secret", name, "-n", ns, "-o", "name"],
+                 kubeconfig=args.kubeconfig, check=False, capture=True)
+    if cp.returncode == 0:
+        log(f"secret backup {name} trong {ns} đã có -> giữ nguyên")
+        return
+    key_id = getattr(args, "backup_key_id", None) or os.environ.get("BACKUP_ACCESS_KEY_ID")
+    secret_key = (getattr(args, "backup_secret_key", None)
+                  or os.environ.get("BACKUP_ACCESS_SECRET_KEY"))
+    if not key_id or not secret_key:
+        missing = [n for n, v in (("BACKUP_ACCESS_KEY_ID", key_id),
+                                  ("BACKUP_ACCESS_SECRET_KEY", secret_key)) if not v]
+        warn(f"KHÔNG tạo secret backup {name} trong {ns}: thiếu {', '.join(missing)}. "
+             "WAL archiving sẽ hỏng và sẽ KHÔNG có base backup nào — database vẫn Ready, "
+             "vẫn phục vụ, và không phục hồi được. `verify` sẽ dừng ở đúng chỗ đó.")
+        return
+    _tolerate_exists(
+        kubectl(["create", "secret", "generic", name, "-n", ns,
+                 f"--from-literal=ACCESS_KEY_ID={key_id}",
+                 f"--from-literal=ACCESS_SECRET_KEY={secret_key}"],
+                kubeconfig=args.kubeconfig, check=False, capture=True),
+        f"secret backup {name} in {ns}",
+    )
+
+
 def cmd_apply_secrets(args) -> None:
     ns = app_namespace(args.app, args.env)
     ensure_namespace(ns, args.kubeconfig)
@@ -2994,6 +3037,8 @@ def cmd_apply_secrets(args) -> None:
              f"chạy lại, hoặc tạo tay: kubectl -n {ns} create secret docker-registry "
              f"{pull_secret()} --docker-server={args.harbor_host} "
              "--docker-username=<user> --docker-password=<token>")
+
+    ensure_backup_credentials(ns, args)
 
     secrets = Path(args.secrets)
     if not secrets.is_file() or not secrets.stat().st_size:
@@ -5288,6 +5333,8 @@ def deploy_environment(ctx: OnboardContext, env: str) -> Path:
         harbor_host=os.environ.get("REGISTRY_HOST") or CONFIG.get("registry.host"),
         harbor_user=os.environ.get("REGISTRY_USER"),
         harbor_pass=os.environ.get("REGISTRY_PASS"),
+        backup_key_id=os.environ.get("BACKUP_ACCESS_KEY_ID"),
+        backup_secret_key=os.environ.get("BACKUP_ACCESS_SECRET_KEY"),
         kubeconfig=ctx.kubeconfig))
     return config_dir
 
@@ -6183,6 +6230,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--secrets", required=True)
     p.add_argument("--harbor-host")
     p.add_argument("--harbor-user")
+    p.add_argument("--backup-key-id", help="ACCESS_KEY_ID của kho object (mặc định "
+                                           "BACKUP_ACCESS_KEY_ID)")
+    p.add_argument("--backup-secret-key", help="ACCESS_SECRET_KEY của kho object (mặc định "
+                                               "BACKUP_ACCESS_SECRET_KEY)")
     p.add_argument("--harbor-pass")
     p.add_argument("--kubeconfig")
     p.set_defaults(func=cmd_apply_secrets)

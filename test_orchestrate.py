@@ -3850,6 +3850,74 @@ def test_a_registry_secret_is_created_when_credentials_are_present(tmp_path, mon
     assert "--docker-username=u" in created[0]
 
 
+def _backup_cfg(**over):
+    data = {"database": {"backup": {"object_store_url": "s3://idp-backup/",
+                                    "credentials_secret": "backup-object-store"}}}
+    data["database"]["backup"].update(over)
+    return orc.EnvConfig(data)
+
+
+def test_backup_credentials_are_created_in_the_app_namespace(monkeypatch):
+    """Lỗi thật thứ mười bảy: provisioner sinh `barmanObjectStore` tham chiếu một Secret
+    mà KHÔNG ai tạo trong namespace onboarding vừa dựng — và CNPG không đọc chéo
+    namespace. Đo trên cụm: ScheduledBackup chạy ngay như thiết kế, Backup đứng ở
+    `walArchivingFailing`, firstRecoverabilityPoint không bao giờ xuất hiện, database vẫn
+    Ready và vẫn phục vụ."""
+    monkeypatch.setattr(orc, "CONFIG", _backup_cfg())
+    calls = []
+
+    def fake_kubectl(argv, **k):
+        calls.append(argv)
+        rc = 1 if argv[:2] == ["get", "secret"] else 0   # chưa tồn tại
+        return orc.subprocess.CompletedProcess([], rc, "", "")
+
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    orc.ensure_backup_credentials("sinhvien-staging", orc.argparse.Namespace(
+        kubeconfig=None, backup_key_id="k", backup_secret_key="s"))
+    created = [c for c in calls if c[:3] == ["create", "secret", "generic"]]
+    assert len(created) == 1, calls
+    assert "backup-object-store" in created[0] and "-n" in created[0]
+    assert "sinhvien-staging" in created[0]
+
+
+def test_backup_credentials_are_never_created_empty(monkeypatch, capsys):
+    """Cùng kỷ luật với registry-pull: một credential sai còn tệ hơn không có, vì
+    create-if-missing khiến nó sống mãi."""
+    monkeypatch.setattr(orc, "CONFIG", _backup_cfg())
+    calls = []
+    monkeypatch.setattr(orc, "kubectl", lambda argv, **k: calls.append(argv) or
+                        orc.subprocess.CompletedProcess([], 1, "", ""))
+    monkeypatch.delenv("BACKUP_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("BACKUP_ACCESS_SECRET_KEY", raising=False)
+    orc.ensure_backup_credentials("sinhvien-staging", orc.argparse.Namespace(
+        kubeconfig=None, backup_key_id=None, backup_secret_key=None))
+    assert not [c for c in calls if c[:3] == ["create", "secret", "generic"]]
+    err = capsys.readouterr().err
+    assert "BACKUP_ACCESS_KEY_ID" in err and "phục hồi" in err
+
+
+def test_no_object_store_means_no_backup_secret(monkeypatch):
+    """Không cấu hình kho object thì không có gì để tạo — và không được cằn nhằn."""
+    monkeypatch.setattr(orc, "CONFIG", _backup_cfg(object_store_url=""))
+    calls = []
+    monkeypatch.setattr(orc, "kubectl", lambda argv, **k: calls.append(argv) or
+                        orc.subprocess.CompletedProcess([], 1, "", ""))
+    orc.ensure_backup_credentials("x-staging", orc.argparse.Namespace(
+        kubeconfig=None, backup_key_id="k", backup_secret_key="s"))
+    assert not calls
+
+
+def test_an_existing_backup_secret_is_left_alone(monkeypatch):
+    """Create-if-missing: không bao giờ ghi đè một credential đang chạy."""
+    monkeypatch.setattr(orc, "CONFIG", _backup_cfg())
+    calls = []
+    monkeypatch.setattr(orc, "kubectl", lambda argv, **k: calls.append(argv) or
+                        orc.subprocess.CompletedProcess([], 0, "secret/x", ""))
+    orc.ensure_backup_credentials("x-staging", orc.argparse.Namespace(
+        kubeconfig=None, backup_key_id="k", backup_secret_key="s"))
+    assert not [c for c in calls if c[0] == "create"]
+
+
 def test_every_postgres_provisioner_declares_its_class():
     """A provisioner without `class` matches EVERY class, and when several match, the one
     score-k8s happens to load last wins — an order that depends on temp filenames it
