@@ -242,7 +242,7 @@ AI phải cập nhật bảng này trong quá trình làm. `Blocked` chỉ dùng
 | 4 — PostgreSQL capability/profile | Done | Xem "Nhật ký Phase 4" bên dưới |
 | 5 — Stack catalog và `score-compose` | Done | Xem "Nhật ký Phase 5" bên dưới |
 | 6 — Onboarding workflow/state machine | Done | Xem "Nhật ký Phase 6" bên dưới |
-| 7 — Pilot, migration và hardening local | Not started | |
+| 7 — Pilot, migration và hardening local | Done | Xem "Nhật ký Phase 7" bên dưới |
 
 Giá trị trạng thái hợp lệ: `Not started`, `In progress`, `Done`, `Blocked`.
 
@@ -833,6 +833,190 @@ onboard app golden path đầu tiên, và bật `features.stack_onboarding` tron
 định, nên làm ngược thứ tự sẽ cho ra một app có CI đỏ, hoặc tệ hơn, một app có CI xanh
 nhưng tính tag khác orchestrator. `write_app_ci_workflow` cảnh báo cả hai, nhưng cảnh báo
 chỉ hữu ích khi có người đọc log.
+
+#### Nhật ký Phase 7
+
+Branch `feature/secret-onboarding`, verify từ working tree tại SHA `b608a96` (Phase 6).
+
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **408 passed**
+(384 → 408, thêm 24 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** ở mỗi lần
+chạm provisioner: 390/390/390 rồi 397/397/397.
+
+**Gate của Phase 7 — phase này không có gate sẵn trong kế hoạch, nên tự đề xuất rồi đo:**
+
+| # | Gate | Kết quả |
+|---|---|---|
+| 1 | Dựng được một database CHẠY ĐƯỢC từ kho backup, dữ liệu khớp từng dòng | **đạt** — 5/5 dòng, md5 khớp, kể cả dữ liệu ghi SAU base backup |
+| 2 | Đổi `class` postgres trên app có dữ liệu không bao giờ im lặng | **đạt** — render DỪNG; có đường giữ dữ liệu đã chạy thật |
+| 3 | Xoay vòng bí mật ứng dụng: mỗi workload restart ĐÚNG MỘT LẦN | **đạt** — 2 workload, mỗi cái 1 lần, theo dõi trọn chu kỳ sau đó: không lần nào nữa |
+| 4 | Xoay vòng credential database kết thúc bằng một app CHẠY ĐƯỢC | **đạt sau khi sửa hai lỗi thiết kế** — xem lỗi 14 |
+| 5 | Xoá app có preview, có duyệt, và không xoá được của đội khác | **đạt** — từ chối đúng lúc, đo trên cụm |
+| 6 | Cảnh báo là thứ kiểm được, không phải văn | **đạt** — `tools/kiem-suc-khoe.sh` chạy được, và bắt đúng ba trạng thái hỏng đã đo |
+| 7 | App legacy không đổi một byte nào | **đạt** — 4 cặp render baseline `36372b9` vs HEAD giống nhau từng byte |
+
+**Lỗi thật thứ mười ba — WAL không có base backup thì phục hồi được đúng không gì cả, và
+nó vô hiệu hoá guard quan trọng nhất của Phase 4.**
+
+`barmanObjectStore` MỘT MÌNH chỉ bật WAL archiving; CNPG không tự chụp lấy một base backup
+nào. Kho object chỉ có `wals/`, không có `base/`. Đo trên `kind-staging` bằng đúng manifest
+cũ: `Cluster` **Ready**, condition `ContinuousArchiving` **True** kèm thông điệp
+*"Continuous archiving is working"*, WAL nằm thật trong bucket MinIO —
+`firstRecoverabilityPoint` **TRỐNG**, và một Cluster dựng bằng `bootstrap.recovery` từ
+chính kho đó chết ngay với `no target backup found`.
+
+Tức là guard `database.backup.object_store_url` của Phase 4 — dựng ra với lý do "một
+database production không phục hồi được thì không đáng gọi là chạy" — đang bảo vệ một thứ
+không tồn tại. Bằng chứng của Phase 6 ("WAL đi vào kho object") đúng, nhưng nó không phải
+bằng chứng về khả năng phục hồi. Đây chính xác là điều người dùng nghi ngờ khi giao phase.
+
+Sửa thiết kế, ba phần: provisioner sinh kèm `ScheduledBackup` với `immediate: true` (không
+có nó thì mọi database mới có một cửa sổ dài tới một chu kỳ cron trong đó nó chạy, nhận
+ghi, và không phục hồi được — rơi đúng vào ngày người ta hay nhập dữ liệu khởi tạo nhất);
+`verify` chờ `firstRecoverabilityPoint` chứ không dừng ở `Ready`; render bị CHẶN khi có kho
+object mà lịch base backup rỗng. Cron của CNPG có **sáu** trường (giây đứng đầu) — `"0 2 *
+* *"` kiểu Unix vẫn được nhận nhưng bị đọc thành "chụp mỗi giờ".
+
+Đo lại sau khi sửa: base backup xong sau ~10 giây, `firstRecoverabilityPoint` xuất hiện, và
+Cluster phục hồi trả về **5/5 dòng với md5 khớp nguồn** — kể cả 2 dòng ghi SAU base backup,
+tức WAL replay cũng chạy.
+
+**Lỗi thật thứ mười bốn — xoay vòng credential database sinh ra một Secret mà chính
+database TỪ CHỐI.** Hai tầng, tầng thứ hai chỉ lộ ra sau khi sửa tầng thứ nhất.
+
+`bootstrap.initdb.secret` chỉ được đọc MỘT LẦN, lúc khởi tạo. Ghi mật khẩu mới vào Vault →
+VSO đồng bộ ra Secret → `psql` bằng đúng giá trị trong Secret trả về `password
+authentication failed for user "app_api"`. App đang chạy **không hỏng ngay** vì nó giữ mật
+khẩu cũ trong biến môi trường của pod; nó hỏng ở lần restart pod kế tiếp — có thể nhiều
+ngày sau, vì một lý do hoàn toàn không liên quan (scale, evict, nâng cấp node). Nguyên nhân
+và triệu chứng cách nhau đủ xa để không ai nối được hai đầu.
+
+Thêm `managed.roles` vào provisioner thì CNPG đối chiếu mật khẩu role với Secret — nhưng
+**chỉ khi đối tượng Cluster được reconcile**. Một Secret đổi KHÔNG kích hoạt việc đó: đo
+được, sau **8 phút** `status.managedRolesStatus.passwordStatus.app_api.resourceVersion` vẫn
+đứng ở bản cũ. Chạm vào Cluster một cái thì role đổi trong **dưới 20 giây**.
+
+Nên xoay vòng là bốn bước và không cái nào tự kích hoạt cái kế tiếp: Vault → Secret (VSO) →
+role trong PostgreSQL (CNPG) → pod. Lệnh mới `rotate-db-credential` chạy đúng thứ tự và
+CHỜ xác nhận ở từng bước, bằng `resourceVersion` — **không đọc giá trị bí mật ở bất kỳ đâu**,
+vì đó cũng chính là thứ CNPG ghi lại trong status. Đo trên cụm với app hai workload: toàn
+bộ chuỗi **88 giây**, chỉ `api` restart đúng một lần, `worker` giữ nguyên generation vì nó
+không đọc Secret database.
+
+**Lỗi thật thứ mười lăm — đổi `class` postgres là một RESOURCE KHÁC, và không ai được báo.**
+
+score-k8s định danh resource bằng `<type>.<class>#<workload>.<tên>`, nên
+`postgres.default#api.db` và `postgres.application#api.db` là hai thứ khác nhau: Guid mới,
+tên object mới, state cũ nằm lại vĩnh viễn kèm mật khẩu dạng thô của provisioner cũ.
+
+Đo trên fixture sao chép từ một app legacy có 4 dòng thật:
+
+| | trước | sau |
+|---|---|---|
+| `PGHOST` | `pg-api-54f63de0` | `pg-api-be0342e7-rw` |
+| `PGDATABASE` | `db-haKaonqu` | `app_api` |
+| `PGUSER` | `user-IUvGqfQK` | `app_api` |
+
+Cluster mới `Ready` với **0 bảng**. Fleet prune StatefulSet cũ, nhưng PVC sinh từ
+`volumeClaimTemplate` **không bị thu hồi theo** — dữ liệu ở lại trên một ổ đĩa không còn ai
+trỏ tới (kiểm được: apply lại StatefulSet thì 4 dòng cũ trở lại nguyên vẹn). App vẫn xanh,
+vẫn kết nối được, và rỗng. Comment trong provisioner nói đổi class "KHÔNG phải sửa code
+app": đúng về **contract**, sai hoàn toàn về **dữ liệu**.
+
+Sửa: render DỪNG khi state đã có bản ghi của class cũ cho cùng resource; người vận hành
+phải chọn tường minh. Và `docs/chuyen-doi-postgres-sang-class-application.md` nói thẳng cả
+hai đường — đường giữ dữ liệu bằng CNPG `bootstrap.initdb.import` (**đã chạy thật**: 4/4
+dòng, md5 khớp, database đổi tên, owner đổi, app đăng nhập bằng credential Vault), và đường
+không giữ dữ liệu được gọi đúng tên là **huỷ-rồi-dựng-lại** với đủ ba hệ quả, không phải
+một dòng trong bảng.
+
+**Workflow xoá app (mục 13.4)** — `offboard`, xây mới. Mặc định **không xoá gì**, chỉ in kế
+hoạch gồm hai danh sách SẼ XOÁ / SẼ GIỮ kèm lý do từng mục. `--execute` đòi gõ lại đúng tên
+app; `prod` đòi thêm `--approved-by`, ghi vào bản ghi state. Lifecycle: backup database
+**không bị đụng tới**, bí mật Vault mặc định **xoá mềm** (kv-v2 tách `data` khỏi
+`metadata`), kho Git không xoá bao giờ.
+
+Tính chất khiến ba cái trên đáng tin: **mọi tài nguyên phải tự chứng minh nó thuộc app
+này.** `{app}-{env}` là một quy ước, không phải bằng chứng — nên trước khi xoá namespace,
+lệnh quét bên trong và TỪ CHỐI nếu thấy nhãn `idp.platform/application` của app khác. Đo
+trên cụm: cắm một ConfigMap dán nhãn `application=doi-thanh-toan` vào namespace fixture →
+`--execute` bị từ chối, namespace vẫn `Active`. GitRepo khớp theo `spec.repo`, không đoán
+theo tên. Thứ tự xoá cũng là thiết kế: **GitRepo trước namespace** — ngược lại thì Fleet
+thấy bundle thiếu tài nguyên và dựng lại tất cả trong lúc đang xoá, hai bên đánh nhau và
+Fleet thắng.
+
+**Quan sát (mục 17)** — probe trước: cụm **không có** stack giám sát nào (không CRD
+`monitoring.coreos.com`/prometheus/grafana). Nên phase này phát hành **điều kiện**, không
+phát hành dashboard: 8 runbook ở `docs/runbook/` (viết từ những gì đo được, không phải từ
+tài liệu thượng nguồn), `docs/canh-bao.md` với biểu thức `kubectl` chạy được + dạng metric
++ ngưỡng + lý do chọn ngưỡng, và `tools/kiem-suc-khoe.sh` chạy các kiểm phía cụm.
+
+Ba phép đo định hình mọi ngưỡng:
+
+1. **Đọc `status`, đừng đọc `reason`.** Một `VaultStaticSecret` đang hỏng đồng bộ có
+   `status: "False"` nhưng `reason` vẫn là chuỗi `"Synced"`. Cảnh báo nào so
+   `reason == "Synced"` sẽ báo xanh trong lúc đồng bộ đã chết.
+2. **Cảnh báo VSO phải có ngưỡng THỜI GIAN.** VSO tự lành sau sự cố Vault nhưng có backoff:
+   đo được **~2,5 phút**, và `message` đứng yên (cùng một giá trị `horizon`) suốt thời gian
+   đó. Cảnh báo tức thời sẽ đánh thức người trực ở mọi lần Vault khởi động lại.
+3. **`Ready` không có nghĩa là an toàn** — xem lỗi 13.
+
+Kiểm rằng các biểu thức thật sự **phát hiện được**, bằng chính ba trạng thái hỏng đã đo hôm
+nay: B1 bắt cluster-không-phục-hồi-được, A1 bắt VSS-hỏng-mà-reason-vẫn-Synced, B4 bắt
+xoay-vòng-dở-dang qua lệch `resourceVersion`. Chạy trên cụm hiện tại: không cảnh báo nào kêu.
+
+**Sự cố ngoài kịch bản, đo được miễn phí:** pod Vault (dev mode) restart giữa phiên và mất
+sạch mount + auth. Kết quả: **pod ứng dụng vẫn Running, Secret đích còn nguyên, database vẫn
+phục vụ đủ dữ liệu** — VSO không xoá Secret khi mất kết nối. Nghĩa là "Vault sập" thường
+KHÔNG có triệu chứng phía người dùng; nó nổ ra ở lần restart pod kế tiếp. Đã ghi thành
+runbook 3. Cũng đo được: một `VaultStaticSecret` tạo **sau** khi Vault trở lại đồng bộ
+ngay, một cái có **từ trước** thì phải chờ hết backoff.
+
+**Món nợ cũ đã trả:** `docs/orchestrator-contract.md` — CLAUDE.md và HUONG-DAN-KIEM-THU.md
+đều trỏ tới file này nhưng nó chưa bao giờ tồn tại. Nay có: hợp đồng "portal gửi Ý ĐỊNH,
+không gửi toạ độ", những gì nền tảng đảm bảo, những gì nó **không** hứa, và quy trình verify
+trên cụm thật theo thứ tự rẻ-trước.
+
+**Regression app legacy**: 4 cặp render (`simple-nginx`, `app-with-postgres` × staging/prod)
+baseline `36372b9` vs HEAD, dùng chung state file, render từ **bản sao** thư mục app, cờ
+tính năng tắt: **giống nhau từng byte**. `examples/` không bị sửa. Sáu app legacy trên cụm
+(`sample-pg`, `sample-nginx`, `boutique`, `demo`, `helloworld`, `sample-boutique`) đều
+Running và cả sáu GitRepo đều **1/1** sau khi phase kết thúc.
+
+File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
+`platform.env.company.yaml`, `provisioners/postgres-application.provisioners.yaml`,
+`docs/chuyen-doi-postgres-sang-class-application.md` (mới),
+`docs/orchestrator-contract.md` (mới), `docs/canh-bao.md` (mới),
+`docs/runbook/` (mới: README + 8 runbook), `tools/kiem-suc-khoe.sh` (mới).
+
+Config key mới: `database.backup.schedule`, `database.backup.first_backup_timeout_seconds`,
+và `database_profiles.<env>.application.backup.schedule` (tuỳ chọn, ghi đè). Placeholder
+mới: `%%computed.database.backup.schedule%%`. Lệnh mới: `offboard`,
+`rotate-db-credential`; cờ mới `render --accept-empty-database`.
+
+Migration: không có cho app đang chạy. App dùng `class: application` **cần render lại và
+apply** để nhận `ScheduledBackup` và `managed.roles` — không có hai thứ đó thì backup không
+phục hồi được và xoay vòng không có hiệu lực. `rotate-db-credential` từ chối chạy trên
+Cluster render bằng catalog cũ, trước khi ghi bất cứ thứ gì vào Vault.
+Rollback: `database.backup.schedule` rỗng + không có kho object cho ra đúng manifest như
+trước; `offboard` và `rotate-db-credential` là lệnh mới, không nằm trên đường deploy.
+
+Hạn chế còn lại: **`--images ci` vẫn chưa đo với một CI thật** — vẫn chỉ chạy đường "chưa có
+ảnh → dừng có trạng thái"; phase này không tạo kho GitHub nào nên không có CI thật để đo.
+`offboard` chưa có bước tự archive kho GitHub (in ra lệnh `gh repo archive` để người chạy
+tự làm) và chưa xoá package trên registry. Cảnh báo mục 17 về **thời lượng onboarding theo
+bước** (D3) mới có nguồn dữ liệu (`history[]` trong bản ghi state), chưa có ngưỡng — cố ý,
+vì một ngưỡng đoán mò sẽ bị tắt sau tuần đầu. Kho object của harness vẫn là một MinIO đơn
+lẻ. CNPG cảnh báo `barmanObjectStore` gốc sẽ bị bỏ ở **1.31**; khi nâng cấp phải chuyển sang
+Barman Cloud Plugin — đó là một thay đổi catalog đã biết trước, chưa làm. Scanner theo
+entropy (mục 6) vẫn chưa làm.
+
+Người dùng phải xác nhận lại khi mang vào công ty: **`database.backup.schedule` phải khớp
+cửa sổ bảo trì do DBA chốt**, và phải nhớ cron của CNPG có sáu trường; `first_backup_timeout_
+seconds` đủ rộng cho một base backup prod thật (harness chụp xong trong 10 giây với dữ liệu
+rỗng — 100Gi thì khác hẳn); ai được phép chạy `offboard` và ai là người duyệt hợp lệ ở prod;
+chính sách lưu trữ backup **sau khi** một app bị xoá (nền tảng cố ý không đụng tới nó);
+và **chạy thật một lần diễn tập phục hồi** theo runbook 4C trước khi cho app đầu tiên lên
+prod — bây giờ đã có quy trình cụ thể để làm việc đó, không còn là một lời khuyên.
 
 ### 0.6. Stop conditions
 
