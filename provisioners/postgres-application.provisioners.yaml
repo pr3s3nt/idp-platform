@@ -147,6 +147,47 @@
                 key: ACCESS_SECRET_KEY
             {{ end }}
         {{ end }}
+    {{ if ne "%%database.backup.object_store_url%%" "" }}
+    # BASE BACKUP. Khối `backup` ở trên MỘT MÌNH chỉ bật WAL archiving — CNPG không tự
+    # chụp lấy một base backup nào, và WAL không có base thì phục hồi được ĐÚNG KHÔNG GÌ
+    # CẢ. Đây không phải suy luận: đo trên harness với đúng manifest cũ — Cluster `Ready`,
+    # condition `ContinuousArchiving=True` kèm thông điệp "Continuous archiving is
+    # working", WAL nằm thật trong bucket MinIO — mà một Cluster dựng bằng
+    # bootstrap.recovery từ chính kho đó chết ngay với `no target backup found`.
+    #
+    # `immediate: true` là phần quan trọng nhất: nó chụp base backup NGAY khi Cluster vừa
+    # dựng xong, thay vì chờ tới lần cron đầu tiên. Không có nó thì mọi database mới sinh
+    # ra đều có một cửa sổ dài tới 24 giờ trong đó nó chạy, nhận ghi, đẩy WAL đi — và
+    # không phục hồi được. Cửa sổ đó rơi đúng vào ngày đầu tiên của một app, tức là lúc
+    # người ta hay nhập dữ liệu khởi tạo nhất.
+    #
+    # `backupOwnerReference: self` để Backup object do lịch này sinh ra bị dọn theo khi
+    # ScheduledBackup bị xoá — dữ liệu trong kho object thì KHÔNG bị đụng tới (retention
+    # của barman lo việc đó), nên xoá app không xoá mất bản backup còn trong hạn lưu.
+    - apiVersion: postgresql.cnpg.io/v1
+      kind: ScheduledBackup
+      metadata:
+        name: {{ .State.cluster }}-backup
+        {{ if ne .Namespace "" }}
+        namespace: {{ .Namespace }}
+        {{ end }}
+        annotations:
+          k8s.score.dev/source-workload: {{ .SourceWorkload }}
+          k8s.score.dev/resource-uid: {{ .Uid }}
+          k8s.score.dev/resource-guid: {{ .Guid }}
+        labels:
+          app.kubernetes.io/name: {{ .State.cluster }}
+          app.kubernetes.io/part-of: idp-platform
+      spec:
+        # Cron của CNPG có SÁU trường (giây đứng đầu), không phải năm như cron Unix. Nháy
+        # kép là bắt buộc — "0 0 2 * * *" không nháy là YAML hợp lệ nhưng ra một chuỗi
+        # khác, và bài học quantity ở khối resources trên kia là cùng một loại lỗi.
+        schedule: "%%computed.database.backup.schedule%%"
+        immediate: true
+        backupOwnerReference: self
+        cluster:
+          name: {{ .State.cluster }}
+    {{ end }}
   expected_outputs:
     - host
     - port

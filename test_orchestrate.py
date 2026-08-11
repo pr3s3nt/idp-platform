@@ -3422,6 +3422,110 @@ def test_resource_quantities_render_as_strings_not_numbers(tmp_path, monkeypatch
         assert isinstance(cluster["spec"]["storage"]["size"], str)
 
 
+@needs_score_k8s
+def test_an_object_store_also_gets_a_base_backup_schedule(tmp_path, monkeypatch,
+                                                          postgres_enabled):
+    """Lỗi thật thứ mười ba, đo trên cụm sống.
+
+    `barmanObjectStore` MỘT MÌNH chỉ bật WAL archiving. CNPG không tự chụp lấy một base
+    backup nào, và WAL không có base thì phục hồi được ĐÚNG KHÔNG GÌ CẢ. Đo được:
+    Cluster `Ready`, condition `ContinuousArchiving=True` kèm thông điệp "Continuous
+    archiving is working", WAL nằm thật trong bucket MinIO — mà một Cluster dựng bằng
+    `bootstrap.recovery` từ chính kho đó chết ngay với `no target backup found`.
+
+    Tức là guard `object_store_url` của Phase 4 đang bảo vệ một thứ không tồn tại."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["backup"].update(
+        {"object_store_url": "s3://idp-backup/",
+         "endpoint_url": "http://minio.object-store.svc.cluster.local:9000",
+         "credentials_secret": "backup-object-store"})
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    docs = render_env(tmp_path, app_dir, "staging", "w")
+    cluster = next(d for d in docs if d["kind"] == "Cluster")
+    sched = next((d for d in docs if d["kind"] == "ScheduledBackup"), None)
+    assert sched, "có kho object nhưng không có ScheduledBackup — WAL sẽ không phục hồi được"
+    assert sched["spec"]["cluster"]["name"] == cluster["metadata"]["name"]
+    # `immediate` là phần quan trọng nhất: không có nó, mọi database mới sinh ra đều có
+    # một cửa sổ dài tới một chu kỳ cron trong đó nó chạy, nhận ghi và KHÔNG phục hồi
+    # được — đúng vào ngày người ta hay nhập dữ liệu khởi tạo nhất.
+    assert sched["spec"]["immediate"] is True
+    # Cron của CNPG có SÁU trường (giây đứng đầu). Năm trường kiểu Unix vẫn là YAML hợp lệ
+    # và vẫn được CNPG nhận, nhưng bị đọc lệch một bậc: "0 2 * * *" thành "mỗi giờ".
+    assert len(str(sched["spec"]["schedule"]).split()) == 6, sched["spec"]["schedule"]
+
+
+@needs_score_k8s
+def test_no_object_store_means_no_scheduled_backup_either(tmp_path, postgres_enabled):
+    """Đối xứng với khối `backup` của Cluster: không có kho thì không sinh ScheduledBackup
+    trỏ vào hư không."""
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    docs = render_env(tmp_path, app_dir, "staging", "w")
+    assert not [d for d in docs if d["kind"] == "ScheduledBackup"]
+
+
+def test_an_object_store_without_a_schedule_is_refused(tmp_path, monkeypatch,
+                                                       postgres_enabled):
+    """Trường hợp nguy hiểm nhất, vì nó trông giống hệt một cấu hình đầy đủ: kho object
+    có thật, WAL chảy thật, cụm báo `ContinuousArchiving=True` — và không phục hồi được
+    gì. Chặn ở render, vì phát hiện lúc cần phục hồi là quá muộn theo đúng nghĩa đen."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["backup"]["object_store_url"] = "s3://idp-backup/"
+    data["database"]["backup"]["schedule"] = ""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    scores = [(s, yaml.safe_load(s.path.read_text())) for s in orc.discover(app_dir)]
+    with pytest.raises(SystemExit, match="base backup"):
+        orc.check_database_classes(scores, "staging")
+
+
+def test_the_environment_profile_can_override_the_backup_schedule(monkeypatch):
+    """Prod thường phải chụp trong cửa sổ bảo trì do DBA chốt, staging thì lúc nào cũng
+    được — nên profile ghi đè được mặc định chung, giống retention."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["backup"]["schedule"] = "0 0 2 * * *"
+    data["database_profiles"]["prod"]["application"]["backup"]["schedule"] = "0 30 3 * * 0"
+    cfg = orc.EnvConfig(data)
+    assert cfg.for_env("staging")["computed.database.backup.schedule"] == "0 0 2 * * *"
+    assert cfg.for_env("prod")["computed.database.backup.schedule"] == "0 30 3 * * 0"
+
+
+def test_verify_waits_for_a_first_recoverability_point(monkeypatch):
+    """`Ready` và `ContinuousArchiving=True` đều KHÔNG nói gì về việc có phục hồi được
+    hay không — cả hai đều True trên một cụm mà `bootstrap.recovery` fail. Trường duy
+    nhất phân biệt là `firstRecoverabilityPoint`, nên `verify` khẳng định đúng trường đó.
+    """
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"database": {"backup": {"first_backup_timeout_seconds": 1}}}))
+    cluster = {"kind": "Cluster", "apiVersion": "postgresql.cnpg.io/v1",
+               "metadata": {"name": "pg-api"},
+               "spec": {"backup": {"barmanObjectStore": {"destinationPath": "s3://b/"}}}}
+    args = orc.argparse.Namespace(app="a", env="staging", kubeconfig=None)
+
+    status = {"conditions": [{"type": "Ready", "status": "True"}]}
+    monkeypatch.setattr(orc, "kubectl", lambda *a, **k: orc.subprocess.CompletedProcess(
+        [], 0, json.dumps({"status": status}), ""))
+    with pytest.raises(SystemExit, match="firstRecoverabilityPoint|base backup"):
+        orc.wait_for_recoverability([cluster], "ns", args)
+
+    status["firstRecoverabilityPoint"] = "2026-08-11T05:32:52Z"
+    orc.wait_for_recoverability([cluster], "ns", args)  # không còn raise
+
+
+def test_verify_does_not_wait_for_backups_that_were_never_configured(monkeypatch):
+    """Một Cluster staging không khai kho object thì không có gì để chờ; chờ nó là treo
+    trọn timeout một cách vô ích."""
+    called = []
+    monkeypatch.setattr(orc, "kubectl", lambda *a, **k: called.append(a))
+    args = orc.argparse.Namespace(app="a", env="staging", kubeconfig=None)
+    orc.wait_for_recoverability(
+        [{"kind": "Cluster", "metadata": {"name": "pg-api"}, "spec": {}}], "ns", args)
+    assert not called
+
+
 def test_every_postgres_provisioner_declares_its_class():
     """A provisioner without `class` matches EVERY class, and when several match, the one
     score-k8s happens to load last wins — an order that depends on temp filenames it

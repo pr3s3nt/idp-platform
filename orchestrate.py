@@ -116,7 +116,26 @@ DEFAULTS: dict = {
         "backup": {"object_store_url": "", "credentials_secret": "", "destination_path": "",
                    # Rỗng = AWS S3. Mọi kho S3-compatible khác (MinIO, Ceph, kho nội bộ)
                    # phải khai địa chỉ ở đây.
-                   "endpoint_url": ""},
+                   "endpoint_url": "",
+                   # LỊCH CHỤP BASE BACKUP. `barmanObjectStore` một mình CHỈ bật WAL
+                   # archiving — nó không chụp lấy một base backup nào, và WAL không có
+                   # base thì phục hồi được ĐÚNG KHÔNG GÌ CẢ. Đo được trên harness:
+                   # Cluster `Ready`, condition `ContinuousArchiving=True` với thông điệp
+                   # "Continuous archiving is working", WAL nằm thật trong bucket — mà
+                   # bootstrap.recovery chết ngay với `no target backup found`.
+                   #
+                   # Cron của CNPG có SÁU trường (giây đứng đầu), không phải năm như cron
+                   # Unix. Viết "0 2 * * *" kiểu Unix thì CNPG đọc thành "giây 0, phút 2,
+                   # mọi giờ" — tức là chụp base backup MỖI GIỜ, và không ai thấy gì cho
+                   # tới khi hoá đơn kho object về.
+                   #
+                   # Mặc định 02:00 hằng ngày. Đây là giá trị chính sách, không phải toạ
+                   # độ hạ tầng, nên có mặc định chạy được là đúng: quên khai thì được
+                   # backup hằng ngày, chứ không phải im lặng không có backup nào.
+                   "schedule": "0 0 2 * * *",
+                   # `verify` chờ base backup ĐẦU TIÊN xong bao lâu (firstRecoverability
+                   # Point xuất hiện). Chỉ áp dụng khi đã cấu hình kho object.
+                   "first_backup_timeout_seconds": 600},
         "ready_timeout_seconds": 600,
     },
     "onboarding": {
@@ -243,6 +262,14 @@ class EnvConfig:
         flat["computed.database.image"] = f"{repo}:{version}" if repo and version else ""
         storage_class = self.get("database.storage_class") or self.get("kubernetes.storage_class") or ""
         flat["computed.database.storage_class"] = storage_class
+        # Lịch base backup: profile của môi trường thắng, không có thì lấy mặc định chung.
+        # Hai mức là có lý do — prod thường phải chụp trong cửa sổ bảo trì do DBA chốt,
+        # còn staging chụp lúc nào cũng được; nhưng một install chỉ muốn MỘT lịch cho cả
+        # hai thì khai đúng một chỗ dưới `database.backup.schedule`.
+        flat["computed.database.backup.schedule"] = (
+            ((profile.get("backup") or {}).get("schedule")
+             or self.get("database.backup.schedule") or "")
+        )
         return flat
 
     def render(self, text: str, env: str, *, where: str, app: str | None = None) -> str:
@@ -827,6 +854,23 @@ def check_database_classes(scores: list[tuple], env: str) -> None:
             "database, but database.backup.object_store_url is empty in platform.env.yaml "
             "— the cluster would run with no backup at all. Configure the object store "
             "(and verify a restore) before rendering prod."
+        )
+
+    # Kho object ĐÃ khai mà lịch base backup rỗng là trường hợp nguy hiểm nhất trong cả
+    # khối này, vì nó trông giống hệt một cấu hình đầy đủ: `barmanObjectStore` được sinh
+    # ra, WAL chảy vào bucket thật, Cluster báo `ContinuousArchiving=True`. Nhưng WAL
+    # không có base backup thì phục hồi được ĐÚNG KHÔNG GÌ CẢ — đo trên harness:
+    # bootstrap.recovery chết ngay với `no target backup found`. Chặn ở render, vì phát
+    # hiện lúc cần phục hồi là quá muộn theo đúng nghĩa đen.
+    if application_users and (CONFIG.get("database.backup.object_store_url") or "") \
+            and not (CONFIG.for_env(env).get("computed.database.backup.schedule") or ""):
+        raise SystemExit(
+            f"workload(s) {[w for w, _ in application_users]} có kho object cấu hình sẵn "
+            "nhưng lịch base backup rỗng (database.backup.schedule, hoặc "
+            f"database_profiles.{env}.application.backup.schedule). Chỉ có "
+            "barmanObjectStore thì chỉ WAL được lưu, và WAL không có base backup thì "
+            "KHÔNG phục hồi được gì — cụm vẫn báo 'Continuous archiving is working'. "
+            "Khai lịch dạng cron SÁU trường của CNPG, ví dụ \"0 0 2 * * *\"."
         )
 
 
@@ -3315,6 +3359,7 @@ def wait_for_databases(docs: list[dict], ns: str, args) -> None:
                 f"reason={(ready or {}).get('reason', '?')}")
         if not pending:
             log(f"tất cả {len(targets)} Cluster postgres đã Ready")
+            wait_for_recoverability(targets, ns, args)
             return
         if time.time() >= deadline:
             break
@@ -3325,6 +3370,63 @@ def wait_for_databases(docs: list[dict], ns: str, args) -> None:
         f"{args.app}/{args.env}: cơ sở dữ liệu chưa Ready sau {timeout}s. Kiểm: Secret "
         "credential đã được VSO đồng bộ chưa (nó là nguồn user/password của initdb), "
         "PVC có bound không, và image postgres có kéo được từ registry không."
+    )
+
+
+def wait_for_recoverability(targets: list[dict], ns: str, args) -> None:
+    """Chờ base backup ĐẦU TIÊN, cho mọi Cluster có khai kho object.
+
+    Vì sao đây là một bước riêng chứ không gộp vào điều kiện `Ready`: `Ready` và
+    `ContinuousArchiving=True` đều KHÔNG nói gì về việc có phục hồi được hay không. Đo
+    được trên harness — một Cluster `Ready`, `ContinuousArchiving=True` với thông điệp
+    "Continuous archiving is working", WAL nằm thật trong bucket, mà `bootstrap.recovery`
+    chết ngay lập tức với `no target backup found`. Trường DUY NHẤT phân biệt hai trạng
+    thái đó là `status.firstRecoverabilityPoint`: nó chỉ xuất hiện sau khi CNPG chụp xong
+    một base backup.
+
+    Nên `verify` khẳng định đúng trường đó. Guard ở mục 8 của kế hoạch nói "database
+    production không phục hồi được thì không đáng gọi là chạy" — câu ấy chỉ có nghĩa khi
+    có một phép đo đứng sau nó.
+    """
+    # Chỉ những Cluster THẬT SỰ có backup trong manifest vừa render. Một cụm staging
+    # không khai kho object thì không có gì để chờ, và chờ nó là treo 10 phút vô ích.
+    want = [d for d in targets
+            if ((d.get("spec") or {}).get("backup") or {}).get("barmanObjectStore")]
+    if not want:
+        return
+    timeout = config_int("database.backup.first_backup_timeout_seconds", 600)
+    log(f"chờ base backup đầu tiên của {len(want)} Cluster trong {ns} (tối đa {timeout}s)")
+    deadline = time.time() + timeout
+    while True:
+        pending = []
+        for doc in want:
+            name = doc["metadata"]["name"]
+            cp = kubectl(["get", "cluster.postgresql.cnpg.io", name, "-n", ns, "-o", "json"],
+                         kubeconfig=args.kubeconfig, check=False, capture=True)
+            if cp.returncode != 0:
+                pending.append(f"{name}: Cluster không đọc được")
+                continue
+            status = (json.loads(cp.stdout or "{}").get("status") or {})
+            if status.get("firstRecoverabilityPoint"):
+                continue
+            pending.append(
+                f"{name}: chưa có firstRecoverabilityPoint — kho object mới chỉ nhận WAL, "
+                f"chưa có base backup nào (lastSuccessfulBackup="
+                f"{status.get('lastSuccessfulBackup') or 'chưa có'})")
+        if not pending:
+            for doc in want:
+                log(f"{doc['metadata']['name']}: phục hồi được")
+            return
+        if time.time() >= deadline:
+            break
+        time.sleep(10)
+    for line in pending:
+        print(f"::error::{line}", file=sys.stderr, flush=True)
+    raise SystemExit(
+        f"{args.app}/{args.env}: có kho object nhưng sau {timeout}s vẫn chưa có base "
+        "backup nào. Kiểm ScheduledBackup trong namespace (`kubectl get scheduledbackup`) "
+        "và log của pod backup. Một cụm ở trạng thái này VẪN báo Ready và VẪN đẩy WAL đi "
+        "— nhưng `bootstrap.recovery` sẽ fail với `no target backup found`."
     )
 
 
