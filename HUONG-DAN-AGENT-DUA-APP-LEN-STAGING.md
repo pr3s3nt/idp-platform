@@ -27,6 +27,72 @@ Coi là THÀNH CÔNG khi tất cả các mệnh đề sau đúng:
 
 ---
 
+## 0.5. NHẬT KÝ CÀI ĐẶT — ghi trong suốt quá trình, không phải viết lại lúc cuối
+
+Mở một file nhật ký **ngay bây giờ**, trước lệnh đầu tiên, và ghi vào đó **liên tục**:
+
+```bash
+export LOG=/tmp/nhat-ky-cai-dat-$APP.md
+{ echo "# Nhật ký cài đặt $APP"; echo; echo "- Bắt đầu: $(date -Is)"; echo "- Máy: $(hostname)";
+  echo "- Nhánh platform: $(git branch --show-current) @ $(git rev-parse --short HEAD)"; echo; } > "$LOG"
+```
+
+Sau **mỗi mục** của hướng dẫn này, nối thêm một khối theo đúng khuôn:
+
+```markdown
+## Mục <số> — <tên mục>
+- Thời điểm: 2026-08-11T12:34:56+07:00
+- Lệnh đã chạy:
+  ```
+  <lệnh nguyên văn>
+  ```
+- Mã thoát: 0
+- CỔNG KIỂM <n>: ĐẠT
+- Bằng chứng:
+  ```
+  <output thật, cắt gọn nhưng KHÔNG sửa>
+  ```
+```
+
+Ba luật của nhật ký:
+
+1. **Ghi ngay sau khi chạy, không ghi lại từ trí nhớ lúc cuối.** Nếu tiến trình chết giữa
+   chừng thì thứ còn lại phải đủ để người khác dựng lại được chuyện gì đã xảy ra.
+2. **Không bao giờ ghi giá trị bí mật vào nhật ký.** Ghi tên khoá, đường dẫn Vault, độ dài
+   — không ghi giá trị. Nhật ký này sẽ được đọc lại và có thể được chia sẻ.
+3. **Output lỗi phải ghi NGUYÊN VĂN, đầy đủ**, không tóm tắt thành "lỗi gì đó". Dòng lỗi
+   thật là toàn bộ giá trị của nhật ký.
+
+### DỪNG NGAY khi có lỗi — không đi tiếp, không tự chữa cháy
+
+Khi một lệnh thoát khác 0 hoặc một CỔNG KIỂM không đạt:
+
+1. Ghi vào nhật ký một khối `## ❌ DỪNG TẠI MỤC <số>` gồm: lệnh, mã thoát, **toàn bộ**
+   output lỗi, trạng thái hiện tại (`onboard-status`, `kubectl get pods`, `kubectl get
+   vaultstaticsecret`), và mã bẫy tương ứng ở mục 10 nếu tra được.
+2. **DỪNG.** Không chạy bước sau. Không thử một cách khác. Không xoá tài nguyên để "làm
+   sạch rồi làm lại".
+3. Chỉ được chạy lại **đúng lệnh cũ** sau khi đã sửa **nguyên nhân** đã ghi ở bước 1, và
+   phải ghi rõ trong nhật ký: đã sửa gì, vì sao tin là nguyên nhân đó.
+
+Vì sao nghiêm ngặt: mọi bước ở đây đều kiểm-trước-khi-tạo, nên **dừng lại là an toàn** —
+chạy lại sẽ tiếp tục từ đúng chỗ. Cái không an toàn là đi tiếp khi một cổng đã đỏ: lỗi thật
+bị chôn dưới ba lỗi kế tiếp, và tài nguyên nửa vời thì khó gỡ hơn nhiều so với một lần dừng
+sạch sẽ.
+
+### Khi kết thúc
+
+Nối vào cuối nhật ký:
+
+- Bảng **S1..S11**, mỗi dòng ĐẠT/KHÔNG kèm bằng chứng.
+- **Đã tạo những gì** (kho GitHub, namespace, đường dẫn Vault, GitRepo, ảnh trên registry).
+- **Đã dọn những gì**, hoặc ghi rõ cái gì được giữ lại và vì sao.
+- Thời gian tổng, và bước nào tốn thời gian nhất.
+
+Đường dẫn nhật ký phải được nêu trong báo cáo cuối.
+
+---
+
 ## 1. Điều kiện tiên quyết
 
 Chạy từ gốc kho `idp-platform`.

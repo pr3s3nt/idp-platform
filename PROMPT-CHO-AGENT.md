@@ -81,7 +81,7 @@ lại ở mục 8 và xác nhận nó `active`. Bỏ quên bước này là đ�
 
 ## Bản ĐIỀN SẴN cho máy này — copy nguyên khối, không phải sửa gì
 
-Chỉ đổi `<đặt-tên-app>` thành tên chưa dùng. Tên **đã bị chiếm**, đừng lấy lại:
+Đã điền sẵn tên app `dangky`. Muốn đổi thì chọn tên chưa dùng. Tên **đã bị chiếm**, đừng lấy lại:
 `sinhvien`, `demo`, `helloworld`, `tuxay`, `thunghiem`, `boutique`, `sample-nginx`,
 `sample-pg`, `sample-boutique`, `smoke-v2`, `shop-v2`, `orders`, `donhang`, `banggia`,
 `thuvien`, `notes-app`.
@@ -102,7 +102,7 @@ trên máy.
 Nó có 11 mục, mỗi mục một CỔNG KIỂM, và 11 tiêu chí thành công S1..S11.
 
 THÔNG SỐ:
-  Tên app        : <đặt-tên-app>
+  Tên app        : dangky
   Tổ chức GitHub : pr3s3nt
   Kho platform   : pr3s3nt/idp-platform
   Nhánh làm việc : feature/secret-onboarding   (KHÔNG đụng main)
@@ -141,10 +141,26 @@ QUY TẮC KHÔNG ĐƯỢC VI PHẠM:
 6. Bước nào tạo tài nguyên bên ngoài (kho GitHub, namespace, đường dẫn Vault) thì
    kiểm-trước-khi-tạo; retry tiếp tục từ bước lỗi, không tạo bản sao thứ hai.
 
-BÁO CÁO KHI XONG: bảng S1..S11, mỗi dòng ĐẠT/KHÔNG kèm bằng chứng thật (output lệnh, mã
-HTTP, tên pod). Không ghi "đạt" cho tiêu chí chưa thực sự chạy lệnh kiểm. Kèm URL hai kho
-đã tạo, cách truy cập app trên staging, và danh sách những gì đã tạo/đã dọn. Tiêu chí nào
-KHÔNG đạt thì nói thẳng và nói vì sao.
+NHẬT KÝ CÀI ĐẶT — đọc mục 0.5 của hướng dẫn và làm đúng như thế:
+  - Mở /tmp/nhat-ky-cai-dat-<tên-app>.md NGAY TRƯỚC lệnh đầu tiên.
+  - Sau MỖI mục, nối thêm: lệnh nguyên văn, mã thoát, kết quả CỔNG KIỂM, output làm bằng
+    chứng. Ghi ngay lúc chạy, không viết lại từ trí nhớ lúc cuối.
+  - Không ghi giá trị bí mật vào nhật ký. Output lỗi thì ghi NGUYÊN VĂN, đầy đủ.
+
+DỪNG NGAY KHI LỖI — đây là yêu cầu quan trọng nhất của lần chạy này:
+  Lệnh thoát khác 0, hoặc một CỔNG KIỂM không đạt, thì:
+    1. Ghi vào nhật ký khối "## ❌ DỪNG TẠI MỤC <số>" gồm lệnh, mã thoát, TOÀN BỘ output
+       lỗi, và trạng thái hiện tại (onboard-status, kubectl get pods, get vaultstaticsecret).
+    2. DỪNG LẠI. Không chạy bước sau. Không thử cách khác. Không xoá tài nguyên để làm lại
+       từ đầu. Không đoán.
+    3. Báo cáo cho tôi: dừng ở đâu, lỗi nguyên văn là gì, bẫy nào ở mục 10 khớp (nếu có).
+  Mọi bước đều kiểm-trước-khi-tạo nên DỪNG LÀ AN TOÀN — chạy lại sẽ tiếp tục đúng chỗ.
+  Đi tiếp khi một cổng đã đỏ mới là thứ làm hỏng: lỗi thật bị chôn dưới ba lỗi kế tiếp.
+
+BÁO CÁO KHI XONG: đường dẫn file nhật ký, rồi bảng S1..S11, mỗi dòng ĐẠT/KHÔNG kèm bằng
+chứng thật (output lệnh, mã HTTP, tên pod). Không ghi "đạt" cho tiêu chí chưa thực sự chạy
+lệnh kiểm. Kèm URL hai kho đã tạo, cách truy cập app trên staging, và danh sách những gì đã
+tạo/đã dọn. Tiêu chí nào KHÔNG đạt thì nói thẳng và nói vì sao.
 
 BẮT BUỘC CUỐI CÙNG: nếu mục 2.2 yêu cầu tắt workflow orchestrator thì phải bật lại ở mục 8
 và xác nhận nó `active`. Bỏ quên là để cụm ở trạng thái hỏng.
