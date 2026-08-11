@@ -2962,7 +2962,7 @@ def cmd_apply_secrets(args) -> None:
     ns = app_namespace(args.app, args.env)
     ensure_namespace(ns, args.kubeconfig)
 
-    if args.harbor_host:
+    if args.harbor_host and args.harbor_user and args.harbor_pass:
         _tolerate_exists(
             kubectl(
                 ["create", "secret", "docker-registry", pull_secret(), "-n", ns,
@@ -2973,8 +2973,27 @@ def cmd_apply_secrets(args) -> None:
             ),
             f"{pull_secret()} in {ns}",
         )
-    else:
+    elif not args.harbor_host:
         warn(f"no --harbor-host given: skipping {pull_secret()} in {ns}")
+    else:
+        # KHÔNG tạo một Secret rỗng. Thiếu user/pass mà vẫn `create secret docker-registry`
+        # thì Python nội suy `None` thành CHUỖI "None", và cụm nhận một credential trông
+        # như đã cấu hình đầy đủ — `kubectl get secret` thấy `registry-pull` tồn tại, kiểu
+        # đúng, dữ liệu có. Ảnh thì không kéo được, và thông báo lỗi là
+        # `403 Forbidden` từ registry, không một chữ nào nhắc tới biến môi trường còn
+        # thiếu. Cộng thêm việc đây là create-if-missing, cái Secret hỏng đó SỐNG MÃI cho
+        # tới khi có người xoá tay — đúng cái bẫy đã trả giá để biết.
+        #
+        # Nên: không tạo gì cả, và nói thẳng cái gì thiếu. Không có Secret thì kubelet báo
+        # `FailedToRetrieveImagePullSecret`, một thông báo TRUNG THỰC.
+        missing = [n for n, v in (("REGISTRY_USER", args.harbor_user),
+                                  ("REGISTRY_PASS", args.harbor_pass)) if not v]
+        warn(f"KHÔNG tạo {pull_secret()} trong {ns}: thiếu {', '.join(missing)}. "
+             f"Ảnh từ {args.harbor_host} sẽ không kéo được nếu registry là private — và "
+             "lỗi khi đó là 403 từ registry, không nhắc gì tới biến này. Đặt biến rồi "
+             f"chạy lại, hoặc tạo tay: kubectl -n {ns} create secret docker-registry "
+             f"{pull_secret()} --docker-server={args.harbor_host} "
+             "--docker-username=<user> --docker-password=<token>")
 
     secrets = Path(args.secrets)
     if not secrets.is_file() or not secrets.stat().st_size:

@@ -3813,6 +3813,43 @@ def test_offboard_without_vault_credentials_says_the_secrets_remain(monkeypatch,
     assert "VẪN CÒN" in capsys.readouterr().err
 
 
+def _apply_secrets_args(tmp_path, **over):
+    base = dict(app="banggia", env="staging", secrets=str(tmp_path / "none.yaml"),
+                harbor_host="ghcr.io", harbor_user=None, harbor_pass=None, kubeconfig=None)
+    base.update(over)
+    return orc.argparse.Namespace(**base)
+
+
+def test_a_registry_secret_is_never_created_with_missing_credentials(tmp_path, monkeypatch,
+                                                                     capsys):
+    """Lỗi thật thứ mười sáu, đo trên cụm.
+
+    Thiếu REGISTRY_USER/REGISTRY_PASS mà vẫn `create secret docker-registry` thì Python
+    nội suy `None` thành CHUỖI "None". Cụm nhận một credential TRÔNG NHƯ đã cấu hình đầy
+    đủ: `kubectl get secret` thấy registry-pull, đúng kiểu dockerconfigjson, có dữ liệu.
+    Ảnh thì không kéo được, và lỗi là `403 Forbidden` từ registry — không một chữ nào
+    nhắc tới biến môi trường còn thiếu. Và vì đây là create-if-missing, cái Secret hỏng đó
+    sống mãi cho tới khi có người xoá tay."""
+    calls = []
+    monkeypatch.setattr(orc, "kubectl", lambda argv, **k: calls.append(argv) or
+                        orc.subprocess.CompletedProcess([], 0, "namespace/x", ""))
+    orc.cmd_apply_secrets(_apply_secrets_args(tmp_path))
+    created = [c for c in calls if c[:3] == ["create", "secret", "docker-registry"]]
+    assert not created, "đã tạo pull secret với credential rỗng"
+    err = capsys.readouterr().err
+    assert "REGISTRY_USER" in err and "REGISTRY_PASS" in err
+
+
+def test_a_registry_secret_is_created_when_credentials_are_present(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(orc, "kubectl", lambda argv, **k: calls.append(argv) or
+                        orc.subprocess.CompletedProcess([], 0, "namespace/x", ""))
+    orc.cmd_apply_secrets(_apply_secrets_args(tmp_path, harbor_user="u", harbor_pass="p"))
+    created = [c for c in calls if c[:3] == ["create", "secret", "docker-registry"]]
+    assert len(created) == 1, calls
+    assert "--docker-username=u" in created[0]
+
+
 def test_every_postgres_provisioner_declares_its_class():
     """A provisioner without `class` matches EVERY class, and when several match, the one
     score-k8s happens to load last wins — an order that depends on temp filenames it
