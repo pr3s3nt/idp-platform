@@ -3849,6 +3849,128 @@ def cmd_secret_set(args) -> None:
     log(f"wrote {args.key} to {mount}/{path} — the value was not printed or stored locally")
 
 
+def _consumers_of_secret(ns: str, secret: str, kubeconfig) -> list[str]:
+    """Deployment nào đang lấy biến môi trường từ Secret này."""
+    cp = kubectl(["get", "deploy", "-n", ns, "-o", "json"],
+                 kubeconfig=kubeconfig, check=False, capture=True)
+    if cp.returncode != 0:
+        return []
+    out = []
+    for dep in (json.loads(cp.stdout or "{}").get("items") or []):
+        spec = ((dep.get("spec") or {}).get("template") or {}).get("spec") or {}
+        refs = json.dumps(spec.get("containers") or [])
+        if f'"{secret}"' in refs:
+            out.append(dep["metadata"]["name"])
+    return sorted(out)
+
+
+def cmd_rotate_db_credential(args) -> None:
+    """Xoay vòng mật khẩu database THEO ĐÚNG THỨ TỰ, và kiểm từng bước.
+
+    Vì sao phải là một lệnh chứ không phải "ghi vào Vault rồi để hệ tự lo": ba thành phần
+    phải đổi theo đúng thứ tự, và không cái nào tự kích hoạt cái kế tiếp.
+
+      1. Vault  — nguồn sự thật.
+      2. Secret — VSO đồng bộ xuống, trong vòng `refreshAfter`.
+      3. ROLE trong PostgreSQL — CNPG chỉ đọc lại `passwordSecret` khi đối tượng CLUSTER
+         được reconcile. Một Secret đổi KHÔNG kích hoạt việc đó. Đo trên harness: sau 8
+         phút, `status.managedRolesStatus.passwordStatus.<role>.resourceVersion` vẫn đứng
+         ở bản cũ, mật khẩu trong Secret KHÔNG đăng nhập được, còn pod vẫn chạy bằng mật
+         khẩu cũ. Chạm vào Cluster một cái thì role đổi trong dưới 20 giây.
+      4. POD  — biến môi trường chỉ đọc lúc container khởi động, nên pod đang chạy vẫn
+         giữ mật khẩu cũ cho tới khi được restart.
+
+    Làm sai thứ tự là tự tạo sự cố: restart pod TRƯỚC khi role đổi thì pod nhận mật khẩu
+    mới trong khi database vẫn dùng mật khẩu cũ, và app chết cho tới lần reconcile sau.
+
+    Lệnh này KHÔNG đọc giá trị bí mật ở bất kỳ bước nào — nó theo dõi `resourceVersion`
+    của Secret, đúng thứ mà CNPG cũng ghi lại. Bí mật vẫn chỉ đi từ Vault tới VSO.
+
+    Cửa sổ gián đoạn còn lại là có thật và không tránh được với một credential duy nhất:
+    từ lúc role đổi (bước 3) tới lúc pod cuối cùng lên lại (bước 4), pod cũ dùng mật khẩu
+    cũ sẽ bị từ chối. Nó dài bằng một lần rollout. Muốn bằng không thì phải hai credential
+    song song, và đó là một thay đổi contract, không phải một cờ.
+    """
+    ns = app_namespace(args.app, args.env)
+    cp = kubectl(["get", "cluster.postgresql.cnpg.io", "-n", ns, "-o", "json"],
+                 kubeconfig=args.kubeconfig, check=False, capture=True)
+    if cp.returncode != 0:
+        raise SystemExit(f"không đọc được Cluster nào trong {ns}: {(cp.stderr or '').strip()}")
+    targets = []
+    for obj in (json.loads(cp.stdout or "{}").get("items") or []):
+        for role in (((obj.get("spec") or {}).get("managed") or {}).get("roles") or []):
+            secret = (role.get("passwordSecret") or {}).get("name")
+            if secret:
+                targets.append((obj["metadata"]["name"], role["name"], secret))
+    if not targets:
+        raise SystemExit(
+            f"{ns}: không có Cluster nào khai `managed.roles[].passwordSecret`. Cụm này "
+            "được render bằng catalog cũ — render lại rồi apply trước khi xoay vòng, nếu "
+            "không thì mật khẩu mới sẽ nằm trong Secret mà database không bao giờ nhận."
+        )
+
+    for cluster, role, secret in targets:
+        log(f"xoay vòng {ns}/{cluster} role={role} secret={secret}")
+
+        def rv() -> str:
+            got = kubectl(["get", "secret", secret, "-n", ns, "-o",
+                           "jsonpath={.metadata.resourceVersion}"],
+                          kubeconfig=args.kubeconfig, check=False, capture=True)
+            return (got.stdout or "").strip()
+
+        before = rv()
+
+        # 1. Vault. Dùng lại đúng đường ghi của `secret-set`, nên đường dẫn không thể lệch.
+        cmd_secret_set(argparse.Namespace(
+            app=args.app, env=args.env, name=CONFIG.get("database.credential_secret") or "database",
+            key="password", generate=True, stdin=False, replace=False))
+
+        # 2. VSO. Chờ Secret thật sự đổi — không đoán theo refreshAfter.
+        deadline = time.time() + config_int("vault.sync_timeout_seconds", 300)
+        while rv() == before:
+            if time.time() >= deadline:
+                raise SystemExit(
+                    f"{secret}: VSO chưa đồng bộ giá trị mới sau khi ghi vào Vault. Kiểm "
+                    f"`kubectl -n {ns} get vaultstaticsecret` — điều kiện SecretSynced.")
+            time.sleep(5)
+        after = rv()
+        log(f"VSO đã đồng bộ {secret} (resourceVersion {before} -> {after})")
+
+        # 3. CNPG. Chạm vào Cluster để ép reconcile, rồi CHỜ nó xác nhận đã đọc đúng bản
+        #    đó — `passwordStatus.resourceVersion` là lời khai của chính operator.
+        kubectl(["annotate", "cluster.postgresql.cnpg.io", cluster, "-n", ns,
+                 f"idp.platform/credential-rotated-at={int(time.time())}", "--overwrite"],
+                kubeconfig=args.kubeconfig, check=False, capture=True)
+        deadline = time.time() + config_int("database.ready_timeout_seconds", 600)
+        while True:
+            got = kubectl(["get", "cluster.postgresql.cnpg.io", cluster, "-n", ns, "-o",
+                           "jsonpath={.status.managedRolesStatus.passwordStatus."
+                           f"{role}.resourceVersion}}"],
+                          kubeconfig=args.kubeconfig, check=False, capture=True)
+            if (got.stdout or "").strip() == after:
+                break
+            if time.time() >= deadline:
+                raise SystemExit(
+                    f"{cluster}: CNPG chưa áp mật khẩu mới cho role {role}. Ở trạng thái "
+                    "này Secret chứa mật khẩu mà database TỪ CHỐI; pod cũ vẫn chạy được "
+                    "bằng mật khẩu cũ, nên không có gì đỏ. Kiểm log của operator.")
+            time.sleep(5)
+        log(f"CNPG đã áp mật khẩu mới cho role {role}")
+
+        # 4. Pod. Đúng một lần restart cho mỗi workload đang dùng Secret này.
+        consumers = _consumers_of_secret(ns, secret, args.kubeconfig)
+        if not consumers:
+            warn(f"không thấy Deployment nào dùng {secret} — bỏ qua bước restart")
+        for dep in consumers:
+            kubectl(["rollout", "restart", f"deploy/{dep}", "-n", ns],
+                    kubeconfig=args.kubeconfig, check=True, capture=True)
+            log(f"restart deploy/{dep}")
+        for dep in consumers:
+            kubectl(["rollout", "status", f"deploy/{dep}", "-n", ns, "--timeout=300s"],
+                    kubeconfig=args.kubeconfig, check=True, capture=True)
+        log(f"{ns}/{cluster}: xoay vòng xong, {len(consumers)} workload đã chạy lại")
+
+
 # --------------------------------------------------------------------------------------
 # stack commands
 # --------------------------------------------------------------------------------------
@@ -5723,6 +5845,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--replace", action="store_true",
                    help="ghi đè toàn bộ secret (mặc định chỉ vá đúng khoá này)")
     p.set_defaults(func=cmd_secret_set)
+
+    p = sub.add_parser("rotate-db-credential",
+                       help="xoay vòng mật khẩu database theo đúng thứ tự Vault -> VSO -> "
+                            "CNPG -> pod, kiểm từng bước")
+    p.add_argument("--app", required=True)
+    p.add_argument("--env", required=True, choices=("staging", "prod"))
+    p.add_argument("--kubeconfig")
+    p.set_defaults(func=cmd_rotate_db_credential)
 
     p = sub.add_parser("verify-rbac",
                        help="in danh tính chỉ-đọc dùng để verify (không có quyền đọc Secret)")

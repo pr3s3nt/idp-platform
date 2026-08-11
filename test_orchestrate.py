@@ -3616,6 +3616,77 @@ def test_verify_does_not_wait_for_backups_that_were_never_configured(monkeypatch
     assert not called
 
 
+def test_rotation_refuses_a_cluster_rendered_before_managed_roles(monkeypatch):
+    """Một Cluster dựng bằng catalog cũ không có `managed.roles`, nên CNPG sẽ không bao
+    giờ đổi mật khẩu role. Ghi mật khẩu mới vào Vault lúc đó chỉ tạo ra một Secret mà
+    database từ chối — im lặng, vì pod cũ vẫn chạy. Nên lệnh DỪNG trước khi ghi gì."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+    monkeypatch.setattr(orc, "kubectl", lambda *a, **k: orc.subprocess.CompletedProcess(
+        [], 0, json.dumps({"items": [{"metadata": {"name": "pg-api"}, "spec": {}}]}), ""))
+    written = []
+    monkeypatch.setattr(orc, "cmd_secret_set", lambda a: written.append(a))
+    args = orc.argparse.Namespace(app="a", env="staging", kubeconfig=None)
+    with pytest.raises(SystemExit, match="managed.roles"):
+        orc.cmd_rotate_db_credential(args)
+    assert not written, "đã ghi vào Vault dù biết database sẽ không nhận"
+
+
+def test_rotation_runs_vault_then_vso_then_cnpg_then_pods(monkeypatch):
+    """Thứ tự là toàn bộ giá trị của lệnh này. Restart pod TRƯỚC khi role đổi thì pod
+    nhận mật khẩu mới trong khi database vẫn dùng mật khẩu cũ — tự tạo sự cố."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+    monkeypatch.setattr(orc, "time", type("T", (), {
+        "time": staticmethod(lambda: 0.0), "sleep": staticmethod(lambda s: None)})())
+    steps: list[str] = []
+    state = {"rv": "1"}
+
+    def fake_kubectl(argv, **kwargs):
+        joined = " ".join(argv)
+        if argv[:2] == ["get", "cluster.postgresql.cnpg.io"] and "-o" in argv and "json" in argv:
+            return orc.subprocess.CompletedProcess([], 0, json.dumps({"items": [{
+                "metadata": {"name": "pg-api"},
+                "spec": {"managed": {"roles": [
+                    {"name": "app_api", "passwordSecret": {"name": "cred"}}]}}}]}), "")
+        if argv[0] == "get" and argv[1] == "secret":
+            return orc.subprocess.CompletedProcess([], 0, state["rv"], "")
+        if argv[0] == "annotate":
+            steps.append("cnpg-nudge")
+            return orc.subprocess.CompletedProcess([], 0, "", "")
+        if argv[:2] == ["get", "cluster.postgresql.cnpg.io"]:
+            return orc.subprocess.CompletedProcess([], 0, state["rv"], "")
+        if argv[:2] == ["get", "deploy"]:
+            return orc.subprocess.CompletedProcess([], 0, json.dumps({"items": [{
+                "metadata": {"name": "api"},
+                "spec": {"template": {"spec": {"containers": [
+                    {"env": [{"valueFrom": {"secretKeyRef": {"name": "cred"}}}]}]}}}}]}), "")
+        if argv[0] == "rollout" and argv[1] == "restart":
+            steps.append("restart")
+        return orc.subprocess.CompletedProcess([], 0, "", "")
+
+    def fake_secret_set(a):
+        steps.append("vault-write")
+        state["rv"] = "2"          # VSO đồng bộ ngay sau đó
+
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    monkeypatch.setattr(orc, "cmd_secret_set", fake_secret_set)
+    orc.cmd_rotate_db_credential(
+        orc.argparse.Namespace(app="a", env="staging", kubeconfig=None))
+    assert steps == ["vault-write", "cnpg-nudge", "restart"], steps
+
+
+def test_rotation_only_restarts_workloads_that_use_the_credential(monkeypatch):
+    """App hai workload: chỉ workload nào thật sự đọc Secret database mới bị restart.
+    Đo trên cụm: `api` restart đúng một lần, `worker` giữ nguyên generation."""
+    ns_deploys = {"items": [
+        {"metadata": {"name": "api"}, "spec": {"template": {"spec": {"containers": [
+            {"env": [{"valueFrom": {"secretKeyRef": {"name": "cred"}}}]}]}}}},
+        {"metadata": {"name": "worker"}, "spec": {"template": {"spec": {"containers": [
+            {"env": [{"valueFrom": {"secretKeyRef": {"name": "stripe"}}}]}]}}}}]}
+    monkeypatch.setattr(orc, "kubectl", lambda *a, **k: orc.subprocess.CompletedProcess(
+        [], 0, json.dumps(ns_deploys), ""))
+    assert orc._consumers_of_secret("ns", "cred", None) == ["api"]
+
+
 def test_every_postgres_provisioner_declares_its_class():
     """A provisioner without `class` matches EVERY class, and when several match, the one
     score-k8s happens to load last wins — an order that depends on temp filenames it
