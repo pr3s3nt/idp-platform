@@ -3687,6 +3687,132 @@ def test_rotation_only_restarts_workloads_that_use_the_credential(monkeypatch):
     assert orc._consumers_of_secret("ns", "cred", None) == ["api"]
 
 
+# ----------------------------------------------------------------- offboard (mục 13.4)
+def _offboard_cluster(monkeypatch, *, ns_labels=(), gitrepos=(), ns_exists=True):
+    """Giả lập cụm cho offboard, và GHI LẠI mọi lệnh đã gọi để test khẳng định được
+    'bản xem trước không xoá gì' bằng bằng chứng, không bằng niềm tin."""
+    calls: list[list[str]] = []
+
+    def fake_kubectl(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == "get" and argv[1] == "namespace":
+            return orc.subprocess.CompletedProcess(
+                [], 0 if ns_exists else 1, json.dumps({"metadata": {}}), "")
+        if argv[0] == "get" and "," in argv[1]:
+            return orc.subprocess.CompletedProcess([], 0, json.dumps({"items": [
+                {"metadata": {"labels": {"idp.platform/application": a}}} for a in ns_labels]}), "")
+        if argv[0] == "get" and argv[1] == "gitrepo":
+            return orc.subprocess.CompletedProcess(
+                [], 0, json.dumps({"items": list(gitrepos)}), "")
+        return orc.subprocess.CompletedProcess([], 0, "{}", "")
+
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    return calls
+
+
+def test_offboard_preview_deletes_nothing(tmp_path, monkeypatch):
+    """Mặc định là XEM TRƯỚC. Một lệnh xoá mà phải chạy mới biết nó làm gì là một lệnh
+    không ai dám chạy ở prod — nên rốt cuộc người ta xoá tay, và xoá tay mới xoá nhầm."""
+    calls = _offboard_cluster(monkeypatch)
+    orc.cmd_offboard(orc.argparse.Namespace(
+        app="donvi", env="staging", execute=False, confirm="", approved_by="",
+        purge_secrets=False, state_file=str(tmp_path / "s.json"), kubeconfig=None))
+    assert not [c for c in calls if c[0] == "delete"], calls
+
+
+def test_offboard_refuses_a_namespace_holding_another_teams_resources(tmp_path, monkeypatch):
+    """Bằng chứng, không phải tên. `{app}-{env}` là một quy ước; nhãn
+    `idp.platform/application` là lời khai của chính tài nguyên đó."""
+    calls = _offboard_cluster(monkeypatch, ns_labels=["doi-thanh-toan"])
+    with pytest.raises(SystemExit, match="application khác"):
+        orc.cmd_offboard(orc.argparse.Namespace(
+            app="donvi", env="staging", execute=True, confirm="donvi", approved_by="",
+            purge_secrets=False, state_file=str(tmp_path / "s.json"), kubeconfig=None))
+    assert not [c for c in calls if c[0] == "delete"]
+
+
+def test_offboard_requires_the_app_name_typed_back(tmp_path, monkeypatch):
+    _offboard_cluster(monkeypatch)
+    with pytest.raises(SystemExit, match="--confirm"):
+        orc.cmd_offboard(orc.argparse.Namespace(
+            app="donvi", env="staging", execute=True, confirm="donv", approved_by="",
+            purge_secrets=False, state_file=str(tmp_path / "s.json"), kubeconfig=None))
+
+
+def test_offboard_in_prod_requires_a_named_approver(tmp_path, monkeypatch):
+    """Ai duyệt được ghi vào bản ghi state — sau này còn tra được."""
+    _offboard_cluster(monkeypatch)
+    with pytest.raises(SystemExit, match="approved-by"):
+        orc.cmd_offboard(orc.argparse.Namespace(
+            app="donvi", env="prod", execute=True, confirm="donvi", approved_by="",
+            purge_secrets=False, state_file=str(tmp_path / "s.json"), kubeconfig=None))
+
+
+def test_offboard_matches_gitrepo_by_url_not_by_name(monkeypatch):
+    """Bài học Phase 6: liệt-kê-rồi-khớp. Đoán tên là cách nhanh nhất để xoá GitRepo của
+    một đội khác đặt tên trùng quy ước."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"git": {"org": "acme", "config_repo_pattern": "idp-{app}-config"}}))
+    _offboard_cluster(monkeypatch, gitrepos=[
+        {"metadata": {"name": "donvi"},
+         "spec": {"repo": "https://github.com/acme/idp-donvi-config", "paths": ["staging"]}},
+        {"metadata": {"name": "donvi-staging"},          # tên KHỚP quy ước…
+         "spec": {"repo": "https://github.com/khac/kho-khac", "paths": ["staging"]}},
+    ])
+    remove, _ = orc.offboard_targets("donvi", "staging", None)
+    names = [t["name"] for t in remove if t["kind"] == "GitRepo"]
+    assert names == ["fleet-local/donvi"], names
+
+
+def test_offboard_keeps_the_database_backup_and_the_git_history(monkeypatch):
+    """Xoá app không được xoá đường phục hồi. Đo trên cụm: sau khi offboard chạy thật,
+    mọi thư mục backup trong kho object còn nguyên."""
+    _offboard_cluster(monkeypatch)
+    _, keep = orc.offboard_targets("donvi", "staging", None)
+    kinds = {t["kind"] for t in keep}
+    assert {"DatabaseBackup", "GitRepository", "VaultPolicy"} <= kinds, kinds
+
+
+def test_offboard_soft_deletes_vault_secrets_by_default(monkeypatch):
+    """kv-v2 phân biệt `data` (xoá mềm, phục hồi được) với `metadata` (xoá hẳn). Xoá nhầm
+    một app rồi phát hiện sau vài giờ là chuyện có thật, và bí mật là thứ khó dựng lại
+    nhất — mọi thứ khác render lại được từ Git."""
+    monkeypatch.setenv("VAULT_ADDR", "http://vault.test")
+    monkeypatch.setenv("VAULT_TOKEN", "t")
+    seen: list[tuple[str, str]] = []
+
+    class Fake:
+        def __init__(self, body): self.body = body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self.body
+
+    def fake_urlopen(request, timeout=None):
+        seen.append((request.get_method(), request.full_url))
+        if request.get_method() == "LIST":
+            return Fake(json.dumps({"data": {"keys": ["database", "stripe"]}}).encode())
+        return Fake(b"{}")
+
+    monkeypatch.setattr(orc.urllib.request, "urlopen", fake_urlopen)
+    orc._offboard_vault("donvi", "staging", purge=False)
+    deletes = [u for m, u in seen if m == "DELETE"]
+    assert all("/kv/data/" in u for u in deletes), deletes
+
+    seen.clear()
+    orc._offboard_vault("donvi", "staging", purge=True)
+    deletes = [u for m, u in seen if m == "DELETE"]
+    assert all("/kv/metadata/" in u for u in deletes), deletes
+
+
+def test_offboard_without_vault_credentials_says_the_secrets_remain(monkeypatch, capsys):
+    """Im lặng bỏ qua phần Vault sẽ để lại bí mật của một app đã bị xoá, và người chạy
+    tưởng đã xong."""
+    monkeypatch.delenv("VAULT_ADDR", raising=False)
+    monkeypatch.delenv("VAULT_TOKEN", raising=False)
+    orc._offboard_vault("donvi", "staging", purge=False)
+    assert "VẪN CÒN" in capsys.readouterr().err
+
+
 def test_every_postgres_provisioner_declares_its_class():
     """A provisioner without `class` matches EVERY class, and when several match, the one
     score-k8s happens to load last wins — an order that depends on temp filenames it

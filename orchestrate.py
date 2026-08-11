@@ -428,6 +428,16 @@ def vault_path(app: str, env: str, name: str) -> str:
     return f"{mount}/{path}"
 
 
+def vault_prefix_for(app: str, env: str) -> str:
+    """Tiền tố (không có mount) chứa MỌI bí mật của một app/env.
+
+    Đúng ranh giới mà policy của app vẽ ra, nên nó cũng là ranh giới an toàn duy nhất cho
+    một thao tác xoá: rộng hơn một ký tự là chạm sang app khác.
+    """
+    leaf = vault_relative_path(app, env, "x")
+    return leaf[: -len("x")].rstrip("/")
+
+
 def vault_relative_path(app: str, env: str, name: str) -> str:
     """The same path WITHOUT the mount prefix.
 
@@ -4170,6 +4180,9 @@ ONBOARD_STATES = (
 )
 # Nhánh tuỳ chọn: không phải lỗi, nhưng cũng KHÔNG phải READY.
 ONBOARD_BRANCH_STATES = ("WAITING_FOR_USER_SECRETS", "PARTIALLY_READY", "FAILED_RETRYABLE")
+# Vòng đời XOÁ (mục 13.4). Cố ý tách khỏi ONBOARD_STATES: xoá không phải "bước tiếp theo"
+# của onboarding, nó là một workflow riêng có preview và có người duyệt.
+ONBOARD_DELETE_STATES = ("DELETE_PLANNED", "PENDING_DELETE_APPROVAL", "DELETING", "DELETED")
 
 
 class OnboardingPaused(Exception):
@@ -5591,6 +5604,226 @@ def cmd_onboard_activate_prod(args) -> None:
     print(onboarding_summary(ctx.record))
 
 
+# --------------------------------------------------------------------------------------
+# offboard — xoá một app (mục 13.4)
+# --------------------------------------------------------------------------------------
+# Ba tính chất mà mục 13.4 đòi, và vì sao từng cái tồn tại:
+#
+#   PREVIEW    — mặc định lệnh này KHÔNG xoá gì. Nó in ra chính xác những gì sẽ bị xoá và
+#                những gì sẽ được GIỮ LẠI kèm lý do. Một lệnh xoá mà phải chạy mới biết nó
+#                làm gì là một lệnh không ai dám chạy ở prod, nên rốt cuộc người ta xoá tay
+#                — và xoá tay mới là thứ xoá nhầm.
+#   APPROVAL   — `--execute` đòi gõ lại đúng tên app; `prod` đòi thêm `--approved-by`, và
+#                tên đó được ghi vào bản ghi state để sau này còn tra được ai đã duyệt.
+#   LIFECYCLE  — không phải cái gì cũng xoá cùng lúc. Backup của database KHÔNG bị đụng
+#                tới (retention của kho object lo việc đó); bí mật trong Vault mặc định chỉ
+#                xoá mềm; kho Git thì không xoá bao giờ.
+#
+# Và tính chất thứ tư, thứ khiến ba cái trên đáng tin: KHÔNG XOÁ NHẦM CỦA ĐỘI KHÁC. Mọi
+# tài nguyên phải TỰ CHỨNG MINH nó thuộc app này trước khi bị chạm tới. Suy từ tên là
+# không đủ — `{app}-{env}` là một quy ước, không phải một bằng chứng.
+def offboard_targets(app: str, env: str, kubeconfig) -> tuple[list[dict], list[dict]]:
+    """Trả về (sẽ xoá, sẽ giữ). Không gọi lệnh xoá nào."""
+    remove: list[dict] = []
+    keep: list[dict] = []
+    ns = app_namespace(app, env)
+
+    cp = kubectl(["get", "namespace", ns, "-o", "json"],
+                 kubeconfig=kubeconfig, check=False, capture=True)
+    if cp.returncode == 0:
+        # BẰNG CHỨNG, KHÔNG PHẢI TÊN. Namespace do platform tạo không mang nhãn, nên tên
+        # đúng quy ước là tất cả những gì ta có ở mức namespace — và nó KHÔNG đủ. Nên ta
+        # hỏi thứ bên trong: nếu có bất kỳ tài nguyên nào tự khai thuộc một application
+        # KHÁC, thì đây là namespace dùng chung và ta không được xoá nó.
+        others = sorted(_foreign_applications(ns, app, kubeconfig))
+        if others:
+            keep.append({"kind": "Namespace", "name": ns,
+                         "why": f"có tài nguyên của application khác: {', '.join(others)}"})
+        else:
+            remove.append({"kind": "Namespace", "name": ns,
+                           "why": "chứa toàn bộ workload/Cluster/Secret của app này"})
+    else:
+        keep.append({"kind": "Namespace", "name": ns, "why": "không tồn tại"})
+
+    # GitRepo của Fleet: LIỆT-KÊ-RỒI-KHỚP theo `spec.repo`, không đoán theo tên. Đoán tên
+    # là cách nhanh nhất để xoá GitRepo của một đội đặt tên trùng quy ước.
+    fleet_ns = CONFIG.get("kubernetes.fleet_namespace", "fleet-local") or "fleet-local"
+    want = onboarding_config_repo_url(app)
+    cp = kubectl(["get", "gitrepo", "-n", fleet_ns, "-o", "json"],
+                 kubeconfig=kubeconfig, check=False, capture=True)
+    if cp.returncode == 0:
+        for obj in (json.loads(cp.stdout or "{}").get("items") or []):
+            spec, meta = obj.get("spec") or {}, obj.get("metadata") or {}
+            same = re.sub(r"\.git$", "", spec.get("repo", "")) == re.sub(r"\.git$", "", want)
+            entry = {"kind": "GitRepo", "name": f"{fleet_ns}/{meta.get('name')}",
+                     "why": f"trỏ vào {spec.get('repo')}"}
+            if same and env in (spec.get("paths") or [env]):
+                remove.append(entry)
+            elif same:
+                keep.append({**entry, "why": f"cùng kho nhưng paths={spec.get('paths')} "
+                                             f"— không phải môi trường {env}"})
+
+    # Bí mật trong Vault: đúng tiền tố apps/<app>/<env>/, tức đúng ranh giới mà policy của
+    # app đã vẽ ra. Không quét rộng hơn, vì rộng hơn là chạm sang app khác.
+    remove.append({"kind": "VaultPrefix",
+                   "name": f"{CONFIG.get('vault.kv_mount') or 'kv'}/"
+                           f"{vault_prefix_for(app, env)}",
+                   "why": "tiền tố bí mật của riêng app/env này"})
+
+    # Những thứ CỐ Ý không xoá.
+    keep.append({"kind": "DatabaseBackup", "name": CONFIG.get("database.backup.object_store_url") or "(chưa cấu hình)",
+                 "why": "xoá app không được xoá đường phục hồi; retention của kho object "
+                        "quyết định, không phải lệnh này"})
+    keep.append({"kind": "GitRepository", "name": want,
+                 "why": "kho Git giữ lịch sử triển khai; hãy archive, đừng xoá"})
+    keep.append({"kind": "VaultPolicy",
+                 "name": (CONFIG.get("vault.policy_template") or "idp-{application}-{environment}")
+                         .replace("{application}", app).replace("{environment}", env),
+                 "why": "policy/role Vault do Vault Ops sở hữu — gỡ bằng quy trình của họ"})
+    return remove, keep
+
+
+def _foreign_applications(ns: str, app: str, kubeconfig) -> set[str]:
+    """Nhãn `idp.platform/application` khác `app` xuất hiện trong namespace này."""
+    found: set[str] = set()
+    kinds = "deploy,statefulset,cronjob,job,service,configmap,secret,pvc"
+    cp = kubectl(["get", kinds, "-n", ns, "-o", "json"],
+                 kubeconfig=kubeconfig, check=False, capture=True)
+    if cp.returncode != 0:
+        return found
+    for obj in (json.loads(cp.stdout or "{}").get("items") or []):
+        owner = ((obj.get("metadata") or {}).get("labels") or {}).get("idp.platform/application")
+        if owner and owner != app:
+            found.add(owner)
+    return found
+
+
+def onboarding_config_repo_url(app: str) -> str:
+    org = CONFIG.get("git.org") or ""
+    pattern = CONFIG.get("git.config_repo_pattern") or "{app}-config"
+    return f"https://github.com/{org}/{pattern.replace('{app}', app)}"
+
+
+def cmd_offboard(args) -> None:
+    app, env = validate_secret_name(args.app), validate_environment(args.env)
+    remove, keep = offboard_targets(app, env, args.kubeconfig)
+
+    print(f"\n=== KẾ HOẠCH XOÁ {app}/{env} ===\n")
+    print("SẼ XOÁ:")
+    for t in remove:
+        print(f"  - {t['kind']:14} {t['name']}\n      vì: {t['why']}")
+    print("\nSẼ GIỮ:")
+    for t in keep:
+        print(f"  - {t['kind']:14} {t['name']}\n      vì: {t['why']}")
+    blocked = [t for t in keep if t["kind"] == "Namespace" and "application khác" in t["why"]]
+    print()
+
+    store = make_onboarding_store(app, args)
+    record = store.read()
+
+    if not args.execute:
+        print("Đây là BẢN XEM TRƯỚC — chưa có gì bị xoá.")
+        print(f"Chạy thật:  offboard --app {app} --env {env} --execute --confirm {app}"
+              + (" --approved-by <tên>" if env == "prod" else ""))
+        if record is not None:
+            record["state"] = "DELETE_PLANNED"
+            record.setdefault("history", []).append(
+                {"at": onboarding_now(), "state": "DELETE_PLANNED", "env": env})
+            store.write(record)
+        return
+
+    # ---- từ đây là hành động thật ----
+    if args.confirm != app:
+        raise SystemExit(
+            f"--confirm phải là đúng tên app ({app!r}), nhận được {args.confirm!r}. "
+            "Gõ lại tên là rào chắn cuối cùng trước một thao tác không hoàn tác được.")
+    if env == "prod" and not args.approved_by:
+        raise SystemExit(
+            "xoá ở prod đòi --approved-by <tên người duyệt>. Tên đó được ghi vào bản ghi "
+            "state, nên sau này còn tra được ai đã đồng ý.")
+    if blocked:
+        raise SystemExit(
+            f"namespace {app_namespace(app, env)} có tài nguyên của application khác "
+            f"({blocked[0]['why']}). Từ chối xoá: xoá app này sẽ kéo theo của đội khác.")
+
+    if record is not None:
+        record["state"] = "DELETING"
+        record.setdefault("deletion", {}).update(
+            {"env": env, "approvedBy": args.approved_by or "", "at": onboarding_now(),
+             "purgeSecrets": bool(args.purge_secrets)})
+        record.setdefault("history", []).append(
+            {"at": onboarding_now(), "state": "DELETING", "env": env})
+        store.write(record)
+
+    done = []
+    for t in remove:
+        if t["kind"] == "GitRepo":
+            ns_, name_ = t["name"].split("/", 1)
+            kubectl(["delete", "gitrepo", name_, "-n", ns_, "--ignore-not-found"],
+                    kubeconfig=args.kubeconfig, check=True, capture=True)
+        elif t["kind"] == "Namespace":
+            # Sau GitRepo, luôn luôn. Xoá namespace trước thì Fleet thấy bundle thiếu tài
+            # nguyên và dựng lại tất cả trong lúc ta đang xoá — hai bên đánh nhau, và
+            # Fleet thắng.
+            kubectl(["delete", "namespace", t["name"], "--ignore-not-found", "--wait=false"],
+                    kubeconfig=args.kubeconfig, check=True, capture=True)
+        elif t["kind"] == "VaultPrefix":
+            _offboard_vault(app, env, purge=args.purge_secrets)
+        done.append(f"{t['kind']}:{t['name']}")
+        log(f"đã xoá {t['kind']} {t['name']}")
+
+    if record is not None:
+        record["state"] = "DELETED"
+        record["deletion"]["removed"] = done
+        record.setdefault("history", []).append(
+            {"at": onboarding_now(), "state": "DELETED", "env": env})
+        store.write(record)
+    print(f"\n{app}/{env}: đã xoá {len(done)} nhóm tài nguyên. Kho Git và backup còn nguyên.")
+
+
+def _offboard_vault(app: str, env: str, *, purge: bool) -> None:
+    """Xoá bí mật của app/env. Mặc định XOÁ MỀM.
+
+    kv-v2 phân biệt `data` (xoá mềm, phục hồi được) với `metadata` (xoá hẳn, không lấy
+    lại được). Mặc định mềm là có chủ ý: xoá nhầm một app rồi phát hiện sau vài giờ là
+    chuyện có thật, và khi đó thứ khó dựng lại nhất chính là bí mật — mọi thứ khác đều
+    render lại được từ Git.
+    """
+    address = (os.environ.get("VAULT_ADDR") or "").rstrip("/")
+    token = os.environ.get("VAULT_TOKEN")
+    if not address or not token:
+        warn("bỏ qua phần Vault: chưa đặt VAULT_ADDR/VAULT_TOKEN. Bí mật của app VẪN CÒN.")
+        return
+    mount = CONFIG.get("vault.kv_mount") or "kv"
+    prefix = vault_prefix_for(app, env)
+    headers = {"X-Vault-Token": token}
+    if CONFIG.get("vault.namespace"):
+        headers["X-Vault-Namespace"] = CONFIG.get("vault.namespace")
+
+    def call(method: str, url: str):
+        try:
+            with urllib.request.urlopen(
+                    urllib.request.Request(url, headers=headers, method=method),
+                    timeout=30) as response:
+                return json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return {}
+            raise SystemExit(f"Vault từ chối {method} {url} ({exc.code})") from None
+        except urllib.error.URLError as exc:
+            raise SystemExit(f"không tới được Vault: {exc.reason}") from None
+
+    listed = call("LIST", f"{address}/v1/{mount}/metadata/{prefix}")
+    names = ((listed.get("data") or {}).get("keys") or [])
+    for name in names:
+        leaf = f"{prefix}/{name}".rstrip("/")
+        kind = "metadata" if purge else "data"
+        call("DELETE", f"{address}/v1/{mount}/{kind}/{leaf}")
+        log(f"{'xoá hẳn' if purge else 'xoá mềm'} {mount}/{leaf}")
+    if not names:
+        log(f"không có bí mật nào dưới {mount}/{prefix}")
+
+
 def cmd_config(args) -> None:
     """Expose platform.env.yaml to the workflow, so the YAML holds no infrastructure value.
 
@@ -5845,6 +6078,23 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--replace", action="store_true",
                    help="ghi đè toàn bộ secret (mặc định chỉ vá đúng khoá này)")
     p.set_defaults(func=cmd_secret_set)
+
+    p = sub.add_parser("offboard",
+                       help="xoá một app: mặc định chỉ XEM TRƯỚC (mục 13.4)")
+    p.add_argument("--app", required=True)
+    p.add_argument("--env", required=True, choices=("staging", "prod"))
+    p.add_argument("--execute", action="store_true",
+                   help="thật sự xoá. Không có cờ này thì chỉ in kế hoạch.")
+    p.add_argument("--confirm", default="",
+                   help="gõ lại đúng tên app; bắt buộc khi có --execute")
+    p.add_argument("--approved-by", default="",
+                   help="ai duyệt việc xoá này; bắt buộc ở prod, ghi vào bản ghi state")
+    p.add_argument("--purge-secrets", action="store_true",
+                   help="xoá HẲN bí mật trong Vault thay vì xoá mềm (không lấy lại được)")
+    p.add_argument("--state-file",
+                   help="đọc/ghi bản ghi onboarding trong file thay vì ConfigMap")
+    p.add_argument("--kubeconfig")
+    p.set_defaults(func=cmd_offboard)
 
     p = sub.add_parser("rotate-db-credential",
                        help="xoay vòng mật khẩu database theo đúng thứ tự Vault -> VSO -> "
