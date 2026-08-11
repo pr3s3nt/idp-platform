@@ -4277,6 +4277,60 @@ def render_app_ci_workflow(text: str, *, app: str, image: str, registry: str,
 APP_CI_REL = ".github/workflows/ci.yaml"
 
 
+def ci_branch_warnings(catalog) -> list[str]:
+    """Những gì CI của app sẽ THẤY, kiểm ngay lúc sinh file. Trả về danh sách cảnh báo.
+
+    CI của app checkout platform ở NHÁNH MẶC ĐỊNH (`ref: main` trong mẫu), không phải ở
+    nhánh bạn đang đứng — cố ý, để CI và orchestrator luôn dùng cùng một bản renderer
+    (orchestrator cũng chỉ chạy được từ nhánh mặc định). Hệ quả ít ai nghĩ tới: onboard một
+    app **từ một nhánh chưa merge** sẽ giao cho đội ứng dụng một workflow gọi những thứ
+    nhánh mặc định chưa có.
+
+    Đo được trên GitHub, chính vì thiếu cảnh báo này: CI của app fixture đỏ ở bước đầu với
+    `unrecognized arguments: --with-build`, và thông báo đó không hề nhắc tới việc nhánh
+    chưa được merge. Lần thứ hai thì chạy được nhưng tính tag `content` trong khi
+    orchestrator tính `commit`, vì `platform.env.yaml` trên nhánh mặc định còn tắt cờ —
+    hai tag khác nhau cho một commit, và Fleet apply một ảnh chưa ai đẩy lên.
+
+    Đọc bằng `git show <nhánh>:<file>`, không gọi mạng: thứ CI nhận được chính là nội dung
+    đã commit trên nhánh đó.
+    """
+    catalog = Path(catalog)
+    branch = str(CONFIG.get("git.default_branch", "main") or "main")
+    out: list[str] = []
+
+    def committed(rel: str) -> str | None:
+        cp = run(["git", "show", f"{branch}:{rel}"], cwd=catalog, check=False, capture=True)
+        return cp.stdout if cp.returncode == 0 else None
+
+    renderer = committed("orchestrate.py")
+    if renderer is None:
+        return [f"không đọc được nhánh '{branch}' của catalog để kiểm xem CI của app sẽ "
+                f"chạy bằng bản orchestrate.py nào. Tự kiểm trước khi giao kho cho đội "
+                f"ứng dụng."]
+    if "--with-build" not in renderer:
+        out.append(
+            f"nhánh '{branch}' của kho platform CHƯA có `image-plan --with-build`, mà CI "
+            f"sinh ra thì gọi nó. Workflow này sẽ ĐỎ ngay ở bước đầu ('unrecognized "
+            f"arguments') cho tới khi nhánh phát triển được merge. Merge trước, rồi hãy "
+            f"onboard app mới.")
+
+    config_text = committed("platform.env.yaml")
+    if config_text is not None:
+        try:
+            shipped = EnvConfig(yaml.safe_load(config_text) or {})
+        except yaml.YAMLError:
+            shipped = None
+        if shipped is not None and not shipped.get("features.stack_onboarding", False) \
+                and feature("stack_onboarding"):
+            out.append(
+                f"`features.stack_onboarding` đang BẬT ở cấu hình bạn chạy nhưng TẮT trong "
+                f"platform.env.yaml trên nhánh '{branch}'. CI của app đọc file trên nhánh "
+                f"đó, nên nó sẽ tính tag `content` trong khi orchestrator tính `commit`: "
+                f"hai tag khác nhau cho một commit, và Fleet apply một ảnh chưa ai đẩy lên.")
+    return out
+
+
 def write_app_ci_workflow(app_dir, app: str, *, catalog=None, image: str = "",
                           force: bool = False) -> bool:
     """Sinh `.github/workflows/ci.yaml` cho kho ứng dụng. True nếu có ghi.
@@ -4300,6 +4354,8 @@ def write_app_ci_workflow(app_dir, app: str, *, catalog=None, image: str = "",
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(rendered)
     log(f"sinh {APP_CI_REL} ({len(services)} workload)")
+    for message in ci_branch_warnings(catalog):
+        warn(message)
     return True
 
 

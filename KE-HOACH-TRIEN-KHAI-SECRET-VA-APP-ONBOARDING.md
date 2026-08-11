@@ -48,7 +48,7 @@ Khi bắt đầu hoặc tiếp tục task:
 8. Cập nhật bảng trạng thái ở mục 0.5 và ghi ngắn gọn test/evidence.
 9. Commit riêng phase đã pass theo quy tắc ở mục 0.3.2, rồi tự chuyển sang phase kế tiếp.
 10. Khi context bị rút gọn hoặc task được tiếp tục ở phiên khác, mở lại file này, bảng trạng thái, branch hiện tại và `git diff` trước khi làm tiếp.
-11. Không push, tạo PR hoặc merge vào `main` cho đến khi đạt điều kiện ở mục 0.3.3 và được người dùng yêu cầu riêng. Không truy cập hoặc thay đổi môi trường công ty trong task này.
+11. **Được phép push `feature/secret-onboarding` lên `origin`** (người dùng cho phép ngày 2026-08-11). Không tạo PR hoặc merge vào `main` cho đến khi đạt điều kiện ở mục 0.3.3 và được người dùng yêu cầu riêng. Không truy cập hoặc thay đổi môi trường công ty trong task này.
 
 AI có thể dùng tác vụ/agent song song cho phần độc lập như Vault harness, stack fixtures hoặc review. Một agent chính phải sở hữu `orchestrate.py` và workflow chính để tránh hai implementation xung đột.
 
@@ -157,7 +157,9 @@ Sau đó AI dừng ở trạng thái `Ready for review` và cung cấp một tro
 1. Push branch và mở PR vào `main` nếu người dùng yêu cầu và remote cho phép.
 2. Đưa lệnh review/merge thủ công nếu không được phép push.
 
-Không merge vào `main` trước khi người dùng review và yêu cầu rõ ràng. Nếu `main` đã thay đổi trong thời gian phát triển, fetch/merge/rebase và xử lý conflict là một task riêng; không tự làm trong bước hoàn tất này.
+Push nhánh phát triển thì được, **merge vào `main` thì không** — trước khi người dùng review và yêu cầu rõ ràng.
+
+Vì sao khác nhau: push chỉ làm cho commit tồn tại ở một nơi thứ hai, và có ích thật — GitHub chỉ chạy `repository_dispatch` từ nhánh mặc định, còn app CI checkout platform ở `ref: main`, nên **cách duy nhất để thử một workflow bằng code của nhánh này là code đó phải có trên remote**. Merge thì đổi thứ đang chạy thật. Nếu `main` đã thay đổi trong thời gian phát triển, fetch/merge/rebase và xử lý conflict là một task riêng; không tự làm trong bước hoàn tất này.
 
 #### 0.3.4. Verification phải thực sự dùng code trên feature branch
 
@@ -188,6 +190,8 @@ Evidence phải ghi branch và SHA đã được test. Không được dùng k�
 Nếu dùng GitHub Actions để test, chỉ dùng `workflow_dispatch` và chọn rõ ref `feature/secret-onboarding`; job đầu tiên phải in/xác nhận `github.ref` và commit SHA. `repository_dispatch` vẫn được giữ nguyên để bảo vệ luồng đang chạy trên `main`.
 
 Không sửa tạm app templates từ `ref: main` sang feature branch rồi commit thay đổi đó. Nếu thật sự cần một workflow test branch, tạo test harness/workflow opt-in tách biệt và không ảnh hưởng app hiện tại.
+
+Cụ thể cho việc thử CI của một app fixture: sửa `ref:` trong bản sao `ci.yaml` **của chính kho fixture** (kho dùng xong xoá) để trỏ vào nhánh phát triển đã push. Đó không phải "sửa template rồi commit" — template trong `templates/` giữ nguyên `ref: main`. Và tắt tạm workflow orchestrator trên kho platform (`gh workflow disable orchestrator`) trong lúc thử, để job `dispatch` của app không kích hoạt một lần deploy bằng code của `main`; bật lại ngay sau đó.
 
 GitHub repository/organization Secrets không cần và không được copy giữa các branch. Secret chỉ có thể không được inject vì scope repository, GitHub Environment protection, fork PR hoặc reusable-workflow forwarding; đó là cấu hình GitHub, không phải dữ liệu thuộc branch.
 
@@ -679,9 +683,9 @@ duyệt hiện đại và systemd-resolved, nhưng một số cấu hình DNS n�
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `c03f5dc` (Phase 5).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **379 passed**
-(323 → 379, thêm 56 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** vì phase
-này sửa `provisioners/postgres-application.provisioners.yaml`: 379/379/379.
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **383 passed**
+(323 → 383, thêm 60 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** vì phase
+này sửa `provisioners/postgres-application.provisioners.yaml`: 383/383/383.
 
 Mô hình: onboarding là **một máy trạng thái có bản ghi nằm ngoài tiến trình** — ConfigMap
 `idp-onboarding-<app>` trong `cluster-state`. Mỗi bước kiểm-trước-khi-tạo và ghi kết quả
@@ -702,6 +706,7 @@ database), kho GitHub thật `pr3s3nt/donhang` + `pr3s3nt/idp-donhang-config`, c
 | Bí mật không tự chảy từ staging sang prod | prod verify sau khi merge | dừng ở **WAITING_FOR_USER_SECRETS** cho prod, dù staging đã có `stripe` |
 | Prod chạy đúng profile prod | sau khi nạp secret prod | Deployment **3/3** × 2, CNPG **3 instance** healthy, `/` → 200, backup: *"Continuous archiving is working"*, WAL thật nằm trong bucket |
 | Fleet không báo drift giả | `kubectl -n fleet-local get gitrepo` | sau khi sửa lỗi quantity: **1/1** cho cả staging lẫn prod |
+| CI do platform sinh chạy được trên GitHub | push một commit vào `dev` của kho fixture | run **success** cả 4 job: `plan` (platform trả `context: "."` + `dockerfile: backend/Dockerfile`), `build` × 2 (build từ gốc kho, thấy `shared/`), `dispatch`. Ảnh có thật trên GHCR (HTTP 200) |
 
 **Regression app legacy**: 4 cặp render (`simple-nginx`, `app-with-postgres` × staging/prod)
 baseline `36372b9` vs HEAD, render từ **bản sao** thư mục app: **giống nhau từng byte**.
@@ -771,15 +776,26 @@ rỗng cho ra đúng manifest như trước.
 Rollback: đặt `features.stack_onboarding: false` — `onboard` từ chối chạy ngay ở bước
 validate, trước khi tạo bất cứ thứ gì.
 
-Hạn chế còn lại: **CI sinh ra chưa được chạy trên GitHub**. Chạy nó cần
-`PLATFORM_DISPATCH_TOKEN`, và job `dispatch` khi đó sẽ gọi `repository_dispatch` vào
-orchestrator trên `main` — chạy trên chính self-hosted runner của máy này, tức là code của
-`main` sẽ chạm cụm verify. Mục 0.3.4 cấm dùng kết quả của một run `main` làm evidence cho
-branch này, nên Actions của kho fixture đã bị **tắt** có chủ ý; công thức build mà file CI
-mang theo được kiểm bằng test và bằng chính đường `--images local` (dùng chung
-`build_specs`). `--images ci` (chờ CI đẩy ảnh) đã có nhưng chỉ chạy đường "ảnh chưa có →
-dừng có trạng thái", chưa đo với một CI thật. Xoá app vẫn là workflow riêng chưa làm (mục
-13.4). Kho object của harness là một bản MinIO đơn lẻ — đủ để chứng minh archiving chạy,
+**Lỗi thật thứ mười một — CI sinh ra từ một nhánh chưa merge thì ĐỎ, và thông báo lỗi
+không nói vì sao.** Mẫu CI checkout platform ở `ref: main` — cố ý, để CI và orchestrator
+dùng cùng một bản renderer (orchestrator cũng chỉ chạy được từ nhánh mặc định). Hệ quả ít
+ai nghĩ tới: onboard một app từ nhánh phát triển sẽ giao cho đội ứng dụng một workflow gọi
+`image-plan --with-build`, thứ mà `main` chưa có. Đo được trên GitHub: `unrecognized
+arguments: --with-build`, không một chữ nào nhắc tới merge. Chạy lại với platform ghim ở
+nhánh phát triển thì qua bước đó, nhưng **tính tag `content` trong khi orchestrator tính
+`commit`** — vì `platform.env.yaml` trên nhánh mặc định còn tắt `features.stack_onboarding`.
+Hai tag khác nhau cho một commit, đúng cái bẫy Phase 5 đã ghim test. Nay
+`write_app_ci_workflow` đọc `git show <nhánh mặc định>:orchestrate.py` và
+`:platform.env.yaml` rồi **cảnh báo tại chỗ sinh file** cho cả hai trường hợp.
+
+Hạn chế còn lại: CI sinh ra đã chạy xanh trên GitHub, nhưng bằng một bản sao `ci.yaml`
+**trong kho fixture** được ghim vào nhánh phát triển (template trong `templates/` giữ
+nguyên `ref: main`); dòng đó chỉ đúng sau khi merge. Trong lúc thử, workflow orchestrator
+của kho platform bị **tắt tạm** (`gh workflow disable`) để job `dispatch` không kích hoạt
+một lần deploy bằng code của `main` trên self-hosted runner của chính máy này — đã bật lại
+và xác nhận `active`. `--images ci` (chờ CI đẩy ảnh) đã có nhưng chỉ chạy đường "ảnh chưa
+có → dừng có trạng thái", chưa đo với một CI thật. Xoá app vẫn là workflow riêng chưa làm
+(mục 13.4). Kho object của harness là một bản MinIO đơn lẻ — đủ để chứng minh archiving chạy,
 không phải một kho backup thật. `onboard` cần token quản trị Vault trong môi trường; công
 ty tách quyền chặt hơn thì phải bọc `ensure_vault_app_access` bằng API onboarding của Vault
 Ops (mục 13.5 đã lường trước, `vault-onboard --print-policy` in sẵn phần việc đó).
@@ -792,6 +808,13 @@ onboarding có được dùng nó không; `database.backup.object_store_url` + `
 với Cluster** (CNPG không đọc chéo namespace); và nhánh prod của kho cấu hình có thật sự
 bật branch protection không — onboarding luôn mở pull request, nhưng chỉ GitHub mới chặn
 được một cú push thẳng của người khác.
+
+**Thứ tự bắt buộc khi mang vào công ty**: merge nhánh này vào nhánh mặc định **trước** khi
+onboard app golden path đầu tiên, và bật `features.stack_onboarding` trong
+`platform.env.yaml` *trên chính nhánh đó*. CI của app đọc cả code lẫn cấu hình từ nhánh mặc
+định, nên làm ngược thứ tự sẽ cho ra một app có CI đỏ, hoặc tệ hơn, một app có CI xanh
+nhưng tính tag khác orchestrator. `write_app_ci_workflow` cảnh báo cả hai, nhưng cảnh báo
+chỉ hữu ích khi có người đọc log.
 
 ### 0.6. Stop conditions
 

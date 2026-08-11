@@ -4461,6 +4461,60 @@ def test_an_existing_repo_secret_is_left_alone(tmp_path, onboarding_enabled, mon
     assert not [a for a in calls if a[:3] == ["gh", "secret", "set"]]
 
 
+def _fake_catalog_branch(monkeypatch, *, renderer: str, config: dict | None):
+    """Giả lập nội dung ĐÃ COMMIT trên nhánh mặc định của catalog."""
+    files = {"orchestrate.py": renderer}
+    if config is not None:
+        files["platform.env.yaml"] = yaml.safe_dump(config)
+
+    def fake_run(argv, **kw):
+        if argv[:2] == ["git", "show"]:
+            rel = argv[2].split(":", 1)[1]
+            if rel in files:
+                return argparse.Namespace(returncode=0, stdout=files[rel], stderr="")
+            return argparse.Namespace(returncode=128, stdout="", stderr="not found")
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "run", fake_run)
+
+
+def test_onboarding_from_an_unmerged_branch_warns_that_the_apps_ci_will_be_red(
+        tmp_path, onboarding_enabled, monkeypatch):
+    """Đo được trên GitHub: CI của app fixture đỏ ở bước đầu với `unrecognized arguments:
+    --with-build`, và thông báo đó không hề nhắc tới việc nhánh chưa merge. CI checkout
+    platform ở NHÁNH MẶC ĐỊNH, không phải nhánh đang đứng."""
+    _fake_catalog_branch(monkeypatch, renderer="def cmd_image_plan(): pass", config=None)
+    warnings = orc.ci_branch_warnings(tmp_path)
+    assert any("--with-build" in w and "merge" in w.lower() for w in warnings), warnings
+
+
+def test_no_warning_once_the_default_branch_carries_the_feature(tmp_path,
+                                                                onboarding_enabled,
+                                                                monkeypatch):
+    _fake_catalog_branch(monkeypatch,
+                         renderer='p.add_argument("--with-build", action="store_true")',
+                         config={"features": {"stack_onboarding": True}})
+    assert orc.ci_branch_warnings(tmp_path) == []
+
+
+def test_a_flag_on_locally_but_off_on_the_default_branch_is_two_tags_for_one_commit(
+        tmp_path, onboarding_enabled, monkeypatch):
+    """CI đọc platform.env.yaml trên nhánh mặc định. Cờ lệch nhau nghĩa là CI tính
+    `content` còn orchestrator tính `commit` — Fleet apply một ảnh chưa ai đẩy lên."""
+    _fake_catalog_branch(monkeypatch, renderer="--with-build",
+                         config={"features": {"stack_onboarding": False}})
+    warnings = orc.ci_branch_warnings(tmp_path)
+    assert any("stack_onboarding" in w for w in warnings), warnings
+
+
+def test_an_unreadable_default_branch_says_so_instead_of_staying_quiet(tmp_path,
+                                                                       onboarding_enabled,
+                                                                       monkeypatch):
+    monkeypatch.setattr(orc, "run", lambda *a, **k: argparse.Namespace(
+        returncode=128, stdout="", stderr="fatal"))
+    assert len(orc.ci_branch_warnings(tmp_path)) == 1
+
+
 # ------------------------------------------------------------------ context build ảnh
 def test_build_context_for_a_stack_app_is_the_repo_root_not_the_service_dir(
         tmp_path, onboarding_enabled):
