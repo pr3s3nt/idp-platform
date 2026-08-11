@@ -105,6 +105,27 @@
             owner: {{ .State.username }}
             secret:
               name: {{ .State.cluster }}-cred
+        # XOAY VÒNG MẬT KHẨU DATABASE. `bootstrap.initdb.secret` chỉ được đọc MỘT LẦN, lúc
+        # khởi tạo cluster. Không có khối này thì xoay vòng credential trong Vault sinh ra
+        # đúng một thứ: một Secret chứa mật khẩu mà database TỪ CHỐI.
+        #
+        # Đo được trên harness: ghi mật khẩu mới vào Vault -> VSO đồng bộ ra Secret ->
+        # `psql` bằng giá trị trong Secret trả về `password authentication failed for user
+        # "app_api"`. App đang chạy KHÔNG hỏng ngay, vì nó giữ mật khẩu cũ trong biến môi
+        # trường của pod — nó hỏng ở lần restart pod kế tiếp, có thể là nhiều ngày sau,
+        # vì một lý do hoàn toàn không liên quan (scale, evict, nâng cấp node). Tức là
+        # nguyên nhân và triệu chứng cách nhau đủ xa để không ai nối được hai đầu.
+        #
+        # `managed.roles` làm CNPG đối chiếu mật khẩu của role với Secret ở mỗi vòng
+        # reconcile, nên Vault vẫn là nguồn sự thật duy nhất và xoay vòng thật sự có hiệu
+        # lực. Đo lại sau khi thêm: đăng nhập được bằng mật khẩu mới ngay vòng kiểm đầu.
+        managed:
+          roles:
+            - name: {{ .State.username }}
+              ensure: present
+              login: true
+              passwordSecret:
+                name: {{ .State.cluster }}-cred
         storage:
           size: %%computed.database.storage%%
           storageClass: %%computed.database.storage_class%%

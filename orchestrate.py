@@ -824,6 +824,76 @@ def _go_template_safe(text: str) -> str:
 DEV_POSTGRES_CLASSES = ("default", "development")
 
 
+def check_postgres_class_migration(services: list, state_path: Path, *,
+                                   accepted: bool) -> None:
+    """Chặn việc đổi `class` của một postgres ĐANG CÓ DỮ LIỆU mà không nói gì.
+
+    Lỗi thật thứ mười lăm. Comment trong provisioner nói đổi từ class cũ sang
+    `class: application` "KHÔNG phải sửa code app" — đúng về CONTRACT (cùng bộ output) và
+    sai hoàn toàn về DỮ LIỆU. Đo trên harness, từ một app legacy có 4 dòng thật:
+
+      score-k8s định danh resource bằng `<type>.<class>#<workload>.<tên>`, nên đổi class
+      là một RESOURCE KHÁC. Nó nhận Guid mới, tên object mới, và state cũ nằm lại trong
+      file state mãi mãi (kèm mật khẩu dạng thô của provisioner cũ).
+
+      Kết quả đo được, không có một cảnh báo nào ở bất kỳ đâu:
+        PGHOST      pg-api-54f63de0   -> pg-api-be0342e7-rw
+        PGDATABASE  db-haKaonqu       -> app_api
+        PGUSER      user-IUvGqfQK     -> app_api
+      Cluster mới `Ready`, 0 bảng. StatefulSet cũ bị Fleet prune, PVC của nó KHÔNG bị xoá
+      theo (PVC sinh từ volumeClaimTemplate không bị thu hồi) — dữ liệu nằm lại trên một
+      ổ đĩa không còn ai trỏ tới. App vẫn xanh, vẫn kết nối được, và rỗng.
+
+    Đây là kiểu hỏng tệ nhất trong cả hệ: mọi thứ báo thành công. Nên render DỪNG, và
+    người vận hành phải chọn tường minh một trong hai đường ở
+    `docs/chuyen-doi-postgres-sang-class-application.md`.
+    """
+    if not state_path.is_file():
+        return
+    state = yaml.safe_load(state_path.read_text()) or {}
+    existing = set((state.get("resources") or {}).keys())
+    if not existing:
+        return
+    for service in services:
+        doc = yaml.safe_load(service.path.read_text()) or {}
+        for name, resource in ((doc or {}).get("resources") or {}).items():
+            if (resource or {}).get("type") != "postgres":
+                continue
+            if ((resource or {}).get("class") or "default") != "application":
+                continue
+            new_uid = f"postgres.application#{service.workload}.{name}"
+            if new_uid in existing:
+                continue  # đã chuyển xong ở lần render trước — không cằn nhằn nữa
+            for old in DEV_POSTGRES_CLASSES:
+                old_uid = f"postgres.{old}#{service.workload}.{name}"
+                if old_uid not in existing:
+                    continue
+                old_state = ((state["resources"][old_uid] or {}).get("state") or {})
+                if accepted:
+                    warn(f"{old_uid} -> {new_uid}: dựng database MỚI và RỖNG theo yêu cầu "
+                         f"(--accept-empty-database). Dữ liệu cũ ở lại trên PVC của "
+                         f"{old_state.get('service', 'StatefulSet cũ')} và không còn ai "
+                         "trỏ tới; tự xoá khi đã chắc.")
+                    continue
+                raise SystemExit(
+                    f"{service.path.name} ({service.workload}): resource {name!r} đang đổi "
+                    f"từ `class: {old}` sang `class: application`, nhưng state đã có "
+                    f"{old_uid} — tức là có một database CŨ đang chạy với dữ liệu thật.\n"
+                    "\n"
+                    "Đổi class KHÔNG di chuyển dữ liệu. score-k8s coi đây là một resource "
+                    "khác, nên lần render này sẽ dựng một Cluster RỖNG với tên/host/"
+                    "database/user khác, còn dữ liệu cũ ở lại trên PVC của "
+                    f"{old_state.get('service', '<StatefulSet cũ>')} sau khi Fleet prune "
+                    "StatefulSet — và app vẫn báo xanh.\n"
+                    "\n"
+                    "Chọn một:\n"
+                    "  1. Di chuyển dữ liệu bằng CNPG `bootstrap.initdb.import`, rồi render "
+                    "lại. Các bước ở docs/chuyen-doi-postgres-sang-class-application.md.\n"
+                    "  2. Nếu database này thật sự không có gì đáng giữ: render lại với "
+                    "`--accept-empty-database`.\n"
+                )
+
+
 def check_database_classes(scores: list[tuple], env: str) -> None:
     """Refuse the demo-grade postgres in prod, and refuse prod without a backup target."""
     if not feature("postgres_application"):
@@ -2786,6 +2856,9 @@ def cmd_render(args) -> None:
     store.pull(work / ".score-k8s" / "state.yaml")
 
     services = discover(app_dir)
+    check_postgres_class_migration(
+        services, work / ".score-k8s" / "state.yaml",
+        accepted=getattr(args, "accept_empty_database", False))
     plan = plan_images(services, args.registry, args.image, args.tag, app_dir,
                        resolve_tag_strategy(app_dir, getattr(args, "tag_strategy", "")))
     rewrite_images(services, plan)
@@ -5520,6 +5593,11 @@ def main(argv: list[str] | None = None) -> None:
         )
         # Optional for `promote --mode tag-only`, which rewrites an existing manifest and
         # needs no catalog, app checkout or scratch dir.
+        # Xác nhận tường minh rằng database mới được phép RỖNG khi đổi class. Không có
+        # mặc định "cứ chạy đi": xem check_postgres_class_migration.
+        p.add_argument("--accept-empty-database", action="store_true",
+                       help="khi đổi `class` của một postgres đã có state: chấp nhận dựng "
+                            "database mới RỖNG và bỏ lại dữ liệu cũ trên PVC cũ")
         p.add_argument("--catalog", required=paths_required, help="checkout of the idp catalog")
         p.add_argument("--app-dir", required=paths_required, help="checkout of the app repo")
         p.add_argument("--work", required=paths_required, help="scratch dir for this render")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import json
 import os
 import re
@@ -3454,6 +3455,95 @@ def test_an_object_store_also_gets_a_base_backup_schedule(tmp_path, monkeypatch,
     # Cron của CNPG có SÁU trường (giây đứng đầu). Năm trường kiểu Unix vẫn là YAML hợp lệ
     # và vẫn được CNPG nhận, nhưng bị đọc lệch một bậc: "0 2 * * *" thành "mỗi giờ".
     assert len(str(sched["spec"]["schedule"]).split()) == 6, sched["spec"]["schedule"]
+
+
+def _legacy_pg_state(tmp_path: Path, uid: str) -> Path:
+    p = tmp_path / "state.yaml"
+    write(p, {"resources": {uid: {"state": {
+        "service": "pg-api-54f63de0", "database": "db-haKaonqu",
+        "username": "user-IUvGqfQK", "password": "cu-the"}}}})
+    return p
+
+
+def _pg_app(tmp_path: Path, klass: str | None) -> list:
+    doc = copy.deepcopy(PG_SCORE)
+    doc["resources"]["db"] = {"type": "postgres"}
+    if klass:
+        doc["resources"]["db"]["class"] = klass
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", doc)
+    return orc.discover(app_dir)
+
+
+@pytest.mark.parametrize("old_class", ["default", "development"])
+def test_switching_a_postgres_class_over_live_data_is_refused(tmp_path, old_class):
+    """Lỗi thật thứ mười lăm. Đổi class là một RESOURCE KHÁC với score-k8s, nên nó dựng
+    một database rỗng bên cạnh cái đang có dữ liệu, đổi cả host/database/user của app, và
+    để dữ liệu cũ lại trên một PVC không còn ai trỏ tới — trong khi mọi thứ báo xanh."""
+    state = _legacy_pg_state(tmp_path, f"postgres.{old_class}#api.db")
+    services = _pg_app(tmp_path, "application")
+    with pytest.raises(SystemExit, match="KHÔNG di chuyển dữ liệu"):
+        orc.check_postgres_class_migration(services, state, accepted=False)
+
+
+def test_the_class_switch_is_allowed_once_it_is_acknowledged(tmp_path):
+    """Một app thật sự chưa có gì đáng giữ vẫn phải đi tiếp được — nhưng bằng một câu nói
+    thẳng, không phải bằng im lặng."""
+    state = _legacy_pg_state(tmp_path, "postgres.default#api.db")
+    services = _pg_app(tmp_path, "application")
+    orc.check_postgres_class_migration(services, state, accepted=True)
+
+
+def test_an_already_migrated_resource_stops_warning(tmp_path):
+    """Sau khi đã chuyển xong, state có CẢ HAI khoá. Cằn nhằn mãi thì lần render nào cũng
+    phải truyền cờ, và một cờ luôn phải truyền là một cờ không còn ai đọc."""
+    state = tmp_path / "state.yaml"
+    write(state, {"resources": {
+        "postgres.default#api.db": {"state": {"service": "pg-api-54f63de0"}},
+        "postgres.application#api.db": {"state": {"cluster": "pg-api-be0342e7"}}}})
+    orc.check_postgres_class_migration(_pg_app(tmp_path, "application"), state,
+                                       accepted=False)
+
+
+def test_a_brand_new_application_database_is_not_a_migration(tmp_path):
+    """App mới toanh: state rỗng, không có gì để mất, không được hỏi gì cả."""
+    state = tmp_path / "state.yaml"
+    write(state, {"resources": {}})
+    orc.check_postgres_class_migration(_pg_app(tmp_path, "application"), state,
+                                       accepted=False)
+
+
+def test_staying_on_the_old_class_is_never_blocked(tmp_path):
+    """Lời hứa brownfield: app không đổi gì thì không bao giờ gặp guard này."""
+    state = _legacy_pg_state(tmp_path, "postgres.default#api.db")
+    orc.check_postgres_class_migration(_pg_app(tmp_path, None), state, accepted=False)
+
+
+@needs_score_k8s
+def test_the_app_role_password_is_reconciled_from_the_same_secret(tmp_path, postgres_enabled):
+    """Lỗi thật thứ mười bốn: xoay vòng credential database sinh ra một Secret mà chính
+    database TỪ CHỐI.
+
+    `bootstrap.initdb.secret` chỉ được đọc một lần, lúc khởi tạo. Đo trên harness: ghi
+    mật khẩu mới vào Vault -> VSO đồng bộ ra Secret -> `psql` bằng đúng giá trị trong
+    Secret trả về `password authentication failed`. App đang chạy không hỏng ngay vì nó
+    giữ mật khẩu cũ trong env của pod; nó hỏng ở lần restart kế tiếp, vì một lý do không
+    liên quan, nhiều ngày sau.
+
+    `managed.roles` là thứ làm cho xoay vòng có hiệu lực thật."""
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    cluster = next(d for d in render_env(tmp_path, app_dir, "staging", "w")
+                   if d["kind"] == "Cluster")
+    roles = cluster["spec"]["managed"]["roles"]
+    assert len(roles) == 1, roles
+    role = roles[0]
+    # Cùng một Secret mà initdb dùng, và cùng role mà app đăng nhập — nếu ba thứ này lệch
+    # nhau thì xoay vòng lại im lặng hỏng theo một kiểu khác.
+    assert role["name"] == cluster["spec"]["bootstrap"]["initdb"]["owner"]
+    assert role["passwordSecret"]["name"] == \
+        cluster["spec"]["bootstrap"]["initdb"]["secret"]["name"]
+    assert role["login"] is True
 
 
 @needs_score_k8s
