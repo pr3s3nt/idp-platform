@@ -5498,6 +5498,13 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---- onboarding (Phase 6). `--work` giữ nguyên giữa các lần chạy là CÓ Ý: bản
     # checkout kho ứng dụng và kho cấu hình nằm ở đó, và lần retry dùng lại chúng.
+    def add_resume_flags(p):
+        p.add_argument("--stop-after", default="",
+                       help="dừng sau bước này (xem tên bước trong `onboard-status`)")
+        p.add_argument("--force-step", action="append", default=[],
+                       help="chạy lại một bước đã `done` (mọi bước đều kiểm-trước-khi-"
+                            "tạo, nên chạy lại là an toàn). Lặp cờ này cho nhiều bước.")
+
     def add_onboard_state_flags(p):
         p.add_argument("--state-file",
                        help="giữ bản ghi onboarding trong file thay vì ConfigMap trong cụm")
@@ -5509,11 +5516,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--work", help="thư mục làm việc, mặc định onboard-<app>")
     p.add_argument("--images", choices=("local", "ci"), default="local",
                    help="local: tự build và đẩy ảnh; ci: chờ CI của kho ứng dụng đẩy")
-    p.add_argument("--stop-after", default="",
-                   help="dừng sau bước này (xem tên bước trong `onboard-status`)")
-    p.add_argument("--force-step", action="append", default=[],
-                   help="chạy lại một bước đã `done` (mọi bước đều kiểm-trước-khi-tạo, "
-                        "nên chạy lại là an toàn). Lặp cờ này cho nhiều bước.")
+    add_resume_flags(p)
     add_catalog_flag(p)
     add_onboard_state_flags(p)
     p.set_defaults(func=cmd_onboard)
@@ -5528,7 +5531,7 @@ def main(argv: list[str] | None = None) -> None:
                        help="kích hoạt production: dùng ảnh đã verify ở staging, qua pull request")
     p.add_argument("--app", required=True)
     p.add_argument("--work", help="thư mục làm việc của lần onboarding trước")
-    p.add_argument("--stop-after", default="")
+    add_resume_flags(p)
     add_catalog_flag(p)
     add_onboard_state_flags(p)
     p.set_defaults(func=cmd_onboard_activate_prod)

@@ -3400,6 +3400,28 @@ def test_an_aws_object_store_carries_no_endpoint_override(tmp_path, monkeypatch,
     assert "endpointURL" not in cluster["spec"]["backup"]["barmanObjectStore"]
 
 
+@needs_score_k8s
+def test_resource_quantities_render_as_strings_not_numbers(tmp_path, monkeypatch,
+                                                           postgres_enabled):
+    """Quantity của Kubernetes là CHUỖI. Profile prod đặt cpu "1", và nếu manifest ghi số
+    1 thì API server lưu lại thành "1" — desired và live khác nhau mãi mãi, Fleet báo
+    bundle `Modified` không bao giờ hết. Đo được trên cụm: bundle prod đứng ở 0/1 với
+    `modified {"spec":{"resources":{"requests":{"cpu":1}}}}` trong khi app chạy đúng.
+    Staging không bao giờ lộ ra vì `250m` không thể là số."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["backup"]["object_store_url"] = "s3://backups/idp"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    for env in ("staging", "prod"):
+        cluster = next(d for d in render_env(tmp_path, app_dir, env, f"w-{env}")
+                       if d["kind"] == "Cluster")
+        requests = cluster["spec"]["resources"]["requests"]
+        for key, value in requests.items():
+            assert isinstance(value, str), f"{env}.{key} là {type(value).__name__}: {value!r}"
+        assert isinstance(cluster["spec"]["storage"]["size"], str)
+
+
 def test_every_postgres_provisioner_declares_its_class():
     """A provisioner without `class` matches EVERY class, and when several match, the one
     score-k8s happens to load last wins — an order that depends on temp filenames it
@@ -4257,6 +4279,21 @@ def test_force_step_reruns_one_finished_step_and_nothing_else(tmp_path,
     ctx.args.force_step = ["hai"]
     orc.run_onboarding(ctx, fake_plan(calls))
     assert calls == ["hai"]
+
+
+def test_both_onboarding_commands_accept_the_same_resume_flags():
+    """`--force-step` chỉ có ở `onboard` mà thiếu ở `onboard-activate-prod` là một lỗ hổng
+    im lặng: nửa production không sửa chữa được, và người vận hành phải sửa tay bản ghi
+    state — đúng thứ máy trạng thái sinh ra để khỏi phải làm."""
+    import contextlib
+    import io
+    for cmd in ("onboard", "onboard-activate-prod"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), pytest.raises(SystemExit):
+            orc.main([cmd, "--help"])
+        text = buf.getvalue()
+        assert "--force-step" in text, cmd
+        assert "--stop-after" in text, cmd
 
 
 def test_force_step_refuses_a_name_that_is_not_a_step(tmp_path, onboarding_enabled):

@@ -679,9 +679,9 @@ duyệt hiện đại và systemd-resolved, nhưng một số cấu hình DNS n�
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `c03f5dc` (Phase 5).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **377 passed**
-(323 → 377, thêm 54 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** vì phase
-này sửa `provisioners/postgres-application.provisioners.yaml`: 377/377/377.
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **379 passed**
+(323 → 379, thêm 56 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** vì phase
+này sửa `provisioners/postgres-application.provisioners.yaml`: 379/379/379.
 
 Mô hình: onboarding là **một máy trạng thái có bản ghi nằm ngoài tiến trình** — ConfigMap
 `idp-onboarding-<app>` trong `cluster-state`. Mỗi bước kiểm-trước-khi-tạo và ghi kết quả
@@ -701,6 +701,7 @@ database), kho GitHub thật `pr3s3nt/donhang` + `pr3s3nt/idp-donhang-config`, c
 | Prod dùng ảnh đã verify ở staging | so ảnh trong PR với manifest staging | **giống hệt** cả hai workload (`donhang-backend`/`donhang-frontend` cùng tag `aafeafce`) |
 | Bí mật không tự chảy từ staging sang prod | prod verify sau khi merge | dừng ở **WAITING_FOR_USER_SECRETS** cho prod, dù staging đã có `stripe` |
 | Prod chạy đúng profile prod | sau khi nạp secret prod | Deployment **3/3** × 2, CNPG **3 instance** healthy, `/` → 200, backup: *"Continuous archiving is working"*, WAL thật nằm trong bucket |
+| Fleet không báo drift giả | `kubectl -n fleet-local get gitrepo` | sau khi sửa lỗi quantity: **1/1** cho cả staging lẫn prod |
 
 **Regression app legacy**: 4 cặp render (`simple-nginx`, `app-with-postgres` × staging/prod)
 baseline `36372b9` vs HEAD, render từ **bản sao** thư mục app: **giống nhau từng byte**.
@@ -726,6 +727,16 @@ có `database.backup.endpoint_url` (rỗng = AWS) và `tools/dung-object-store-h
 MinIO thật cho harness — vì fail-closed chỉ có nghĩa khi harness cũng phải vượt qua nó,
 không phải điền một URL giả cho qua cửa.
 
+**Lỗi thật thứ mười — bundle prod báo `Modified` vĩnh viễn, và cụm thì hoàn toàn đúng.**
+Quantity của Kubernetes là CHUỖI. Provisioner ghi `cpu: %%computed.database.cpu_request%%`
+không nháy, nên profile staging (`250m`) ra chuỗi và không ai thấy gì — còn profile prod
+đặt `"1"` thì YAML sinh ra `cpu: 1`, một SỐ. API server nhận và lưu lại thành `"1"`, nên
+desired (số) và live (chuỗi) khác nhau mãi mãi. Đo được: GitRepo `donhang-prod` đứng ở
+**0/1** với `modified {"spec":{"resources":{"requests":{"cpu":1}}}}` trong khi 3 pod app,
+3 instance Postgres và HTTP đều đúng. Một bundle luôn đỏ là một bundle không ai còn đọc —
+tức là lần drift THẬT tiếp theo sẽ không ai thấy. Sau khi thêm nháy và merge lại: **1/1**.
+Đây là loại lỗi chỉ prod mới lộ, và chỉ lộ khi có người thật sự nhìn Fleet sau khi deploy.
+
 **Ba chỗ tự tìm thấy khi chạy thật, đều đã sửa:** bản checkout kho ứng dụng chỉ tồn tại
 trong thư mục `--work` của lần chạy trước, nên retry trên máy khác không có gì để render —
 nay mỗi bước tự dựng lại từ remote, bước build lấy **đỉnh nhánh** (đội ứng dụng thường đã
@@ -739,7 +750,9 @@ onboarding đẩy code lên nhánh đọc từ `environments.staging.config_bran
 mặc định, nên không ai thấy; một công ty đổi tên nhánh thì code được đẩy lên một nhánh
 **không workflow nào nghe**, không ảnh nào được build, và không có lỗi ở đâu cả. GitHub
 phân giải khối `on:` tĩnh nên CI không tự hỏi được — nay bộ sinh điền hai tên nhánh đó vào
-lúc tạo file.
+lúc tạo file. Và `--force-step` chỉ có ở `onboard`, thiếu ở `onboard-activate-prod`: nửa
+production không sửa chữa được, người vận hành phải sửa tay bản ghi state — đúng thứ máy
+trạng thái sinh ra để khỏi phải làm.
 
 File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
 `platform.env.company.yaml`, `provisioners/postgres-application.provisioners.yaml`,

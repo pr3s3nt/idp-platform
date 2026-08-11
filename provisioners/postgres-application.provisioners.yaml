@@ -110,8 +110,17 @@
           storageClass: %%computed.database.storage_class%%
         resources:
           requests:
-            cpu: %%computed.database.cpu_request%%
-            memory: %%computed.database.memory_request%%
+            # NHÁY KÉP LÀ BẮT BUỘC, và lý do chỉ lộ ra ở prod. Quantity của Kubernetes là
+            # CHUỖI. Profile staging (`250m`, `512Mi`) không bao giờ ra số nên không ai
+            # thấy gì; profile prod đặt `cpu_request: "1"`, mà không có nháy thì YAML sinh
+            # ra `cpu: 1` — một SỐ. API server nhận và lưu lại thành `"1"`, nên desired
+            # (số) và live (chuỗi) khác nhau MÃI MÃI: Fleet báo bundle `Modified` không
+            # bao giờ hết, và một bundle luôn đỏ là một bundle không ai còn đọc.
+            # Đo được trên kind-staging: bundle prod đứng ở 0/1 với
+            # `modified {"spec":{"resources":{"requests":{"cpu":1}}}}` trong khi cụm chạy
+            # hoàn toàn đúng.
+            cpu: "%%computed.database.cpu_request%%"
+            memory: "%%computed.database.memory_request%%"
         {{ if ne "%%database.backup.object_store_url%%" "" }}
         # Backup chỉ xuất hiện khi đã cấu hình kho object. Không có kho thì KHÔNG sinh
         # khối rỗng: một `backup:` không đầy đủ làm CNPG báo lỗi cluster-level, còn ở đây
