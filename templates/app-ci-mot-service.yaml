@@ -75,6 +75,8 @@ jobs:
     # Tính hai lần là hai cơ hội ra hai kết quả khác nhau.
     outputs:
       image: ${{ steps.plan.outputs.ref }}
+      context: ${{ steps.plan.outputs.context }}
+      dockerfile: ${{ steps.plan.outputs.dockerfile }}
     steps:
       - uses: actions/checkout@v4
 
@@ -109,18 +111,28 @@ jobs:
           # đặt tag có thể tới từ .idp/stack.yaml, mà file đó chỉ có hiệu lực khi cờ
           # features.stack_onboarding bật — thiếu config thì CI tính ra một tag, còn
           # orchestrator tính ra tag khác, và Fleet apply một image chưa ai đẩy lên.
-          IMG=$(python3 platform/orchestrate.py --env-config platform/platform.env.yaml \
-                  image-plan \
-                  --app "$APP" --image "$IMAGE_NAME" --tag "$GITHUB_SHA" \
-                  --registry "$REGISTRY" --app-dir . | jq -r 'to_entries[0].value')
-          echo "==> sẽ build: $IMG"
-          echo "ref=$IMG" >> "$GITHUB_OUTPUT"
+          # --with-build: platform trả về CẢ cách build, không chỉ tên ảnh. Cần thế vì
+          # context không phải lúc nào cũng là thư mục chứa Dockerfile — app sinh từ stack
+          # có gói dùng chung nằm ở gốc kho, build sai context là hỏng ngay ở npm install.
+          python3 platform/orchestrate.py --env-config platform/platform.env.yaml \
+            image-plan --with-build --catalog platform \
+            --app "$APP" --image "$IMAGE_NAME" --tag "$GITHUB_SHA" \
+            --registry "$REGISTRY" --app-dir . > plan.json
+          cat plan.json
+          IMG=$(jq -r 'to_entries[0].value.image'      plan.json)
+          CTX=$(jq -r 'to_entries[0].value.context'    plan.json)
+          DF=$(jq  -r 'to_entries[0].value.dockerfile' plan.json)
+          echo "==> sẽ build: $IMG (context $CTX, dockerfile $DF)"
+          echo "ref=$IMG"        >> "$GITHUB_OUTPUT"
+          echo "context=$CTX"    >> "$GITHUB_OUTPUT"
+          echo "dockerfile=$DF"  >> "$GITHUB_OUTPUT"
 
       - name: Build image
         run: |
           set -euo pipefail
           REF="${{ steps.plan.outputs.ref }}"
-          docker build -t "$REF" .
+          docker build -f "${{ steps.plan.outputs.dockerfile }}" -t "$REF" \
+            "${{ steps.plan.outputs.context }}"
           echo "==> đã build $REF"
 
       # ĐÓNG GÓI ẢNH ĐỂ CHUYỂN SANG MÁY KHÁC.

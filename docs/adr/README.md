@@ -17,5 +17,6 @@ thứ đang giữ cho hệ thống không hỏng — và họ sẽ có lý, vì 
 | [0007](0007-topo-vso-va-danh-tinh-verify.md) | Mỗi app một danh tính Vault; verify không được đọc Secret | Accepted |
 | [0008](0008-provider-database-va-credential.md) | CloudNativePG cho `class: application`; credential database đi qua Vault | Accepted |
 | [0009](0009-stack-catalog-va-phat-trien-local.md) | Stack là phép cộng component; `make dev` sinh từ chính Score | Accepted |
+| [0010](0010-may-trang-thai-onboarding.md) | Onboarding là máy trạng thái, bản ghi ngoài tiến trình, chờ-người là một trạng thái | Accepted |
 
 Định dạng: Bối cảnh → Quyết định → Hệ quả → Đã cân nhắc và loại.

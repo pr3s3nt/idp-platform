@@ -50,6 +50,7 @@ Mỗi "mảng" test canh một bất biến. Test đỏ ở mảng nào = bạn 
 | `kiểm cụm sau khi triển khai` | Logic `verify`: chờ rollout thật, không nhìn `availableReplicas`. |
 | `PHASE 5 — stack catalog` | Catalog `templates/stacks/` tự nhất quán; sinh app không để sót `__TOKEN__`; `.env.example` không lệch khỏi values. |
 | `PHASE 5 — tích hợp score-compose` | Chạy **chính `make generate`** của app sinh ra: routing `/api` phải đứng trước `/` bất kể tên workload, và nginx phải re-resolve DNS. |
+| `PHASE 6 — onboarding` | Request bị kiểm chặt (khoá lạ, `"false"` dạng chuỗi, stack version không phát hành); máy trạng thái **bỏ qua bước đã xong** khi retry; chờ-người không bao giờ thành `READY`; prod luôn đi qua pull request và mang đúng bộ ảnh staging; CI sinh ra không còn chỗ phải sửa tay. |
 
 ## Render/verify cục bộ — KHÔNG cần cụm
 
@@ -104,6 +105,7 @@ lấy trạng thái SỐNG:
 | 3 — App secret | Phase 2 chạy được (VSO sync ra Secret trong ns) | `kubectl get vaultstaticsecret,secretstore -A` |
 | 4 — Postgres capability | DB provider/operator production-grade | probe: tìm operator postgres; `kubectl get crd \| grep -iE 'postgres\|cnpg\|zalando'` |
 | 5 — Stack + score-compose | `score-compose` bản đã ghim + `docker` + `make` | `score-compose --version`; `docker info` |
+| 6 — Onboarding | Phase 2-5 chạy được + `gh` đã đăng nhập + kho object cho backup (nếu bật prod) | `gh auth status`; `kubectl -n object-store get deploy minio` |
 | chung — deploy tới cụm | Fleet + gateway (traefik) + storageClass | có trong output `thu-thap-ha-tang.sh` |
 
 **Dựng lại Vault/VSO trên harness (Phase 2) — một lệnh, chạy lại được nhiều lần:**
@@ -143,6 +145,43 @@ và chỉ ghi khi có `--write`.
 > Ba test tích hợp Phase 5 chạy **chính `make generate` của app sinh ra**, nên chúng cần
 > `make` và `score-compose` trên PATH. Gate `make dev` đầy đủ (dựng container thật) không
 > nằm trong pytest — chạy tay theo lệnh trên rồi kiểm `/` và `/api/health`.
+
+**Onboarding một app mới từ đầu (Phase 6):**
+
+```bash
+# 1. Kho object cho backup — BẮT BUỘC nếu app xin database và có bật prod.
+#    Render prod bị CHẶN khi database.backup.object_store_url rỗng (fail-closed có chủ ý).
+./tools/dung-object-store-harness.sh --context kind-staging      # chỉ harness, không chạy ở công ty
+
+# 2. Vault nhìn thấy được từ máy đang chạy lệnh (vault.address là địa chỉ CỤM nhìn thấy).
+kubectl -n vault port-forward svc/vault 8200:8200 &
+export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=<token có quyền quản trị>
+
+# 3. Thông tin đăng nhập registry cho imagePullSecret, và (tuỳ chọn) token cho CI của app.
+export REGISTRY_USER=... REGISTRY_PASS=...     # KHÔNG bao giờ là tham số dòng lệnh
+export APP_DISPATCH_TOKEN=...                  # bỏ trống -> onboarding chỉ BÁO là còn thiếu
+
+# 4. Chạy. Cùng một file request chạy lại bao nhiêu lần cũng được.
+python3 orchestrate.py --env-config platform.env.yaml onboard \
+  --request request-<app>.yaml --work /duong/dan/tam/onboard-<app>
+python3 orchestrate.py --env-config platform.env.yaml onboard-status --app <app>
+python3 orchestrate.py --env-config platform.env.yaml onboard-activate-prod \
+  --app <app> --work /duong/dan/tam/onboard-<app>
+```
+
+Hình dạng file request nằm ở mục 13.1 của `KE-HOACH...`. Trạng thái sống trong ConfigMap
+`idp-onboarding-<app>` ở `kubernetes.state_namespace` — đọc bằng `onboard-status --json`.
+
+Ba trạng thái KHÔNG phải lỗi và cũng KHÔNG phải xong:
+
+| Trạng thái | Nghĩa | Làm gì tiếp |
+|---|---|---|
+| `WAITING_FOR_USER_SECRETS` | app deploy rồi nhưng thiếu bí mật bên thứ ba | chạy đúng lệnh `secret-set` mà nó in ra, rồi chạy lại `onboard` |
+| `PENDING_PROD_APPROVAL` | pull request prod đã mở, chờ người merge | merge rồi chạy lại `onboard-activate-prod` |
+| `FAILED_RETRYABLE` | một bước hỏng, lý do nằm trong bản ghi | sửa nguyên nhân rồi chạy lại — nó tiếp tục từ đúng bước đó |
+
+`--force-step <tên bước>` chạy lại một bước đã `done` (mọi bước đều kiểm-trước-khi-tạo).
+`--stop-after <tên bước>` dừng sớm để xem kết quả từng phần.
 
 > Thứ chỉ tồn tại ở công ty (Vault addr thật, policy…) thì theo `KE-HOACH...` mục 0.6: tạo
 > config key + validation/preflight + checklist, **không** tự đánh dấu pass, và **không** để

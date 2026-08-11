@@ -237,7 +237,7 @@ AI phải cập nhật bảng này trong quá trình làm. `Blocked` chỉ dùng
 | 3 — App secret integration | Done | Xem "Nhật ký Phase 3" bên dưới |
 | 4 — PostgreSQL capability/profile | Done | Xem "Nhật ký Phase 4" bên dưới |
 | 5 — Stack catalog và `score-compose` | Done | Xem "Nhật ký Phase 5" bên dưới |
-| 6 — Onboarding workflow/state machine | Not started | |
+| 6 — Onboarding workflow/state machine | Done | Xem "Nhật ký Phase 6" bên dưới |
 | 7 — Pilot, migration và hardening local | Not started | |
 
 Giá trị trạng thái hợp lệ: `Not started`, `In progress`, `Done`, `Blocked`.
@@ -674,6 +674,111 @@ hỏng ngay ở bước build đầu tiên; `images.postgres` phải cùng major
 `database_profiles.*.application.engine_version`; đội nào được phép chạy `stack-new`; và
 `*.localhost` có phân giải về 127.0.0.1 trên máy lập trình viên hay không (đúng với trình
 duyệt hiện đại và systemd-resolved, nhưng một số cấu hình DNS nội bộ chặn).
+
+#### Nhật ký Phase 6
+
+Branch `feature/secret-onboarding`, verify từ working tree tại SHA `c03f5dc` (Phase 5).
+
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **377 passed**
+(323 → 377, thêm 54 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** vì phase
+này sửa `provisioners/postgres-application.provisioners.yaml`: 377/377/377.
+
+Mô hình: onboarding là **một máy trạng thái có bản ghi nằm ngoài tiến trình** — ConfigMap
+`idp-onboarding-<app>` trong `cluster-state`. Mỗi bước kiểm-trước-khi-tạo và ghi kết quả
+ngay; "đang chờ người" là một trạng thái chứ không phải lỗi. Xem ADR `0010`.
+
+**Gate của Phase 6, đo bằng cách chạy thật** — app fixture `donhang` (`node-fullstack` +
+database), kho GitHub thật `pr3s3nt/donhang` + `pr3s3nt/idp-donhang-config`, cụm
+`kind-staging`, gọi `orchestrate.py` trực tiếp từ working tree của feature branch:
+
+| Gate | Cách đo | Kết quả |
+|---|---|---|
+| Từ request đến STAGING_READY không cần Ops thao tác từng resource | một file request 20 dòng + `onboard` | 13 bước tự chạy: 2 kho GitHub, 2 nhánh mỗi kho, workflow verify, `.github/workflows/ci.yaml`, namespace, ServiceAccount, VaultAuth, 2 policy + 1 role Vault, credential database sinh vào Vault, 2 ảnh build+push, manifest vào kho cấu hình, GitRepo của Fleet. **Không có lệnh `kubectl create` nào gõ tay** |
+| App chạy thật, không chỉ đúng hình dạng | qua Gateway, `Host: donhang.staging.internal.dev` | `/` → **200 text/html**; `/api/health` → JSON từ Express; `/api/ready` (chạm DB) → `{"status":"ready"}`; `POST /api/items` → **201**, dữ liệu thật trong Postgres |
+| Thiếu secret bên thứ ba ⇒ WAITING_FOR_USER_SECRETS, không báo READY sai | đội ứng dụng khai `STRIPE_KEY: {secretRef: …}` rồi push | trạng thái **WAITING_FOR_USER_SECRETS** kèm đúng lệnh `secret-set` phải chạy. Trên cụm: backend đứng ở `CreateContainerConfigError`, VSS `stripe` **False**, còn VSS credential database **True** — hai loại bí mật được phân biệt đúng |
+| Retry không tạo duplicate | `secret-set` rồi chạy lại đúng lệnh cũ | 7 bước đã xong **bị bỏ qua**, chỉ `verify-staging` chạy lại → STAGING_READY. Đếm sau đó: **1** kho app, **1** kho cấu hình, **1** namespace, **1** GitRepo, **1** CNPG Cluster, **1** ConfigMap state, **2** đường dẫn Vault (`database`, `stripe`) |
+| Prod chỉ chạy sau approval | `onboard-activate-prod` | mở **pull request #1**, trạng thái `PENDING_PROD_APPROVAL`, `main` **không có** `prod/manifests.yaml`. Sau khi người duyệt merge và chạy lại → prod deploy, verify, **READY** |
+| Prod dùng ảnh đã verify ở staging | so ảnh trong PR với manifest staging | **giống hệt** cả hai workload (`donhang-backend`/`donhang-frontend` cùng tag `aafeafce`) |
+| Bí mật không tự chảy từ staging sang prod | prod verify sau khi merge | dừng ở **WAITING_FOR_USER_SECRETS** cho prod, dù staging đã có `stripe` |
+| Prod chạy đúng profile prod | sau khi nạp secret prod | Deployment **3/3** × 2, CNPG **3 instance** healthy, `/` → 200, backup: *"Continuous archiving is working"*, WAL thật nằm trong bucket |
+
+**Regression app legacy**: 4 cặp render (`simple-nginx`, `app-with-postgres` × staging/prod)
+baseline `36372b9` vs HEAD, render từ **bản sao** thư mục app: **giống nhau từng byte**.
+`examples/` không bị sửa.
+
+**Lỗi thật thứ tám — mẫu CI được ship KHÔNG build được app do chính platform sinh ra.**
+`app-ci-nhieu-service.yaml` chạy `docker build "<workload>/"`, tức context là thư mục của
+service. Nhưng golden path là monorepo: `backend/Dockerfile` có `COPY shared/`, và `shared/`
+nằm ngoài `backend/`. Nghĩa là **mọi app sinh từ stack đều đỏ ở lần CI đầu tiên** với
+`shared: not found` — sau khi kho đã được tạo, tức ở chỗ tốn nhất để phát hiện. Catalog đã
+biết điều này (`buildContext: "."` trong `component.yaml`) nhưng thông tin đó chỉ đi vào
+`Makefile` cho `make dev`, không tới CI. Nay CI **hỏi** platform bằng `image-plan
+--with-build`, giống hệt cách nó đã hỏi tên ảnh. Cờ mới thay vì đổi mặc định là có chủ ý:
+mọi app đang chạy có một bản sao mẫu cũ đọc `.[workload]` như một chuỗi, đổi hình dạng mặc
+định là làm hỏng tất cả chúng cùng lúc ở lần push kế tiếp.
+
+**Lỗi thật thứ chín — `endpointURL` thiếu làm backup hỏng trong im lặng.** Provisioner
+CNPG sinh `barmanObjectStore` không có `endpointURL`, nên barman gọi thẳng
+`s3.amazonaws.com` với mọi kho object. Với MinIO/Ceph — tức gần như mọi cài đặt on-prem —
+Cluster vẫn **Ready**, database vẫn phục vụ, chỉ WAL archiving là hỏng: một database
+production không phục hồi được, đúng thứ mà guard `object_store_url` sinh ra để chặn. Nay
+có `database.backup.endpoint_url` (rỗng = AWS) và `tools/dung-object-store-harness.sh` dựng
+MinIO thật cho harness — vì fail-closed chỉ có nghĩa khi harness cũng phải vượt qua nó,
+không phải điền một URL giả cho qua cửa.
+
+**Ba chỗ tự tìm thấy khi chạy thật, đều đã sửa:** bản checkout kho ứng dụng chỉ tồn tại
+trong thư mục `--work` của lần chạy trước, nên retry trên máy khác không có gì để render —
+nay mỗi bước tự dựng lại từ remote, bước build lấy **đỉnh nhánh** (đội ứng dụng thường đã
+đẩy code trong lúc onboarding bỏ dở) còn bước deploy/verify lấy **đúng commit đã build**
+(render theo đỉnh nhánh sẽ trỏ tới một ảnh chưa ai đẩy lên). Và `tao-app-moi.sh` in ra ba
+việc phải làm tay, việc số 1 là đặt `PLATFORM_DISPATCH_TOKEN` — thiếu nó thì lần push đầu
+tiên của đội ứng dụng đỏ ở `actions/checkout` với thông báo không hề nhắc tới secret; nay
+onboarding đặt nó khi người chạy cung cấp `APP_DISPATCH_TOKEN`, và **báo là còn thiếu** khi
+không. Chỗ thứ ba: hai mẫu CI gắn cứng `on: push: branches: [dev, main]` trong khi
+onboarding đẩy code lên nhánh đọc từ `environments.staging.config_branch` — trùng nhau ở
+mặc định, nên không ai thấy; một công ty đổi tên nhánh thì code được đẩy lên một nhánh
+**không workflow nào nghe**, không ảnh nào được build, và không có lỗi ở đâu cả. GitHub
+phân giải khối `on:` tĩnh nên CI không tự hỏi được — nay bộ sinh điền hai tên nhánh đó vào
+lúc tạo file.
+
+File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
+`platform.env.company.yaml`, `provisioners/postgres-application.provisioners.yaml`,
+`templates/app-ci-mot-service.yaml`, `templates/app-ci-nhieu-service.yaml`,
+`tools/dung-object-store-harness.sh` (mới), `docs/adr/0010-may-trang-thai-onboarding.md`
+(mới), `docs/adr/README.md`, `HUONG-DAN-KIEM-THU.md`, `HUONG-DAN-TAO-APP-MOI.md`.
+
+Config key mới: `git.app_repo_pattern`, `git.platform_repo`, `onboarding.*`
+(`state_configmap_pattern`, `visibilities`, `allowed_owners`, `verify_timeout_seconds`),
+`database.backup.endpoint_url`. Lệnh mới: `onboard`, `onboard-status`,
+`onboard-activate-prod`; cờ mới `image-plan --with-build`.
+
+Migration: không có. Onboarding là một lệnh mới, không nằm trên đường deploy đang chạy.
+`image-plan` giữ nguyên hình dạng JSON cũ trừ khi truyền `--with-build`. `endpoint_url`
+rỗng cho ra đúng manifest như trước.
+Rollback: đặt `features.stack_onboarding: false` — `onboard` từ chối chạy ngay ở bước
+validate, trước khi tạo bất cứ thứ gì.
+
+Hạn chế còn lại: **CI sinh ra chưa được chạy trên GitHub**. Chạy nó cần
+`PLATFORM_DISPATCH_TOKEN`, và job `dispatch` khi đó sẽ gọi `repository_dispatch` vào
+orchestrator trên `main` — chạy trên chính self-hosted runner của máy này, tức là code của
+`main` sẽ chạm cụm verify. Mục 0.3.4 cấm dùng kết quả của một run `main` làm evidence cho
+branch này, nên Actions của kho fixture đã bị **tắt** có chủ ý; công thức build mà file CI
+mang theo được kiểm bằng test và bằng chính đường `--images local` (dùng chung
+`build_specs`). `--images ci` (chờ CI đẩy ảnh) đã có nhưng chỉ chạy đường "ảnh chưa có →
+dừng có trạng thái", chưa đo với một CI thật. Xoá app vẫn là workflow riêng chưa làm (mục
+13.4). Kho object của harness là một bản MinIO đơn lẻ — đủ để chứng minh archiving chạy,
+không phải một kho backup thật. `onboard` cần token quản trị Vault trong môi trường; công
+ty tách quyền chặt hơn thì phải bọc `ensure_vault_app_access` bằng API onboarding của Vault
+Ops (mục 13.5 đã lường trước, `vault-onboard --print-policy` in sẵn phần việc đó).
+
+Người dùng phải xác nhận lại khi mang vào công ty: `git.platform_repo` và
+`git.app_repo_pattern` theo quy ước của tổ chức; `onboarding.allowed_owners` (rỗng = ai
+cũng onboard được — hợp harness, không hợp công ty); ai giữ token viết policy Vault và
+onboarding có được dùng nó không; `database.backup.object_store_url` + `endpoint_url` +
+`credentials_secret` của kho object thật, và Secret credential phải nằm **cùng namespace
+với Cluster** (CNPG không đọc chéo namespace); và nhánh prod của kho cấu hình có thật sự
+bật branch protection không — onboarding luôn mở pull request, nhưng chỉ GitHub mới chặn
+được một cú push thẳng của người khác.
 
 ### 0.6. Stop conditions
 

@@ -3363,6 +3363,43 @@ def test_no_object_store_means_no_backup_block_at_all(tmp_path, postgres_enabled
     assert "backup" not in cluster["spec"]
 
 
+@needs_score_k8s
+def test_a_non_aws_object_store_gets_its_endpoint_into_the_cluster(tmp_path, monkeypatch,
+                                                                   postgres_enabled):
+    """Đo được trên harness: thiếu `endpointURL`, barman gọi thẳng s3.amazonaws.com và
+    WAL archiving hỏng trong im lặng — Cluster vẫn Ready, database vẫn phục vụ, và không
+    có gì để phục hồi. Mọi cài đặt on-prem (MinIO/Ceph) đều rơi vào trường hợp này."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["backup"].update(
+        {"object_store_url": "s3://idp-backup/",
+         "endpoint_url": "http://minio.object-store.svc.cluster.local:9000",
+         "credentials_secret": "backup-object-store"})
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    cluster = next(d for d in render_env(tmp_path, app_dir, "staging", "w")
+                   if d["kind"] == "Cluster")
+    store = cluster["spec"]["backup"]["barmanObjectStore"]
+    assert store["endpointURL"] == "http://minio.object-store.svc.cluster.local:9000"
+    assert store["destinationPath"] == "s3://idp-backup/"
+    assert store["s3Credentials"]["accessKeyId"]["name"] == "backup-object-store"
+
+
+@needs_score_k8s
+def test_an_aws_object_store_carries_no_endpoint_override(tmp_path, monkeypatch,
+                                                          postgres_enabled):
+    """Rỗng phải nghĩa là "AWS S3", không phải một endpointURL rỗng — CNPG sẽ cố gọi
+    chuỗi rỗng đó."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["database"]["backup"]["object_store_url"] = "s3://backups/idp"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    app_dir = tmp_path / "app"
+    write(app_dir / "score.yaml", PG_SCORE)
+    cluster = next(d for d in render_env(tmp_path, app_dir, "staging", "w")
+                   if d["kind"] == "Cluster")
+    assert "endpointURL" not in cluster["spec"]["backup"]["barmanObjectStore"]
+
+
 def test_every_postgres_provisioner_declares_its_class():
     """A provisioner without `class` matches EVERY class, and when several match, the one
     score-k8s happens to load last wins — an order that depends on temp filenames it
@@ -3953,3 +3990,740 @@ def test_the_orchestrator_workflow_defers_to_the_app_when_the_payload_is_silent(
     text = (CATALOG / ".github" / "workflows" / "orchestrator.yaml").read_text()
     assert "client_payload.tag_strategy || ''" in text
     assert "client_payload.tag_strategy || 'content'" not in text
+
+
+# =====================================================================================
+# PHASE 6 — onboarding: request, máy trạng thái, idempotency
+# =====================================================================================
+@pytest.fixture
+def onboarding_enabled(monkeypatch):
+    """Cấu hình thật của repo với bốn cờ bật — đúng thứ một công ty bật cho app pilot."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("features", {}).update(
+        {"application_values": True, "vault_secrets": True,
+         "postgres_application": True, "stack_onboarding": True})
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    return data
+
+
+def add_third_party_secret(app_dir: Path, var: str, *, name: str, key: str) -> None:
+    """Đội ứng dụng khai một bí mật của bên thứ ba trong values của họ."""
+    path = app_dir / ".score-values" / "values.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["spec"].setdefault("application", {})[var] = {
+        "secretRef": {"name": name, "key": key}}
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+
+def onboarding_request(**over) -> dict:
+    doc = {
+        "application": {"name": "donhang", "owner": "team-order",
+                        "description": "Quản lý đơn hàng"},
+        "stack": {"id": "node-fullstack", "version": "1.0.0"},
+        "database": {"enabled": True, "profile": "application"},
+        "routing": {"visibility": "internal"},
+        "environments": {"staging": True, "prod": True},
+    }
+    for key, value in over.items():
+        if value is None:
+            doc.pop(key, None)
+        elif isinstance(value, dict) and isinstance(doc.get(key), dict):
+            doc[key] = {**doc[key], **value}
+        else:
+            doc[key] = value
+    return doc
+
+
+# ------------------------------------------------------------------- request (13.1)
+def test_a_valid_request_normalises_to_the_shape_section_13_1_describes(onboarding_enabled):
+    req = orc.validate_onboarding_request(onboarding_request(), "req.yaml", CATALOG)
+    assert req["application"] == {"name": "donhang", "owner": "team-order",
+                                  "description": "Quản lý đơn hàng"}
+    assert req["stack"] == {"id": "node-fullstack", "version": "1.0.0"}
+    assert req["environments"] == {"staging": True, "prod": True}
+    # Không hỏi namespace, Vault path, Secret name, StorageClass hay DB resource thô —
+    # đúng câu cuối của mục 13.1. Request chỉ mang những khoá này.
+    assert set(req) == {"application", "stack", "database", "routing", "environments"}
+
+
+def test_a_typo_in_a_top_level_key_is_refused_not_ignored(onboarding_enabled):
+    """`enviroments:` được bỏ qua trong im lặng sẽ dựng một app thiếu prod, và không ai
+    biết cho tới ngày cần lên production."""
+    doc = onboarding_request()
+    doc["enviroments"] = doc.pop("environments")
+    with pytest.raises(SystemExit, match="enviroments"):
+        orc.validate_onboarding_request(doc, "req.yaml", CATALOG)
+
+
+def test_a_request_without_an_owner_is_refused(onboarding_enabled):
+    with pytest.raises(SystemExit, match="owner"):
+        orc.validate_onboarding_request(
+            onboarding_request(application={"owner": ""}), "req.yaml", CATALOG)
+
+
+def test_a_request_pinning_a_stack_version_the_catalog_does_not_publish_is_refused(
+        onboarding_enabled):
+    """Nếu bỏ qua, app được sinh từ một bộ file khác với thứ request nói."""
+    with pytest.raises(SystemExit, match="v9.9.9"):
+        orc.validate_onboarding_request(
+            onboarding_request(stack={"version": "9.9.9"}), "req.yaml", CATALOG)
+
+
+def test_a_request_must_pin_a_stack_version_at_all(onboarding_enabled):
+    """Bỏ trống nghĩa là "phiên bản nào cũng được", và app được sinh từ một bộ file khác
+    nhau tuỳ ngày chạy."""
+    doc = onboarding_request()
+    doc["stack"] = {"id": "node-fullstack"}
+    with pytest.raises(SystemExit, match="stack.version"):
+        orc.validate_onboarding_request(doc, "req.yaml", CATALOG)
+
+
+def test_database_enabled_must_match_what_the_stack_actually_has(onboarding_enabled):
+    """Capability là thuộc tính của STACK. Một request nói `enabled: false` trên một stack
+    có database sẽ dựng ra một app vẫn có database — tức là request nói dối."""
+    with pytest.raises(SystemExit, match="capability"):
+        orc.validate_onboarding_request(
+            onboarding_request(database={"enabled": False}), "req.yaml", CATALOG)
+    # và chiều ngược lại: stack không có database mà request xin
+    with pytest.raises(SystemExit, match="capability"):
+        orc.validate_onboarding_request(
+            onboarding_request(stack={"id": "static-frontend"},
+                               database={"enabled": True}), "req.yaml", CATALOG)
+
+
+def test_a_string_false_is_not_accepted_as_a_boolean(onboarding_enabled):
+    """YAML coi "false" là một CHUỖI, và mọi chuỗi không rỗng đều truthy. Nhận nó nghĩa là
+    `prod: "false"` bật production."""
+    with pytest.raises(SystemExit, match="true/false"):
+        orc.validate_onboarding_request(
+            onboarding_request(environments={"prod": "false"}), "req.yaml", CATALOG)
+
+
+def test_a_staging_free_request_is_refused(onboarding_enabled):
+    with pytest.raises(SystemExit, match="staging"):
+        orc.validate_onboarding_request(
+            onboarding_request(environments={"staging": False}), "req.yaml", CATALOG)
+
+
+def test_visibility_comes_from_config_not_from_a_branch_in_the_code(onboarding_enabled,
+                                                                   monkeypatch):
+    with pytest.raises(SystemExit, match="onboarding.visibilities"):
+        orc.validate_onboarding_request(
+            onboarding_request(routing={"visibility": "public"}), "req.yaml", CATALOG)
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["onboarding"]["visibilities"] = ["internal", "public"]
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    req = orc.validate_onboarding_request(
+        onboarding_request(routing={"visibility": "public"}), "req.yaml", CATALOG)
+    assert req["routing"]["visibility"] == "public"
+
+
+def test_onboarding_permission_is_a_config_list_not_a_hardcoded_rule(onboarding_enabled,
+                                                                    monkeypatch):
+    """Mục 13.5: ai được onboard là chính sách của công ty, nên nó nằm trong cấu hình."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["onboarding"]["allowed_owners"] = ["team-payments"]
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    with pytest.raises(SystemExit, match="allowed_owners"):
+        orc.validate_onboarding_request(onboarding_request(), "req.yaml", CATALOG)
+
+
+# ------------------------------------------------------------- idempotency (13.4)
+def test_the_same_request_always_produces_the_same_request_id(onboarding_enabled):
+    a = orc.validate_onboarding_request(onboarding_request(), "a.yaml", CATALOG)
+    b = orc.validate_onboarding_request(onboarding_request(), "b.yaml", CATALOG)
+    assert orc.onboarding_request_id(a) == orc.onboarding_request_id(b)
+    assert orc.onboarding_request_id(a).startswith("ob-donhang-")
+
+
+def test_changing_the_request_changes_the_idempotency_key(onboarding_enabled):
+    a = orc.validate_onboarding_request(onboarding_request(), "a.yaml", CATALOG)
+    b = orc.validate_onboarding_request(
+        onboarding_request(environments={"prod": False}), "b.yaml", CATALOG)
+    assert orc.onboarding_idempotency_key(a) != orc.onboarding_idempotency_key(b)
+
+
+def test_a_second_different_request_for_a_live_app_is_refused(tmp_path, onboarding_enabled):
+    """Đây là chỗ chặn "bản sao thứ hai". Không có nó, sửa một dòng rồi chạy lại sẽ tạo
+    thêm kho, thêm namespace và một credential database mới bên cạnh app đang chạy."""
+    store = orc.FileOnboardingStore(tmp_path / "state.json")
+    first = orc.validate_onboarding_request(onboarding_request(), "a.yaml", CATALOG)
+    orc.load_or_create_record(store, first)
+    second = orc.validate_onboarding_request(
+        onboarding_request(application={"owner": "team-khac"}), "b.yaml", CATALOG)
+    with pytest.raises(SystemExit, match="stack-upgrade"):
+        orc.load_or_create_record(store, second)
+
+
+def test_the_same_request_resumes_the_existing_record(tmp_path, onboarding_enabled):
+    store = orc.FileOnboardingStore(tmp_path / "state.json")
+    req = orc.validate_onboarding_request(onboarding_request(), "a.yaml", CATALOG)
+    first = orc.load_or_create_record(store, req)
+    first["steps"]["validate"] = {"status": "done"}
+    store.write(first)
+    again = orc.load_or_create_record(store, req)
+    assert again["requestId"] == first["requestId"]
+    assert again["steps"]["validate"]["status"] == "done"
+
+
+def test_the_record_is_written_before_any_external_resource_exists(tmp_path,
+                                                                   onboarding_enabled):
+    """Ghi state NGAY là điều kiện để retry tiếp tục được: một lần chạy chết ngay sau khi
+    tạo kho GitHub vẫn phải để lại dấu vết."""
+    path = tmp_path / "state.json"
+    store = orc.FileOnboardingStore(path)
+    req = orc.validate_onboarding_request(onboarding_request(), "a.yaml", CATALOG)
+    orc.load_or_create_record(store, req)
+    assert json.loads(path.read_text())["state"] == "REQUESTED"
+
+
+def test_onboarding_labels_carry_what_section_13_4_requires(onboarding_enabled):
+    req = orc.validate_onboarding_request(onboarding_request(), "a.yaml", CATALOG)
+    labels = orc.onboarding_labels(req, env="staging")
+    assert labels["idp.platform/application"] == "donhang"
+    assert labels["idp.platform/environment"] == "staging"
+    assert labels["idp.platform/stack-version"] == "1.0.0"
+    assert labels["idp.platform/onboarding-request-id"] == orc.onboarding_request_id(req)
+    for key, value in labels.items():
+        assert re.match(r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$", value), key
+        assert len(value) <= 63, key
+
+
+# --------------------------------------------------------------------- máy trạng thái
+def fake_plan(calls: list, *, fail_at: str = "", pause_at: str = ""):
+    def make(key, state):
+        def fn(ctx):
+            calls.append(key)
+            if key == fail_at:
+                raise SystemExit(f"{key} hỏng")
+            if key == pause_at:
+                raise orc.OnboardingPaused("WAITING_FOR_USER_SECRETS", f"{key} phải chờ")
+        return orc.OnboardStep(key, state, fn, key)
+    return [make("mot", "VALIDATING"), make("hai", "CONFIGURING_VAULT"),
+            make("ba", "VERIFYING_STAGING")]
+
+
+def onboard_ctx(tmp_path, onboarding_enabled, **over):
+    store = orc.FileOnboardingStore(tmp_path / "state.json")
+    req = orc.validate_onboarding_request(onboarding_request(**over), "a.yaml", CATALOG)
+    record = orc.load_or_create_record(store, req)
+    work = tmp_path / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    args = argparse.Namespace(catalog=str(CATALOG), work=str(work),
+                              kubeconfig=None, state_file=str(tmp_path / "state.json"),
+                              images="local", force_step=[])
+    return orc.OnboardContext(req, record, store, args)
+
+
+def test_a_failed_step_records_failed_retryable_and_the_next_run_resumes_there(
+        tmp_path, onboarding_enabled):
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    calls = []
+    with pytest.raises(SystemExit):
+        orc.run_onboarding(ctx, fake_plan(calls, fail_at="hai"))
+    assert calls == ["mot", "hai"]
+    assert ctx.record["state"] == "FAILED_RETRYABLE"
+    assert ctx.record["steps"]["hai"]["status"] == "failed"
+
+    calls.clear()
+    orc.run_onboarding(ctx, fake_plan(calls))
+    # `mot` đã xong nên KHÔNG chạy lại — đây chính là "retry không tạo bản sao".
+    assert calls == ["hai", "ba"]
+
+
+def test_a_paused_step_is_not_a_failure_and_never_becomes_ready(tmp_path,
+                                                                onboarding_enabled):
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    calls = []
+    orc.run_onboarding(ctx, fake_plan(calls, pause_at="hai"))
+    assert calls == ["mot", "hai"]                 # `ba` không được chạy
+    assert ctx.record["state"] == "WAITING_FOR_USER_SECRETS"
+    assert ctx.record["steps"]["hai"]["status"] == "waiting"
+    # và lần chạy sau thử lại đúng bước đó
+    calls.clear()
+    orc.run_onboarding(ctx, fake_plan(calls))
+    assert calls == ["hai", "ba"]
+
+
+def test_force_step_reruns_one_finished_step_and_nothing_else(tmp_path,
+                                                              onboarding_enabled):
+    """Mọi bước đều kiểm-trước-khi-tạo, nên chạy lại một bước là an toàn — và đôi khi là
+    thứ duy nhất cứu được một lần onboarding bỏ dở."""
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    calls = []
+    orc.run_onboarding(ctx, fake_plan(calls))
+    assert calls == ["mot", "hai", "ba"]
+    calls.clear()
+    ctx.args.force_step = ["hai"]
+    orc.run_onboarding(ctx, fake_plan(calls))
+    assert calls == ["hai"]
+
+
+def test_force_step_refuses_a_name_that_is_not_a_step(tmp_path, onboarding_enabled):
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    ctx.args.force_step = ["khong-ton-tai"]
+    with pytest.raises(SystemExit, match="khong-ton-tai"):
+        orc.run_onboarding(ctx, fake_plan([]))
+
+
+def test_stop_after_stops_where_it_says(tmp_path, onboarding_enabled):
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    calls = []
+    orc.run_onboarding(ctx, fake_plan(calls), stop_after="mot")
+    assert calls == ["mot"]
+
+
+def test_the_state_machine_only_uses_states_section_13_2_names(tmp_path,
+                                                               onboarding_enabled):
+    known = set(orc.ONBOARD_STATES) | set(orc.ONBOARD_BRANCH_STATES)
+    for step in orc.ONBOARD_PLAN + orc.ONBOARD_PROD_PLAN:
+        assert step.state in known, step.key
+    assert [s.state for s in orc.ONBOARD_PLAN] == sorted(
+        [s.state for s in orc.ONBOARD_PLAN], key=orc.ONBOARD_STATES.index), \
+        "các bước phải đi theo đúng thứ tự máy trạng thái ở mục 13.2"
+
+
+def test_history_is_capped_so_a_hundred_retries_do_not_grow_the_record_forever(
+        tmp_path, onboarding_enabled):
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    for i in range(120):
+        orc.record_state(ctx.record, orc.ONBOARD_STATES[i % len(orc.ONBOARD_STATES)],
+                         ctx.store)
+    assert len(ctx.record["history"]) <= 50
+
+
+# ------------------------------------------------------- cờ tính năng và tiền điều kiện
+def test_onboarding_refuses_to_start_when_the_platform_flag_is_off(tmp_path):
+    """Nếu bỏ qua, một lần onboarding tạo kho + namespace + credential rồi mới phát hiện
+    platform chưa bật tính năng — và không ai dọn đống đó."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("features", {}).update({"stack_onboarding": False})
+    old = orc.CONFIG
+    orc.CONFIG = orc.EnvConfig(data)
+    try:
+        store = orc.FileOnboardingStore(tmp_path / "s.json")
+        req = {"application": {"name": "donhang", "owner": "t"},
+               "stack": {"id": "node-fullstack", "version": "1.0.0"},
+               "database": {"enabled": True, "profile": "application"},
+               "routing": {"visibility": "internal"},
+               "environments": {"staging": True, "prod": False}}
+        record = orc.new_onboarding_record(req)
+        ctx = orc.OnboardContext(req, record, store, argparse.Namespace(
+            catalog=str(CATALOG), work=str(tmp_path), kubeconfig=None))
+        with pytest.raises(SystemExit, match="features.stack_onboarding is off"):
+            orc.step_validate(ctx)
+    finally:
+        orc.CONFIG = old
+
+
+def test_validate_derives_hostnames_and_never_asks_for_them(tmp_path, onboarding_enabled):
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    orc.step_validate(ctx)
+    hosts = ctx.record["outputs"]["hostnames"]
+    assert hosts["staging"] == "donhang." + orc.CONFIG.get("environments.staging.domain")
+    assert hosts["prod"] == "donhang." + orc.CONFIG.get("environments.prod.domain")
+
+
+# --------------------------------------------------------- CI của app (nợ của Phase 5)
+def test_the_generated_ci_has_no_placeholder_left_to_edit(tmp_path, onboarding_enabled):
+    dest = new_app(tmp_path, app="donhang")
+    assert orc.write_app_ci_workflow(dest, "donhang", catalog=CATALOG)
+    text = (dest / orc.APP_CI_REL).read_text()
+    assert "<-- SỬA" not in text
+    assert "TEN-APP" not in text and "harbor.vi-du.vn" not in text
+    env = yaml.safe_load(text)["env"]
+    assert env == {"APP": "donhang", "IMAGE_NAME": "donhang",
+                   "REGISTRY": orc.CONFIG.get("registry.path"),
+                   "PLATFORM_REPO": orc.CONFIG.get("git.platform_repo")}
+
+
+def test_the_generated_ci_listens_on_the_branches_this_platform_calls_staging_and_prod(
+        tmp_path, onboarding_enabled, monkeypatch):
+    """GitHub phân giải khối `on:` TĨNH, nên CI không tự hỏi platform được. Một công ty đổi
+    config_branch mà CI vẫn nghe `dev` thì onboarding đẩy code lên một nhánh không workflow
+    nào chạy: không ảnh nào được build, và không có lỗi ở đâu cả."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["environments"]["staging"]["config_branch"] = "phat-trien"
+    data["environments"]["prod"]["config_branch"] = "san-xuat"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
+    dest = new_app(tmp_path, app="donhang")
+    orc.write_app_ci_workflow(dest, "donhang", catalog=CATALOG)
+    doc = yaml.safe_load((dest / orc.APP_CI_REL).read_text())
+    assert doc[True]["push"]["branches"] == ["phat-trien", "san-xuat"]
+
+
+def test_the_generated_ci_is_not_overwritten_on_a_second_run(tmp_path, onboarding_enabled):
+    """Sau lần đầu, file này là của đội ứng dụng — họ thêm bước test vào đó."""
+    dest = new_app(tmp_path, app="donhang")
+    orc.write_app_ci_workflow(dest, "donhang", catalog=CATALOG)
+    (dest / orc.APP_CI_REL).write_text("# đội ứng dụng đã sửa\n")
+    assert orc.write_app_ci_workflow(dest, "donhang", catalog=CATALOG) is False
+    assert (dest / orc.APP_CI_REL).read_text() == "# đội ứng dụng đã sửa\n"
+
+
+def test_a_multi_workload_app_gets_the_multi_service_template(tmp_path, onboarding_enabled):
+    """Chép nhầm mẫu hỏng ngay ở bước build, nên mẫu được SUY RA từ số workload."""
+    dest = new_app(tmp_path, app="donhang")                      # node-fullstack: 2 workload
+    orc.write_app_ci_workflow(dest, "donhang", catalog=CATALOG)
+    assert "matrix" in (dest / orc.APP_CI_REL).read_text()
+    one = new_app(tmp_path, stack_id="node-api", app="motservice")
+    orc.write_app_ci_workflow(one, "motservice", catalog=CATALOG)
+    assert "matrix" not in (one / orc.APP_CI_REL).read_text()
+
+
+def test_the_generator_stops_if_the_template_loses_a_line_it_must_fill():
+    with pytest.raises(SystemExit, match="REGISTRY"):
+        orc.render_app_ci_workflow(
+            "env:\n  APP: X\n  IMAGE_NAME: X\n  PLATFORM_REPO: X\n",
+            app="a", image="a", registry="r", platform_repo="p")
+
+
+def test_a_missing_repo_secret_is_reported_instead_of_a_red_ci_run_nobody_explains(
+        tmp_path, onboarding_enabled, monkeypatch):
+    """Thiếu PLATFORM_DISPATCH_TOKEN thì lần push đầu tiên của đội ứng dụng ĐỎ, và thông
+    báo lỗi nói về actions/checkout chứ không nói "chưa ai đặt secret"."""
+    monkeypatch.delenv("APP_DISPATCH_TOKEN", raising=False)
+    monkeypatch.setattr(orc, "run", lambda *a, **k: argparse.Namespace(
+        returncode=0, stdout="", stderr=""))
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    orc.ensure_app_repo_secrets(ctx)
+    assert ctx.record["outputs"]["pendingRepoSecrets"] == ["PLATFORM_DISPATCH_TOKEN"]
+
+
+def test_a_repo_secret_is_set_when_the_operator_supplies_it_and_never_via_argv(
+        tmp_path, onboarding_enabled, monkeypatch):
+    """Giá trị đi qua stdin: tham số dòng lệnh nằm trong `ps` của mọi user khác trên máy."""
+    monkeypatch.setenv("APP_DISPATCH_TOKEN", "gho-bi-mat")
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append((argv, kw.get("stdin")))
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "run", fake_run)
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    orc.ensure_app_repo_secrets(ctx)
+    setters = [(a, s) for a, s in calls if a[:3] == ["gh", "secret", "set"]]
+    assert setters and setters[0][1] == "gho-bi-mat"
+    assert "gho-bi-mat" not in " ".join(setters[0][0])
+    assert ctx.record["outputs"]["pendingRepoSecrets"] == []
+
+
+def test_an_existing_repo_secret_is_left_alone(tmp_path, onboarding_enabled, monkeypatch):
+    monkeypatch.setenv("APP_DISPATCH_TOKEN", "gho-bi-mat")
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return argparse.Namespace(returncode=0, stdout="PLATFORM_DISPATCH_TOKEN\n",
+                                  stderr="")
+
+    monkeypatch.setattr(orc, "run", fake_run)
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    orc.ensure_app_repo_secrets(ctx)
+    assert not [a for a in calls if a[:3] == ["gh", "secret", "set"]]
+
+
+# ------------------------------------------------------------------ context build ảnh
+def test_build_context_for_a_stack_app_is_the_repo_root_not_the_service_dir(
+        tmp_path, onboarding_enabled):
+    """Lỗi thật mà mẫu CI cũ mang sẵn: `docker build backend/` không thấy `shared/`, và
+    lỗi nổ ra ở npm install với "shared: not found" — sau khi kho đã được tạo."""
+    dest = new_app(tmp_path, app="donhang")
+    specs = orc.build_specs(dest, orc.discover(dest), CATALOG)
+    assert specs["backend"] == {"context": ".", "dockerfile": "backend/Dockerfile"}
+    assert specs["frontend"] == {"context": ".", "dockerfile": "frontend/Dockerfile"}
+    # và Dockerfile thật sự phụ thuộc vào điều đó
+    assert "COPY shared/" in (dest / "backend" / "Dockerfile").read_text()
+
+
+def test_build_context_for_an_app_without_a_stack_file_keeps_the_old_convention(tmp_path):
+    """Mọi app đang chạy đều không có `.idp/stack.yaml`. Chúng phải build y như trước."""
+    write(tmp_path / "score.yaml", score_spec("nginx", container="web"))
+    specs = orc.build_specs(tmp_path, orc.discover(tmp_path), CATALOG)
+    assert specs["nginx"] == {"context": ".", "dockerfile": "Dockerfile"}
+
+    multi = tmp_path / "multi"
+    write(multi / "api" / "score.yaml", score_spec("api"))
+    write(multi / "web" / "score.yaml", score_spec("web"))
+    specs = orc.build_specs(multi, orc.discover(multi), CATALOG)
+    assert specs["api"] == {"context": "api", "dockerfile": "api/Dockerfile"}
+
+
+def test_image_plan_keeps_its_old_shape_unless_asked_for_the_new_one(tmp_path, capsys):
+    """Mọi app đang chạy có một bản sao mẫu CI cũ đọc `.[workload]` như một chuỗi. Đổi
+    hình dạng mặc định là làm hỏng TẤT CẢ chúng cùng lúc, ở lần push kế tiếp."""
+    write(tmp_path / "score.yaml", score_spec("nginx", container="web"))
+    orc.cmd_image_plan(argparse.Namespace(
+        app="a", image="a", tag="t", registry="r", app_dir=str(tmp_path),
+        tag_strategy="commit", with_build=False, catalog=str(CATALOG)))
+    assert json.loads(capsys.readouterr().out) == {"nginx": "r/a:t"}
+    orc.cmd_image_plan(argparse.Namespace(
+        app="a", image="a", tag="t", registry="r", app_dir=str(tmp_path),
+        tag_strategy="commit", with_build=True, catalog=str(CATALOG)))
+    assert json.loads(capsys.readouterr().out) == {
+        "nginx": {"image": "r/a:t", "context": ".", "dockerfile": "Dockerfile"}}
+
+
+def test_the_shipped_ci_templates_ask_the_platform_how_to_build():
+    """Mẫu nào gắn cứng context sẽ hỏng với mọi app sinh từ stack — và chỉ hỏng sau khi
+    kho đã được tạo, tức là ở chỗ tốn nhất."""
+    for name in ("app-ci-mot-service.yaml", "app-ci-nhieu-service.yaml"):
+        code = "\n".join(line for line in
+                         (CATALOG / "templates" / name).read_text().splitlines()
+                         if not line.lstrip().startswith("#"))
+        assert "--with-build" in code, name
+        assert "docker build -f" in code, name
+        assert 'docker build -t "$REF" .' not in code, name
+        assert 'docker build -t "$REF" "${{ matrix.workload }}/"' not in code, name
+
+
+# ---------------------------------------------------------------- database credential
+def test_the_database_username_matches_what_the_provisioner_will_ask_for():
+    """Hai chỗ tính một tên là hai chỗ có thể lệch. Ở đây hậu quả là CNPG tạo database với
+    owner khác user mà VSO đồng bộ, và app nhận "password authentication failed" trên một
+    credential trông hoàn toàn đúng."""
+    text = (CATALOG / "provisioners" / "postgres-application.provisioners.yaml").read_text()
+    assert 'print "app_" (.SourceWorkload | replace "-" "_")' in text
+    assert orc.database_username("backend") == "app_backend"
+    assert orc.database_username("don-hang") == "app_don_hang"
+
+
+def test_database_workloads_are_read_from_the_apps_own_score_files(tmp_path,
+                                                                   onboarding_enabled):
+    dest = new_app(tmp_path, app="donhang")
+    assert orc.database_workloads(dest) == ["backend"]
+
+
+def test_two_database_workloads_are_refused_because_they_would_share_one_credential(
+        tmp_path, onboarding_enabled, monkeypatch):
+    """Provisioner đọc credential từ MỘT đường dẫn Vault cho cả app. Hai database dùng
+    chung một mật khẩu là một sự cố đang chờ xảy ra."""
+    dest = new_app(tmp_path, app="donhang")
+    spec = yaml.safe_load((dest / "frontend" / "score.yaml").read_text())
+    spec["resources"] = {"db": {"type": "postgres", "class": "application"}}
+    (dest / "frontend" / "score.yaml").write_text(yaml.safe_dump(spec, sort_keys=False))
+    monkeypatch.setattr(orc, "ensure_app_checkout", lambda ctx, at_sha="": dest)
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    with pytest.raises(SystemExit, match="một credential"):
+        orc.ensure_database_credentials(ctx, "staging")
+
+
+# ----------------------------------------------------- WAITING_FOR_USER_SECRETS (gate 2)
+def test_a_missing_third_party_secret_is_reported_not_waited_on(tmp_path,
+                                                                onboarding_enabled,
+                                                                monkeypatch):
+    """Gate của phase: thiếu bí mật bên thứ ba dẫn tới WAITING_FOR_USER_SECRETS, KHÔNG
+    phải một lần verify chờ hết giờ rồi báo "0/1 replicas ready" — thông điệp đó gửi người
+    trực đi soi image trong khi chẳng có gì hỏng cả."""
+    dest = new_app(tmp_path, app="donhang")
+    add_third_party_secret(dest, "STRIPE_KEY", name="stripe", key="api_key")
+
+    monkeypatch.setattr(orc, "vault_secret_key_names", lambda *a, **k: None)
+    missing = orc.third_party_secret_requirements(dest, "donhang", "staging")
+    assert missing == [{"secret": "stripe", "keys": ["api_key"],
+                        "path": "kv/apps/donhang/staging/stripe"}]
+
+    # đã nạp rồi thì không còn thiếu
+    monkeypatch.setattr(orc, "vault_secret_key_names", lambda *a, **k: {"api_key"})
+    assert orc.third_party_secret_requirements(dest, "donhang", "staging") == []
+
+
+def test_the_platform_owned_database_credential_is_not_reported_as_a_user_secret(
+        tmp_path, onboarding_enabled, monkeypatch):
+    """Phân biệt hai loại là điều làm nên khác nhau giữa "đang chờ bạn dán API key" và
+    "platform hỏng"."""
+    dest = new_app(tmp_path, app="donhang")
+    monkeypatch.setattr(orc, "vault_secret_key_names", lambda *a, **k: None)
+    assert orc.third_party_secret_requirements(dest, "donhang", "staging") == []
+
+
+def test_verify_staging_pauses_and_prints_the_exact_command_to_run(tmp_path,
+                                                                   onboarding_enabled,
+                                                                   monkeypatch):
+    dest = new_app(tmp_path, app="donhang")
+    monkeypatch.setattr(orc, "third_party_secret_requirements",
+                        lambda *a, **k: [{"secret": "stripe", "keys": ["api_key"],
+                                          "path": "kv/apps/donhang/staging/stripe"}])
+    monkeypatch.setattr(orc, "ensure_app_checkout", lambda ctx, at_sha="": dest)
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    ctx.record["outputs"]["sha"] = "a" * 40
+    with pytest.raises(orc.OnboardingPaused) as caught:
+        orc.step_verify_staging(ctx)
+    assert caught.value.state == "WAITING_FOR_USER_SECRETS"
+    assert "secret-set --app donhang --env staging --name stripe --key api_key" \
+        in caught.value.message
+
+
+def test_a_retry_on_a_fresh_machine_rebuilds_the_app_checkout(tmp_path,
+                                                              onboarding_enabled,
+                                                              monkeypatch):
+    """Một lần retry hiếm khi chạy trên cái máy đã bỏ dở. `--work` mới tinh thì không có
+    bản checkout nào, và mọi bước sau đều cần nó."""
+    cloned = {}
+
+    def fake_run(argv, **kw):
+        if argv[:2] == ["git", "clone"]:
+            cloned["branch"] = argv[argv.index("--branch") + 1]
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+        return argparse.Namespace(returncode=0, stdout="c" * 40 + "\n", stderr="")
+
+    monkeypatch.setattr(orc, "run", fake_run)
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    ctx.record["outputs"]["appRepo"] = "https://github.com/o/donhang"
+    ctx.record["outputs"]["sha"] = "b" * 40
+    orc.ensure_app_checkout(ctx)
+    assert cloned["branch"] == orc.CONFIG.get("environments.staging.config_branch")
+    # đỉnh nhánh đã đổi -> onboarding đi tiếp với commit mới, không deploy commit cũ
+    assert ctx.record["outputs"]["sha"] == "c" * 40
+
+
+def test_deploy_and_verify_pin_the_exact_commit_that_was_built(tmp_path,
+                                                               onboarding_enabled,
+                                                               monkeypatch):
+    """Nếu render theo đỉnh nhánh trong khi ảnh được build từ commit trước đó, manifest
+    trỏ tới một ảnh chưa ai đẩy lên — và chỉ lộ ra khi pod ImagePullBackOff."""
+    seen = []
+
+    def fake_run(argv, **kw):
+        seen.append(argv)
+        if argv[:2] == ["git", "clone"]:
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+        return argparse.Namespace(returncode=0, stdout="tip\n", stderr="")
+
+    monkeypatch.setattr(orc, "run", fake_run)
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    ctx.record["outputs"]["appRepo"] = "https://github.com/o/donhang"
+    ctx.record["outputs"]["sha"] = "b" * 40
+    orc.ensure_app_checkout(ctx, at_sha="b" * 40)
+    assert ["git", "checkout", "-q", "b" * 40] in [a[:3] + a[3:4] for a in seen]
+    assert ctx.record["outputs"]["sha"] == "b" * 40      # KHÔNG bị đỉnh nhánh ghi đè
+
+
+# ------------------------------------------------------------------ prod gate (gate 4)
+def test_prod_cannot_be_activated_before_staging_was_verified(tmp_path,
+                                                              onboarding_enabled):
+    """Prod chạy ĐÚNG bộ ảnh staging đã kiểm. Chưa kiểm thì không có gì để đưa lên."""
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    with pytest.raises(SystemExit, match="VERIFYING_STAGING"):
+        orc.step_provision_prod(ctx)
+
+
+def test_prod_cannot_be_activated_for_an_app_that_never_asked_for_it(tmp_path,
+                                                                     onboarding_enabled):
+    ctx = onboard_ctx(tmp_path, onboarding_enabled, environments={"prod": False})
+    ctx.record["steps"]["verify-staging"] = {"status": "done"}
+    with pytest.raises(SystemExit, match="environments.prod"):
+        orc.step_provision_prod(ctx)
+
+
+def test_prod_always_goes_through_a_pull_request_never_a_direct_push(tmp_path,
+                                                                     onboarding_enabled,
+                                                                     monkeypatch):
+    """Nhánh prod của một cụm thử thường CHƯA bật bảo vệ. Nếu để logic đoán, prod sẽ được
+    push thẳng — mất luôn điểm kiểm soát duy nhất của con người."""
+    seen = {}
+
+    def fake_commit(args):
+        seen.update(vars(args))
+        return "https://github.com/x/y/pull/1"
+
+    monkeypatch.setattr(orc, "clone_config_repo",
+                        lambda ctx, env: _prod_config_fixture(tmp_path))
+    monkeypatch.setattr(orc, "deploy_environment", lambda ctx, env: None)
+    monkeypatch.setattr(orc, "run", lambda *a, **k: argparse.Namespace(
+        returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(orc, "copy_images", lambda *a, **k: 0)
+    monkeypatch.setattr(orc, "cmd_commit", fake_commit)
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    ctx.record["outputs"]["sha"] = "d" * 40
+    with pytest.raises(orc.OnboardingPaused) as caught:
+        orc.step_deploy_prod(ctx)
+    assert seen["via_pr"] is True and seen["env"] == "prod"
+    assert caught.value.state == "PENDING_PROD_APPROVAL"
+    assert ctx.record["outputs"]["prodPullRequest"] == "https://github.com/x/y/pull/1"
+
+
+def _prod_config_fixture(tmp_path: Path) -> Path:
+    config = tmp_path / "config-prod"
+    (config / "prod").mkdir(parents=True, exist_ok=True)
+    (config / "prod" / "manifests.yaml").write_text("")
+    return config
+
+
+def test_prod_takes_the_images_from_the_staging_manifest_not_from_a_fresh_tag(tmp_path):
+    """Với `tagStrategy: content` mỗi workload mang nhãn riêng, nên "ảnh đã verify" không
+    phải MỘT giá trị mà là cả một bộ — chép từ manifest staging là cách duy nhất đúng."""
+    def deployment(name, image):
+        return {"apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": {"name": name},
+                "spec": {"template": {"spec": {"containers": [
+                    {"name": name, "image": image}]}}}}
+
+    staging = tmp_path / "staging.yaml"
+    prod = tmp_path / "prod.yaml"
+    orc.dump_all([deployment("backend", "r/donhang-backend:aaa"),
+                  deployment("frontend", "r/donhang-frontend:bbb")], staging)
+    orc.dump_all([deployment("backend", "r/donhang-backend:zzz"),
+                  deployment("frontend", "r/donhang-frontend:zzz")], prod)
+    assert orc.copy_images(staging, prod, "donhang") == 2
+    images = {d["metadata"]["name"]:
+              d["spec"]["template"]["spec"]["containers"][0]["image"]
+              for d in orc.load_all(prod)}
+    assert images == {"backend": "r/donhang-backend:aaa",
+                      "frontend": "r/donhang-frontend:bbb"}
+
+
+# ------------------------------------------------------------------------ state store
+def test_the_cluster_record_is_a_configmap_because_it_holds_no_secret_value(
+        tmp_path, onboarding_enabled, monkeypatch):
+    applied = {}
+
+    def fake_kubectl(args, **kw):
+        if args[0] == "apply":
+            applied.update(json.loads(kw["stdin"]))
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    monkeypatch.setattr(orc, "ensure_namespace", lambda *a, **k: None)
+    req = orc.validate_onboarding_request(onboarding_request(), "a.yaml", CATALOG)
+    store = orc.ClusterOnboardingStore("donhang")
+    store.write(orc.new_onboarding_record(req))
+    assert applied["kind"] == "ConfigMap"
+    assert applied["metadata"]["name"] == "idp-onboarding-donhang"
+    assert applied["metadata"]["namespace"] == orc.state_ns()
+    assert applied["metadata"]["labels"]["idp.platform/application"] == "donhang"
+    # bản ghi không được mang giá trị bí mật nào: chỉ đường dẫn, tên và trạng thái
+    assert "password" not in applied["data"]["record.json"]
+
+
+def test_the_onboarding_summary_tells_the_developer_what_they_asked_for(tmp_path,
+                                                                        onboarding_enabled):
+    ctx = onboard_ctx(tmp_path, onboarding_enabled)
+    ctx.record["state"] = "WAITING_FOR_USER_SECRETS"
+    ctx.record["steps"]["validate"] = {"status": "done"}
+    ctx.record["outputs"] = {
+        "appRepo": "https://github.com/o/donhang",
+        "configRepo": "https://github.com/o/idp-donhang-config",
+        "stagingUrls": ["http://donhang.staging.internal.dev"],
+        "database": {"staging": {"username": "app_backend",
+                                 "vaultPath": "kv/apps/donhang/staging/database"}},
+        "missingSecrets": [{"secret": "stripe", "keys": ["api_key"],
+                            "path": "kv/apps/donhang/staging/stripe"}],
+    }
+    text = orc.onboarding_summary(ctx.record)
+    assert "WAITING_FOR_USER_SECRETS" in text
+    assert "https://github.com/o/donhang" in text
+    assert "http://donhang.staging.internal.dev" in text
+    assert "app_backend" in text
+    assert "CÒN THIẾU: kv/apps/donhang/staging/stripe" in text
+
+
+def test_vault_key_names_never_return_the_values(monkeypatch):
+    """Hàm này tồn tại để trả lời "đã nạp chưa", và câu trả lời đó không cần biết bí mật
+    là gì. Trả về giá trị là mở một đường cho nó lọt vào log hoặc vào state."""
+    monkeypatch.setattr(orc, "vault_api",
+                        lambda *a, **k: (200, {"data": {"data": {"api_key": "sk-live-123"}}}))
+    names = orc.vault_secret_key_names("donhang", "staging", "stripe")
+    assert names == {"api_key"}
+    assert "sk-live-123" not in repr(names)

@@ -23,6 +23,80 @@
 
 ---
 
+## Đường ngắn nhất: một request, một lệnh (Phase 6)
+
+Mọi thứ dưới đây — Phần A, Phần B, Phần C — gộp thành **một máy trạng thái chạy lại được**.
+Viết một file request (mục 13.1 của `KE-HOACH-TRIEN-KHAI-SECRET-VA-APP-ONBOARDING.md`):
+
+```yaml
+apiVersion: idp.company/v1
+kind: OnboardingRequest
+
+application:
+  name: don-hang
+  owner: team-order
+  description: Quản lý đơn hàng
+
+stack:
+  id: node-fullstack
+  version: 1.0.0
+
+database:
+  enabled: true
+  profile: application
+
+routing:
+  visibility: internal
+
+environments:
+  staging: true
+  prod: true
+```
+
+Không hỏi namespace, đường dẫn Vault, tên Secret, StorageClass, địa chỉ registry hay
+resource database thô — **platform suy ra hết**. Rồi:
+
+```bash
+export VAULT_ADDR=... VAULT_TOKEN=...          # nửa Vault: token RIÊNG, không suy ra từ gh
+export REGISTRY_USER=... REGISTRY_PASS=...     # để tạo imagePullSecret
+python3 orchestrate.py --env-config platform.env.yaml onboard \
+  --request request-don-hang.yaml --work /tmp/onboard-don-hang
+```
+
+Nó chạy tuần tự: kiểm request → tạo kho ứng dụng từ stack (kèm `.github/workflows/ci.yaml`
+đã điền sẵn) → tạo kho cấu hình + hai nhánh + Fleet skeleton → namespace, ServiceAccount,
+VaultAuth, policy/role Vault → sinh credential database ghi thẳng vào Vault → build và đẩy
+ảnh → render staging, ghi vào kho cấu hình, đăng ký GitRepo → chờ cụm chạy thật.
+
+**Chạy lại bao nhiêu lần cũng được.** Bước đã xong thì bỏ qua; không có kho, namespace hay
+mật khẩu database thứ hai nào được tạo ra.
+
+Hai lần dừng là bình thường, không phải lỗi:
+
+| Trạng thái | Nghĩa | Làm gì |
+|---|---|---|
+| `WAITING_FOR_USER_SECRETS` | app đã deploy, còn thiếu bí mật của bên thứ ba | chạy đúng lệnh `secret-set` nó in ra, rồi chạy lại `onboard` |
+| `PENDING_PROD_APPROVAL` | pull request prod đã mở | người duyệt merge, rồi chạy lại `onboard-activate-prod` |
+
+Production là một **lệnh riêng**, không phải bước tiếp theo:
+
+```bash
+python3 orchestrate.py --env-config platform.env.yaml onboard-activate-prod \
+  --app don-hang --work /tmp/onboard-don-hang
+```
+
+Nó dựng tài nguyên prod, render prod bằng **đúng bộ ảnh staging đã được verify**, và luôn
+mở pull request — kể cả khi nhánh prod chưa bật bảo vệ. Bí mật **không** được sao chép từ
+staging sang prod: prod sẽ dừng ở `WAITING_FOR_USER_SECRETS` cho tới khi có người nạp.
+
+Xem đang ở đâu: `orchestrate.py onboard-status --app don-hang` (thêm `--json` để xem bản
+ghi đầy đủ). Trạng thái sống trong ConfigMap `idp-onboarding-<app>`.
+
+Phần còn lại của tài liệu này mô tả **từng việc onboarding làm thay bạn** — đọc khi cần
+hiểu, khi phải làm tay, hoặc khi một bước hỏng.
+
+---
+
 ## Đường tắt: chạy script thay vì làm tay Phần B
 
 Toàn bộ **Phần B** (dựng kho cấu hình, gieo hai nhánh, `fleet.yaml`, workflow verify, mời
@@ -181,6 +255,9 @@ Một dòng, là ref của repo platform mà app render theo.
 
 ### A4. `.github/workflows/ci.yaml`
 
+> `onboard` **sinh sẵn file này** (chọn đúng mẫu theo số workload, điền cả 4 dòng `env`).
+> Phần dưới chỉ cần đọc khi bạn tự dựng repo bằng tay.
+
 Mẫu nằm ngay trong repo platform, thư mục `templates/`. **Chọn đúng mẫu theo số service
 trong repo** — đây là chỗ sai dễ mắc, và nó hỏng ngay ở bước build:
 
@@ -202,17 +279,25 @@ Chép nhầm mẫu một-service cho repo nhiều service sẽ ra:
 > ai nhận mà cũng không báo lỗi gì rõ ràng. Trên GHES, đặt `CI_RUNNER_LABEL` ở **cấp tổ
 > chức** là mọi repo ứng dụng tự có.
 
-Sau khi chép, đổi 3 dòng:
+Sau khi chép, đổi 4 dòng đánh dấu `<-- SỬA`:
 
 ```yaml
 env:
   APP: demo                              # tên app
   IMAGE_NAME: demo                       # tên ảnh, có thể khác tên app
+  REGISTRY: <registry.path>              # khớp registry.path của platform.env.yaml
   PLATFORM_REPO: <org>/idp-platform      # ĐÚNG repo platform của bản cài này
 ```
 
-Quên dòng thứ ba thì CI gọi sang platform khác — **vẫn chạy thành công**, chỉ là triển khai
+Quên dòng cuối thì CI gọi sang platform khác — **vẫn chạy thành công**, chỉ là triển khai
 lên nhầm hạ tầng.
+
+> **CI hỏi platform CÁCH build, không tự đoán.** Bước `plan` gọi
+> `image-plan --with-build`, và platform trả về cả context lẫn đường dẫn Dockerfile cho
+> từng workload. Cần thế vì app sinh từ stack là monorepo: `backend/Dockerfile` có
+> `COPY shared/`, nên context phải là **gốc kho**. Bản mẫu trước đây gắn cứng
+> `docker build <workload>/` và mọi app golden path đều hỏng ở lần CI đầu tiên với
+> `shared: not found` — sau khi kho đã được tạo, tức ở chỗ tốn nhất.
 
 ---
 

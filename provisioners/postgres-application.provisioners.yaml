@@ -120,6 +120,14 @@
           retentionPolicy: "%%computed.database.backup.retention_days%%d"
           barmanObjectStore:
             destinationPath: %%database.backup.object_store_url%%
+            {{ if ne "%%database.backup.endpoint_url%%" "" }}
+            # Kho object KHÔNG phải AWS S3 (MinIO, Ceph, kho nội bộ của công ty). Thiếu
+            # dòng này thì barman gọi thẳng s3.amazonaws.com và hỏng ở một nơi không ai
+            # ngờ: cluster vẫn Ready, chỉ có WAL archiving là im lặng thất bại — tức là
+            # database chạy tốt nhưng KHÔNG phục hồi được, đúng thứ mà guard backup sinh
+            # ra để chặn.
+            endpointURL: %%database.backup.endpoint_url%%
+            {{ end }}
             {{ if ne "%%database.backup.credentials_secret%%" "" }}
             s3Credentials:
               accessKeyId:

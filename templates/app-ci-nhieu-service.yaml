@@ -107,7 +107,12 @@ jobs:
           # lược khai trong .idp/stack.yaml chỉ có hiệu lực khi cờ features.stack_onboarding
           # bật — không có config thì bước này tính ra `content` trong khi orchestrator tính
           # ra `commit`, và hai bên lệch tag nghĩa là Fleet apply một image chưa ai đẩy lên.
+          # --with-build: hỏi luôn CÁCH build, không chỉ tên ảnh. Context không phải lúc
+          # nào cũng là thư mục chứa Dockerfile — app sinh từ stack có gói dùng chung ở gốc
+          # kho, nên `docker build <workload>/` hỏng ngay ở npm install với "shared: not
+          # found". Platform biết điều đó (buildContext của component), CI thì không.
           python3 platform/orchestrate.py --env-config platform/platform.env.yaml image-plan \
+            --with-build --catalog platform \
             --app "$APP" --image "$IMAGE_NAME" --tag "$GITHUB_SHA" \
             --registry "$REGISTRY" --app-dir . > plan.json
           cat plan.json
@@ -129,12 +134,15 @@ jobs:
 
           NEED='[]'
           for w in $(jq -r 'keys[]' plan.json); do
-            ref=$(jq -r --arg w "$w" '.[$w]' plan.json)
+            ref=$(jq -r --arg w "$w" '.[$w].image' plan.json)
+            ctx=$(jq -r --arg w "$w" '.[$w].context' plan.json)
+            df=$(jq  -r --arg w "$w" '.[$w].dockerfile' plan.json)
             if exists "$ref"; then
               echo "  bỏ qua $w — $ref đã có"
             else
-              echo "  cần build $w — $ref"
-              NEED=$(jq -c --arg w "$w" --arg r "$ref" '. + [{workload:$w, ref:$r}]' <<<"$NEED")
+              echo "  cần build $w — $ref (context $ctx, dockerfile $df)"
+              NEED=$(jq -c --arg w "$w" --arg r "$ref" --arg c "$ctx" --arg d "$df" \
+                '. + [{workload:$w, ref:$r, context:$c, dockerfile:$d}]' <<<"$NEED")
             fi
           done
           echo "matrix=$NEED" >> "$GITHUB_OUTPUT"
@@ -164,7 +172,8 @@ jobs:
           set -euo pipefail
           REF="${{ matrix.ref }}"
           for attempt in 1 2 3; do
-            docker build -t "$REF" "${{ matrix.workload }}/" && break
+            docker build -f "${{ matrix.dockerfile }}" -t "$REF" \
+              "${{ matrix.context }}" && break
             [ "$attempt" = 3 ] && { echo "::error::build ${{ matrix.workload }} hỏng sau 3 lần"; exit 1; }
             echo "::warning::build ${{ matrix.workload }} hỏng (lần $attempt/3) — thử lại sau 20s"
             sleep 20
