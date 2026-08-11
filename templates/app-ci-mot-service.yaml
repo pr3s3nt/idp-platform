@@ -80,6 +80,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # CÔNG CỤ CỦA MÁY CHẠY — kiểm TRƯỚC, vì thiếu chúng thì lỗi rơi ra ở giữa một khối
+      # bash dài và không nói cho bạn biết phải cài gì. Runner do GitHub cấp luôn có đủ;
+      # runner tự dựng — tức MỌI cài đặt GitHub Enterprise Server — thì không có gì đảm bảo.
+      # Đo được trên một runner WSL sạch: `pip install` chết vì PEP 668, và ngay sau đó là
+      # `jq: command not found` giữa một khối bash dài.
+      - name: Kiểm công cụ của máy chạy
+        run: |
+          set -euo pipefail
+          missing=""
+          for t in python3 jq docker git; do
+            command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::máy chạy thiếu:$missing — cài lên runner rồi chạy lại (runner do GitHub cấp thì luôn có sẵn)"
+            exit 1
+          fi
+          # pyyaml: orchestrate.py import nó. `pip install` trên một bản Linux hiện đại bị
+          # PEP 668 CHẶN với "error: externally-managed-environment" — runner của GitHub thì
+          # không, nên lỗi này chỉ nổ ra ở môi trường thật. Có sẵn thì không cài lại; không
+          # có thì thử lần lượt ba cách, cách nào chạy được cũng được.
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "==> pyyaml đã có sẵn"
+          else
+            pip install --quiet pyyaml \
+              || pip install --quiet --user pyyaml \
+              || pip install --quiet --break-system-packages pyyaml
+            python3 -c 'import yaml'
+            echo "==> đã cài pyyaml"
+          fi
+
+
       # Dùng PAT chứ không phải GITHUB_TOKEN: cùng một token này còn phải dispatch chéo
       # sang idp-platform ở bước dưới, nên giữ một credential duy nhất cho dễ debug.
 
@@ -106,7 +137,6 @@ jobs:
         id: plan
         run: |
           set -euo pipefail
-          pip install --quiet pyyaml
           # --env-config LÀ BẮT BUỘC, dù bước này không đọc toạ độ hạ tầng nào. Chiến lược
           # đặt tag có thể tới từ .idp/stack.yaml, mà file đó chỉ có hiệu lực khi cờ
           # features.stack_onboarding bật — thiếu config thì CI tính ra một tag, còn
@@ -168,6 +198,12 @@ jobs:
     env:
       IMAGE_REF: ${{ needs.build.outputs.image }}
     steps:
+      # Job này chạy trên MÁY KHÁC với job trước (đó là toàn bộ lý do nó tách ra), nên
+      # công cụ phải được kiểm lại ở đây.
+      - name: Kiểm công cụ của máy chạy
+        run: |
+          command -v jq >/dev/null 2>&1 || { echo "::error::máy chạy thiếu jq"; exit 1; }
+
       - uses: actions/download-artifact@v4
         with:
           name: image

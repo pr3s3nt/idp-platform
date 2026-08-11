@@ -106,6 +106,7 @@ lấy trạng thái SỐNG:
 | 4 — Postgres capability | DB provider/operator production-grade | probe: tìm operator postgres; `kubectl get crd \| grep -iE 'postgres\|cnpg\|zalando'` |
 | 5 — Stack + score-compose | `score-compose` bản đã ghim + `docker` + `make` | `score-compose --version`; `docker info` |
 | 6 — Onboarding | Phase 2-5 chạy được + `gh` đã đăng nhập + kho object cho backup (nếu bật prod) | `gh auth status`; `kubectl -n object-store get deploy minio` |
+| 6 — CI của app trên runner tự dựng | `python3`, `jq`, `docker`, `git` trên máy chạy | `for t in python3 jq docker git; do command -v $t; done` |
 | chung — deploy tới cụm | Fleet + gateway (traefik) + storageClass | có trong output `thu-thap-ha-tang.sh` |
 
 **Dựng lại Vault/VSO trên harness (Phase 2) — một lệnh, chạy lại được nhiều lần:**

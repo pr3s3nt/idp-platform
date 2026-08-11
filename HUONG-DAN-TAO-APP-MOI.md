@@ -273,6 +273,16 @@ cp <repo-platform>/templates/app-ci-mot-service.yaml .github/workflows/ci.yaml
 Chép nhầm mẫu một-service cho repo nhiều service sẽ ra:
 `failed to read dockerfile: open Dockerfile: no such file or directory`.
 
+> ⚠️ **MÁY CHẠY PHẢI CÓ SẴN: `python3`, `jq`, `docker`, `git`.** Runner do GitHub cấp
+> luôn có đủ; runner tự dựng — tức **mọi** cài đặt GitHub Enterprise Server — thì không.
+> Đo trên một runner WSL sạch: `pip install pyyaml` chết vì PEP 668
+> (`error: externally-managed-environment`, chỉ có ở Linux hiện đại, không có trên runner
+> của GitHub), rồi `jq: command not found` rơi ra giữa một khối bash dài. Mẫu CI nay kiểm
+> bốn công cụ đó ở bước ĐẦU TIÊN và dừng sau vài giây với đúng tên thứ còn thiếu, thay vì
+> hỏng ở dòng thứ 40 với một thông báo nói về argparse. `pyyaml` thì nó tự cài, thử lần
+> lượt `pip`, `pip --user`, `pip --break-system-packages` — nhưng cài sẵn lên ảnh runner
+> vẫn tốt hơn.
+
 > ⚠️ **Đừng gắn cứng `runs-on`.** Cả hai mẫu đều đọc biến:
 > `runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}`. `ubuntu-latest` là runner do
 > GitHub.com cấp — **GitHub Enterprise Server không có nó**, workflow sẽ nằm chờ mãi không

@@ -4556,6 +4556,30 @@ def test_image_plan_keeps_its_old_shape_unless_asked_for_the_new_one(tmp_path, c
         "nginx": {"image": "r/a:t", "context": ".", "dockerfile": "Dockerfile"}}
 
 
+def test_the_shipped_ci_templates_check_their_runner_before_using_it():
+    """Đo được trên một self-hosted runner thật (WSL sạch): `pip install pyyaml` chết vì
+    PEP 668 `externally-managed-environment`, và ngay sau đó `jq: command not found` rơi ra
+    giữa một khối bash dài. Runner do GitHub cấp không bao giờ lộ hai lỗi này — nhưng trên
+    GHES thì runner tự dựng là đường DUY NHẤT."""
+    for name in ("app-ci-mot-service.yaml", "app-ci-nhieu-service.yaml"):
+        doc = yaml.safe_load((CATALOG / "templates" / name).read_text())
+        jobs = doc["jobs"]
+        first = next(iter(jobs))
+        names = [s.get("name", "") for s in jobs[first]["steps"]]
+        assert "Kiểm công cụ của máy chạy" in names, name
+        text = (CATALOG / "templates" / name).read_text()
+        # pip trần là chính cái chết trên PEP 668; phải có đường lùi.
+        assert "--break-system-packages" in text, name
+        assert re.search(r"pip install --quiet pyyaml\s*$", text, re.M) is None, name
+        # và mọi job dùng jq đều phải tự kiểm, vì chúng chạy trên MÁY KHÁC nhau.
+        for job_name, job in jobs.items():
+            body = yaml.safe_dump(job)
+            if "jq " in body and job_name != first:
+                assert "Kiểm công cụ của máy chạy" in [s.get("name", "")
+                                                       for s in job["steps"]], \
+                    f"{name}: job {job_name} dùng jq mà không kiểm"
+
+
 def test_the_shipped_ci_templates_ask_the_platform_how_to_build():
     """Mẫu nào gắn cứng context sẽ hỏng với mọi app sinh từ stack — và chỉ hỏng sau khi
     kho đã được tạo, tức là ở chỗ tốn nhất."""

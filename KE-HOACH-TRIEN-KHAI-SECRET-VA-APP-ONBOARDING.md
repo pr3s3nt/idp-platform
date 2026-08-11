@@ -683,9 +683,9 @@ duyệt hiện đại và systemd-resolved, nhưng một số cấu hình DNS n�
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `c03f5dc` (Phase 5).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **383 passed**
-(323 → 383, thêm 60 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** vì phase
-này sửa `provisioners/postgres-application.provisioners.yaml`: 383/383/383.
+Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **384 passed**
+(323 → 384, thêm 61 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** vì phase
+này sửa `provisioners/postgres-application.provisioners.yaml`: 384/384/384.
 
 Mô hình: onboarding là **một máy trạng thái có bản ghi nằm ngoài tiến trình** — ConfigMap
 `idp-onboarding-<app>` trong `cluster-state`. Mỗi bước kiểm-trước-khi-tạo và ghi kết quả
@@ -707,6 +707,7 @@ database), kho GitHub thật `pr3s3nt/donhang` + `pr3s3nt/idp-donhang-config`, c
 | Prod chạy đúng profile prod | sau khi nạp secret prod | Deployment **3/3** × 2, CNPG **3 instance** healthy, `/` → 200, backup: *"Continuous archiving is working"*, WAL thật nằm trong bucket |
 | Fleet không báo drift giả | `kubectl -n fleet-local get gitrepo` | sau khi sửa lỗi quantity: **1/1** cho cả staging lẫn prod |
 | CI do platform sinh chạy được trên GitHub | push một commit vào `dev` của kho fixture | run **success** cả 4 job: `plan` (platform trả `context: "."` + `dockerfile: backend/Dockerfile`), `build` × 2 (build từ gốc kho, thấy `shared/`), `dispatch`. Ảnh có thật trên GHCR (HTTP 200) |
+| CI chạy được trên RUNNER TỰ DỰNG, qua `vars.CI_RUNNER_LABEL` | đăng ký một self-hosted runner nhãn `idp-app-ci` cho kho fixture, đặt biến, chạy lại | **success** cả 4 job, `runner_name=idp-app-ci-wsl` cho từng job. Đây là đường DUY NHẤT trên GHES, và trước đó chưa từng được chạy |
 
 **Regression app legacy**: 4 cặp render (`simple-nginx`, `app-with-postgres` × staging/prod)
 baseline `36372b9` vs HEAD, render từ **bản sao** thư mục app: **giống nhau từng byte**.
@@ -788,6 +789,18 @@ Hai tag khác nhau cho một commit, đúng cái bẫy Phase 5 đã ghim test. N
 `write_app_ci_workflow` đọc `git show <nhánh mặc định>:orchestrate.py` và
 `:platform.env.yaml` rồi **cảnh báo tại chỗ sinh file** cho cả hai trường hợp.
 
+**Lỗi thật thứ mười hai — CI sinh ra không chạy nổi trên một runner tự dựng, và chỉ runner
+tự dựng mới lộ ra.** Hai thứ, cả hai đều vô hình trên runner do GitHub cấp:
+`pip install --quiet pyyaml` chết với `error: externally-managed-environment` (PEP 668 —
+mọi bản Linux hiện đại đều chặn cài gói vào system python), và `jq` không có sẵn nên
+`jq: command not found` rơi ra ở dòng thứ 47 của một khối bash. Trên GHES, runner tự dựng
+là đường **duy nhất**, nên đây không phải trường hợp hiếm mà là trường hợp mặc định của
+công ty. Nay hai mẫu CI mở đầu bằng một bước kiểm `python3/jq/docker/git` và dừng sau vài
+giây với `::error::máy chạy thiếu: jq`; `pyyaml` thì tự cài, thử lần lượt `pip`,
+`pip --user`, `pip --break-system-packages`. Mọi job dùng `jq` đều tự kiểm lại, vì chúng
+cố ý chạy trên những máy khác nhau. Đo cả hai chiều: thiếu jq → đỏ sau 4 giây với đúng tên
+công cụ; cài jq rồi chạy lại → xanh cả 4 job.
+
 Hạn chế còn lại: CI sinh ra đã chạy xanh trên GitHub, nhưng bằng một bản sao `ci.yaml`
 **trong kho fixture** được ghim vào nhánh phát triển (template trong `templates/` giữ
 nguyên `ref: main`); dòng đó chỉ đúng sau khi merge. Trong lúc thử, workflow orchestrator
@@ -808,6 +821,11 @@ onboarding có được dùng nó không; `database.backup.object_store_url` + `
 với Cluster** (CNPG không đọc chéo namespace); và nhánh prod của kho cấu hình có thật sự
 bật branch protection không — onboarding luôn mở pull request, nhưng chỉ GitHub mới chặn
 được một cú push thẳng của người khác.
+
+Và: **runner chạy CI của app phải có sẵn `python3`, `jq`, `docker`, `git`** (mẫu CI kiểm ở
+bước đầu và nói rõ thứ nào thiếu). Trên GHES không có `ubuntu-latest`, nên phải đặt biến
+`CI_RUNNER_LABEL` ở cấp tổ chức bằng nhãn của một runner có thật — đường này đã được chạy
+thử bằng một self-hosted runner dựng riêng, và cả 4 job đều xanh trên nó.
 
 **Thứ tự bắt buộc khi mang vào công ty**: merge nhánh này vào nhánh mặc định **trước** khi
 onboard app golden path đầu tiên, và bật `features.stack_onboarding` trong
