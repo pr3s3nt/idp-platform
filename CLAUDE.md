@@ -32,7 +32,7 @@ INFRASTRUCTURE VALUES HERE".
 - Giữ tương thích ngược; các comment "vì sao" là lịch sử lỗi đã trả giá — đọc trước khi đổi, đừng xoá.
 
 ## Tài liệu gốc
-- `HUONG-DAN-KIEM-THU.md` — harness (cách chạy, canh gì) + môi trường/cụm verify + probe hạ tầng sống (`tools/thu-thap-ha-tang.sh`).
+- `HUONG-DAN-KIEM-THU.md` — harness (cách chạy, canh gì) + **quy trình test một feature qua luồng thật (AI tự lái)** + môi trường/cụm verify + probe hạ tầng sống (`tools/thu-thap-ha-tang.sh`).
 - `HUONG-DAN-TRIEN-KHAI-APP-CHUAN.md` — đường chuẩn onboard một app tới staging (kèm bảng "Bẫy đã biết").
 - `TAI-LIEU-DU-AN.md` — thiết kế + lý do từng quyết định.
 - `docs/adr/` — quyết định kiến trúc (vd `0002-vault-only-secret-store.md`).

@@ -79,6 +79,56 @@ Mỗi "mảng" test canh một bất biến. Test đỏ ở mảng nào = bạn 
   `repository_dispatch` chạy `orchestrator.yaml`. Muốn kiểm tới cụm thì đối chiếu trực tiếp
   (`kubectl`, `gh api`) — xem `docs/orchestrator-contract.md`.
 
+## Test một FEATURE qua luồng thật (AI tự lái) — khi sửa orchestrate.py/catalog
+
+`pytest` xanh chỉ nói **logic** đúng (mục trên). Để biết một feature **chạy được**, phải cho nó
+đi hết luồng thật trên harness sống. Có một nút thắt và một cửa thoát:
+
+- **Nút thắt:** `repository_dispatch` (app CI gọi platform) LUÔN chạy code platform từ nhánh mặc
+  định `main` — nên code feature trên nhánh **chưa merge** không được chạy qua đường app-CI thường.
+- **Cửa thoát:** `workflow_dispatch` cho chọn ref. `gh workflow run orchestrator.yaml --ref <nhánh>`
+  chạy đúng `orchestrator.yaml` **và** checkout `orchestrate.py` **theo nhánh** (bước "Checkout
+  platform" không ghim `ref`). Đây là cách chạy code chưa merge trên runner + cụm thật.
+
+**Ranh giới cô lập = TÊN APP, không phải nhánh git.** Platform tách mọi tài nguyên theo tên app
+(`<app>-staging`, `idp-<app>-config`, state Secret theo app, đường Vault theo app). Nên luôn test
+bằng **một app tên-mới throwaway**; **không** trỏ run nhánh feature vào một app đang chạy — nó commit
+vào config repo của app đó → Fleet áp lên cụm → đổi app thật, và state dùng chung có thể làm run
+`main` sau đó đọc sai (vỡ bất biến tương thích ngược). Xong thì `offboard` app throwaway.
+
+### Vòng lặp phát triển (rẻ → đắt, mỗi lớp bắt một loại lỗi)
+
+| Lớp | AI làm gì | Bắt lỗi gì | Khi nào |
+|---|---|---|---|
+| 1. pytest | `pytest test_orchestrate.py` | logic render/commit/verify | mỗi lần sửa |
+| 2. `--ref` + ảnh thật | vòng dưới | render/deploy/state + tên ảnh, trên cụm thật | vài lần/ngày |
+| 3. CI dispatch → v2 | app test CI build+dispatch tới `idp-platform-v2` (main=feature) → `kind-v2` | khúc CI dựng payload `repository_dispatch` mà lớp 2 bỏ qua | trước khi merge |
+
+**Lớp 2 — vòng AI tự lái (ảnh thật, không để người chen giữa build và trigger):**
+
+```
+1. Đẩy code app test  ->  CI build + push ẢNH THẬT lên registry
+     (CI của app test nên là BUILD-ONLY: nếu nó tự dispatch, cú đó đi vào main = code cũ.
+      Tách vai rõ — CI lo build ảnh, AI lo trigger + verify.)
+2. Poll registry tới khi tag ảnh thật sự có mặt.                # chốt "đợi ảnh"
+3. gh workflow run orchestrator.yaml --ref <nhánh> \
+     -f app=<app-test> -f repo=<org/app-test> -f sha=<sha CI vừa build> -f env=staging
+4. Verify (đo, đừng tin):
+   - ảnh trong manifest render == ảnh thật trong registry       # chốt "khớp tên ảnh" (chống §6.14)
+   - rollout thật: updatedReplicas/observedGeneration
+   - curl qua gateway -> 200
+5. Sửa code -> đẩy nhánh -> lặp lại từ 1 (hoặc từ 3 nếu ảnh không đổi).
+```
+
+Ba "chốt" (đợi ảnh · khớp tên ảnh · đúng ref) là thứ khiến việc tách build khỏi trigger **an toàn
+khi một agent kỷ luật lái**: đọc giá trị thật thay vì tính lại, chờ điều kiện thay vì đoán. Đây
+chính là chỗ §6.14 (`TAI-LIEU-DU-AN.md`) từng hỏng vì hai bên tự tính tên ảnh rồi lệch nhau.
+
+**Lớp 3** phủ nốt khúc `repository_dispatch` thật: đưa code nhánh lên `main` của `idp-platform-v2`
+(`git push -f v2 <nhánh>:main` — v2 là platform test dùng-một-lần nên force-push thoải mái), trỏ CI
+app test dispatch tới v2, chạy trên `kind-v2` (tách hẳn kind-staging). Runner/cụm v2: xem memory dự
+án + `HUONG-DAN-CAI-DAT.md`.
+
 ## Môi trường verify & hạ tầng (đọc trước khi làm phase cần cụm)
 
 Một số phase (Vault/VSO, DB provider, score-compose…) cần hạ tầng thật, không chỉ pytest.
