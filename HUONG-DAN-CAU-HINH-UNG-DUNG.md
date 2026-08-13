@@ -158,10 +158,10 @@ lệnh nằm trong history của shell và trong `ps` của mọi user khác tr�
 export VAULT_ADDR=https://vault.<công-ty>   # địa chỉ BẠN gọi được, không phải của cụm
 export VAULT_TOKEN=...                      # token của BẠN, không bao giờ của CI
 
-python3 orchestrate.py secret-set --app payment-api --env staging \
+python3 idpctl secret-set --app payment-api --env staging \
   --name stripe --key api_key            # nhập ẩn, gõ hai lần
 
-printf '%s' "$KEY" | python3 orchestrate.py secret-set --app payment-api --env staging \
+printf '%s' "$KEY" | python3 idpctl secret-set --app payment-api --env staging \
   --name stripe --key api_key --stdin    # hoặc qua stdin
 ```
 

@@ -86,16 +86,16 @@ kubectl -n <ns> cp <pod-postgres-cũ>:/tmp/truoc-migrate.dump ./truoc-migrate.du
 Database mới lấy user/password từ Vault, không phải từ state:
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 idpctl --env-config platform.env.yaml \
   secret-set --app <app> --env <env> --name database --key password --generate --replace
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 idpctl --env-config platform.env.yaml \
   secret-set --app <app> --env <env> --name database --key username --stdin <<< "app_<workload>"
 ```
 
 ### Bước 4 — render với class mới, chấp nhận cluster rỗng, rồi CHƯA apply
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml render \
+python3 idpctl --env-config platform.env.yaml render \
   --app <app> --env <env> ... --accept-empty-database \
   --out ./config/<env>/manifests.yaml
 ```
@@ -181,7 +181,7 @@ seed), thì đường đi là **huỷ rồi dựng lại**, và tài liệu này
 là "migrate":
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml render \
+python3 idpctl --env-config platform.env.yaml render \
   --app <app> --env <env> ... --accept-empty-database
 ```
 

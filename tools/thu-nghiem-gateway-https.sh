@@ -82,7 +82,7 @@ resources:
       path: /
 EOF
 
-python3 orchestrate.py --env-config "$WORK/overlay.yaml" render \
+python3 idpctl --env-config "$WORK/overlay.yaml" render \
   --app echo --tag runtime --registry local.test/idp \
   --catalog . --app-dir "$WORK/app" --work "$WORK/work" \
   --state-file "$WORK/state.yaml" --env staging --out "$WORK/out.yaml" >/dev/null

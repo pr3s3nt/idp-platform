@@ -38,7 +38,7 @@ Ghi giá trị bằng đúng lệnh của platform, để đường dẫn không
 
 ```bash
 export VAULT_ADDR=... VAULT_TOKEN=...     # token có policy GHI, không phải token của VSO
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 idpctl --env-config platform.env.yaml \
   secret-set --app <app> --env <env> --name <tên> --key <khoá> --stdin
 ```
 

@@ -25,7 +25,7 @@ done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KCTX=(); [[ -n "$CONTEXT" ]] && KCTX=(--context "$CONTEXT")
 k() { kubectl "${KCTX[@]}" "$@"; }
-cfg() { python3 "$HERE/orchestrate.py" --env-config "$HERE/$ENV_CONFIG" config --get "$1" 2>/dev/null; }
+cfg() { python3 "$HERE/idpctl" --env-config "$HERE/$ENV_CONFIG" config --get "$1" 2>/dev/null; }
 
 PROVIDER=$(cfg database.provider)
 OPERATOR_NS=$(cfg database.operator_namespace)
@@ -62,11 +62,11 @@ XONG. Một app dùng database:
   1. score.yaml:   resources: {db: {type: postgres, class: application}}
   2. onboard Vault (Phase 2) rồi sinh credential — mật khẩu KHÔNG ai nhìn thấy:
 
-     python3 orchestrate.py secret-set --app <app> --env staging \\
-       --name \$(python3 orchestrate.py config --get database.credential_secret) \\
+     python3 idpctl secret-set --app <app> --env staging \\
+       --name \$(python3 idpctl config --get database.credential_secret) \\
        --key username --stdin --replace   <<< "app_<workload>"
-     python3 orchestrate.py secret-set --app <app> --env staging \\
-       --name \$(python3 orchestrate.py config --get database.credential_secret) \\
+     python3 idpctl secret-set --app <app> --env staging \\
+       --name \$(python3 idpctl config --get database.credential_secret) \\
        --key password --generate
 
   3. render + apply như bình thường; \`verify\` chờ Cluster báo Ready.

@@ -29,7 +29,7 @@ PF_PID=""
 VAULT_PORT=""
 VAULT_WAS_STOPPED=0
 K() { kubectl --context "$CONTEXT" "$@"; }
-O() { python3 "$HERE/orchestrate.py" --env-config "$HERE/platform.env.yaml" "$@"; }
+O() { python3 "$HERE/idpctl" --env-config "$HERE/platform.env.yaml" "$@"; }
 V() {
   K -n "$VAULT_NS" exec -i "$VAULT_POD" -- \
     env "VAULT_TOKEN=$DEV_ROOT_TOKEN" VAULT_ADDR=http://127.0.0.1:8200 vault "$@"

@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Stable command entrypoint for the internal developer platform."""
+
+from engine.cli import main
+
+
+if __name__ == "__main__":
+    main()

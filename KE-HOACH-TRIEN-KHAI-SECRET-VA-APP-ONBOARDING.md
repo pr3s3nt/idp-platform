@@ -50,7 +50,7 @@ Khi bắt đầu hoặc tiếp tục task:
 10. Khi context bị rút gọn hoặc task được tiếp tục ở phiên khác, mở lại file này, bảng trạng thái, branch hiện tại và `git diff` trước khi làm tiếp.
 11. **Được phép push `feature/secret-onboarding` lên `origin`** (người dùng cho phép ngày 2026-08-11). Không tạo PR hoặc merge vào `main` cho đến khi đạt điều kiện ở mục 0.3.3 và được người dùng yêu cầu riêng. Không truy cập hoặc thay đổi môi trường công ty trong task này.
 
-AI có thể dùng tác vụ/agent song song cho phần độc lập như Vault harness, stack fixtures hoặc review. Một agent chính phải sở hữu `orchestrate.py` và workflow chính để tránh hai implementation xung đột.
+AI có thể dùng tác vụ/agent song song cho phần độc lập như Vault harness, stack fixtures hoặc review. Một agent chính phải sở hữu `idpctl` và workflow chính để tránh hai implementation xung đột.
 
 #### 0.3.1. Tự tạo và bảo vệ development branch
 
@@ -102,7 +102,7 @@ Các điều cấm:
 - Không đổi branch name giữa các phase.
 - Không tạo một branch cho mỗi phase nếu chỉ có một agent chính làm tuần tự.
 
-Nếu dùng agent song song, agent phụ phải dùng worktree/branch con riêng và không cùng sửa `orchestrate.py` hoặc workflow chính. Agent chính chịu trách nhiệm review/cherry-pick thay đổi về `feature/secret-onboarding`.
+Nếu dùng agent song song, agent phụ phải dùng worktree/branch con riêng và không cùng sửa `idpctl` hoặc workflow chính. Agent chính chịu trách nhiệm review/cherry-pick thay đổi về `feature/secret-onboarding`.
 
 #### 0.3.2. Commit discipline trên development branch
 
@@ -172,7 +172,7 @@ Vì vậy một deploy-request thành công không chứng minh code mới trên
 
 ```text
 git branch --show-current phải là feature/secret-onboarding
-→ gọi trực tiếp orchestrate.py từ working tree hiện tại
+→ gọi trực tiếp idpctl từ working tree hiện tại
 → render bằng config local
 → apply/để Fleet reconcile vào namespace fixture local
 → chạy verify và smoke tests local
@@ -191,7 +191,7 @@ Nếu dùng GitHub Actions để test, chỉ dùng `workflow_dispatch` và chọ
 
 Không sửa tạm app templates từ `ref: main` sang feature branch rồi commit thay đổi đó. Nếu thật sự cần một workflow test branch, tạo test harness/workflow opt-in tách biệt và không ảnh hưởng app hiện tại.
 
-Cụ thể cho việc thử CI của một app fixture: sửa `ref:` trong bản sao `ci.yaml` **của chính kho fixture** (kho dùng xong xoá) để trỏ vào nhánh phát triển đã push. Đó không phải "sửa template rồi commit" — template trong `templates/` giữ nguyên `ref: main`. Và tắt tạm workflow orchestrator trên kho platform (`gh workflow disable orchestrator`) trong lúc thử, để job `dispatch` của app không kích hoạt một lần deploy bằng code của `main`; bật lại ngay sau đó.
+Cụ thể cho việc thử CI của một app fixture: sửa `ref:` trong bản sao `ci.yaml` **của chính kho fixture** (kho dùng xong xoá) để trỏ vào nhánh phát triển đã push. Đó không phải "sửa template rồi commit" — template trong `templates/` giữ nguyên `ref: main`. Và tắt tạm workflow deploy trên kho platform (`gh workflow disable deploy.yaml`) trong lúc thử, để job `dispatch` của app không kích hoạt một lần deploy bằng code của `main`; bật lại ngay sau đó.
 
 GitHub repository/organization Secrets không cần và không được copy giữa các branch. Secret chỉ có thể không được inject vì scope repository, GitHub Environment protection, fork PR hoặc reusable-workflow forwarding; đó là cấu hình GitHub, không phải dữ liệu thuộc branch.
 
@@ -258,9 +258,9 @@ Test đã chạy thật trên working tree của feature branch:
 
 | Lệnh | Kết quả |
 |---|---|
-| `python3 -m pytest test_orchestrate.py -q` (baseline, trước thay đổi) | 80 passed |
-| `python3 -m pytest test_orchestrate.py -q` (sau Phase 0) | **117 passed** |
-| `orchestrate.py --env-config platform.env.yaml preflight` | OK, khớp phiên bản đã ghim |
+| `python3 -m pytest test_engine.py -q` (baseline, trước thay đổi) | 80 passed |
+| `python3 -m pytest test_engine.py -q` (sau Phase 0) | **117 passed** |
+| `idpctl --env-config platform.env.yaml preflight` | OK, khớp phiên bản đã ghim |
 | `preflight --require-score-compose` | OK, score-compose 0.43.0 khớp |
 | `preflight` với pin sai (9.9.9) | Fail đúng như thiết kế, exit 1 |
 
@@ -271,7 +271,7 @@ Ba gate của Phase 0:
 3. **Placeholder trong `resources.*.params`** — `test_placeholders_resolve_inside_resource_params` xác nhận score-k8s 0.15.0 thật sự nội suy `${resources.hostname.host}` vào `params.host` của route. Golden path same-origin phụ thuộc vào điều này.
 
 File đã thay đổi: `.gitignore`, `platform.env.yaml`, `platform.env.company.yaml`,
-`orchestrate.py`, `test_orchestrate.py`, `docs/adr/*` (7 file mới).
+`idpctl`, `test_engine.py`, `docs/adr/*` (7 file mới).
 
 Config key mới: `ci.score_k8s_version`, `ci.score_compose_version`, `vault.*`,
 `database_profiles.*`, `features.*` (bốn cờ, tất cả `false`).
@@ -292,11 +292,11 @@ runner `platform-orchestrator`; tên KV mount và kv v1/v2 của Vault công ty;
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `3713b36` (Phase 0).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **180 passed**
+Unit + integration: `python3 -m pytest test_engine.py -q` → **180 passed**
 (117 → 180, thêm 63 test). Không có test nào bị skip.
 
 **Deploy và smoke test thật trên cụm `kind-staging`**, render bằng
-`python3 orchestrate.py` gọi trực tiếp từ working tree của feature branch — không dùng
+`python3 idpctl` gọi trực tiếp từ working tree của feature branch — không dùng
 `repository_dispatch`, không dùng workflow chạy `main`. Namespace fixture riêng
 `valuesdemo-staging` / `valuesdemo-prod`, đã xoá sau khi đo xong:
 
@@ -321,7 +321,7 @@ Promotion guard đo qua CLI thật:
 bằng worktree tại baseline `36372b9`, một lần bằng HEAD, dùng chung state file. Cả 4 cặp
 **giống nhau từng byte**.
 
-File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`,
+File đã thay đổi: `idpctl`, `test_engine.py`,
 `HUONG-DAN-CAU-HINH-UNG-DUNG.md` (mới).
 
 Config key mới: không có ngoài Phase 0. Tính năng bật bằng
@@ -344,7 +344,7 @@ tới giá trị hạ tầng nào.
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `a3a81cb` (sau Phase 1).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **220 passed**
+Unit + integration: `python3 -m pytest test_engine.py -q` → **220 passed**
 (180 → 220, thêm 40 test). Không có test nào bị skip.
 
 **Hạ tầng đã dựng thật trên cụm `kind-staging`** (probe trước khi làm xác nhận cả
@@ -355,7 +355,7 @@ namespace Vault):
 |---|---|---|
 | Vault (dev mode) | chart 0.34.0, Vault 2.0.3 | ns `vault`, KV v2 ở `kv`, kubernetes auth, audit device bật |
 | Vault Secrets Operator | 1.5.0 — đúng bản đã ghim | ns `vault-secrets-operator-system` |
-| VaultConnection + VaultAuthGlobal | sinh từ `platform.env.yaml` | `orchestrate.py vault-foundation --apply` |
+| VaultConnection + VaultAuthGlobal | sinh từ `platform.env.yaml` | `idpctl vault-foundation --apply` |
 
 Dựng lại được bằng một lệnh: `./tools/dung-vault-harness.sh --context kind-staging`
 (idempotent, mọi toạ độ đọc từ config, tự kiểm bằng `preflight` ở bước cuối).
@@ -386,7 +386,7 @@ không kèm namespace bị VSO 1.5.0 phân giải theo namespace của resource 
 hiện trong log controller, `kubectl apply` vẫn xanh. Platform nay luôn sinh dạng đầy đủ
 `<operator-ns>/<connection-name>`, có test ghim lại.
 
-File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
+File đã thay đổi: `idpctl`, `test_engine.py`, `platform.env.yaml`,
 `platform.env.company.yaml`, `tools/dung-vault-harness.sh` (mới),
 `docs/adr/0007-topo-vso-va-danh-tinh-verify.md` (mới), `docs/adr/README.md`,
 `HUONG-DAN-KIEM-THU.md`.
@@ -420,7 +420,7 @@ GHI cho `prod`; namespace của VSO nếu công ty cài chỗ khác; `allowed_na
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `17388f3` (Phase 2).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **247 passed**
+Unit + integration: `python3 -m pytest test_engine.py -q` → **247 passed**
 (220 → 247, thêm 27 test). Không có test nào bị skip.
 
 Cơ chế: `secretRef` trong `.score-values/values.yaml` nay sinh ra một `VaultStaticSecret`
@@ -429,7 +429,7 @@ biến qua `secretKeyRef`. Provisioner sinh ra dùng `{{ if eq .SourceWorkload }
 workload chỉ thấy Secret của chính nó.
 
 **Đo trên cụm `kind-staging`** với app fixture `secretdemo` (namespace riêng, đã xoá sau
-khi đo), render bằng `python3 orchestrate.py` gọi thẳng từ working tree của feature branch:
+khi đo), render bằng `python3 idpctl` gọi thẳng từ working tree của feature branch:
 
 | Kiểm chứng | Kết quả đo được |
 |---|---|
@@ -462,7 +462,7 @@ khôi phục). Cả 4 cặp **giống nhau từng byte**.
 Vault dưới dạng JSON — tức bộ lọc theo workload trở thành trang trí. Đo được vì Secret đích
 có `DATA=2` trong khi chỉ khai một khoá. Nay luôn sinh kèm `excludeRaw: true`, có test ghim.
 
-File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `HUONG-DAN-CAU-HINH-UNG-DUNG.md`.
+File đã thay đổi: `idpctl`, `test_engine.py`, `HUONG-DAN-CAU-HINH-UNG-DUNG.md`.
 
 Config key mới: không có. Lệnh mới: `secret-set` (ghi một khoá vào Vault; **không có cờ
 `--value`** — giá trị chỉ qua nhập ẩn hoặc stdin, vì tham số dòng lệnh nằm trong history và
@@ -489,7 +489,7 @@ Deployment/StatefulSet/DaemonSet — workload dạng khác cần cách khác.
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `0d808a4` (Phase 3).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **275 passed**
+Unit + integration: `python3 -m pytest test_engine.py -q` → **275 passed**
 (247 → 275, thêm 28 test). Không có test nào bị skip.
 
 Provider: **CloudNativePG** (chart 0.29.0 / operator 1.30.0) — đã cài lên `kind-staging`
@@ -555,7 +555,7 @@ một timeout được cấu hình bằng `0` thành giá trị mặc định �
 phải sai số liệu mà là **lệnh treo 10 phút thay vì fail ngay**; nó đã âm thầm cộng 60 giây
 vào mỗi lần chạy test suite từ Phase 3. Nay có `config_int()` và một test ghim.
 
-File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
+File đã thay đổi: `idpctl`, `test_engine.py`, `platform.env.yaml`,
 `platform.env.company.yaml`, `HUONG-DAN-CAU-HINH-UNG-DUNG.md`, `docs/adr/README.md`,
 `provisioners/postgres-application.provisioners.yaml` (mới),
 `provisioners/local.provisioners.yaml` (khai class tường minh),
@@ -587,7 +587,7 @@ một lần restore** trước khi cho app đầu tiên lên prod.
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `0416685` (Phase 4).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **323 passed**
+Unit + integration: `python3 -m pytest test_engine.py -q` → **323 passed**
 (275 → 323, thêm 48 test). Không có test nào bị skip. Chạy lại **ba lần liên tiếp** vì
 Phase 5 thêm provisioner mới: 323/323/323.
 
@@ -646,8 +646,8 @@ gọi `image-plan` **không truyền `--env-config`**, nên CI không nhìn th�
 `features.stack_onboarding`: CI tính ra `content` trong khi orchestrator tính ra `commit` —
 hai tag khác nhau cho một commit, và Fleet apply một image chưa ai đẩy lên. Có test ghim cả hai.
 
-File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
-`platform.env.company.yaml`, `.github/workflows/orchestrator.yaml`,
+File đã thay đổi: `idpctl`, `test_engine.py`, `platform.env.yaml`,
+`platform.env.company.yaml`, `.github/workflows/deploy.yaml`,
 `templates/app-ci-mot-service.yaml`, `templates/app-ci-nhieu-service.yaml`,
 `HUONG-DAN-KIEM-THU.md`, `HUONG-DAN-TAO-APP-MOI.md`, `docs/adr/README.md`,
 `docs/adr/0009-stack-catalog-va-phat-trien-local.md` (mới),
@@ -683,7 +683,7 @@ duyệt hiện đại và systemd-resolved, nhưng một số cấu hình DNS n�
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `c03f5dc` (Phase 5).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **384 passed**
+Unit + integration: `python3 -m pytest test_engine.py -q` → **384 passed**
 (323 → 384, thêm 61 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** vì phase
 này sửa `provisioners/postgres-application.provisioners.yaml`: 384/384/384.
 
@@ -693,7 +693,7 @@ ngay; "đang chờ người" là một trạng thái chứ không phải lỗi. 
 
 **Gate của Phase 6, đo bằng cách chạy thật** — app fixture `donhang` (`node-fullstack` +
 database), kho GitHub thật `pr3s3nt/donhang` + `pr3s3nt/idp-donhang-config`, cụm
-`kind-staging`, gọi `orchestrate.py` trực tiếp từ working tree của feature branch:
+`kind-staging`, gọi `idpctl` trực tiếp từ working tree của feature branch:
 
 | Gate | Cách đo | Kết quả |
 |---|---|---|
@@ -760,7 +760,7 @@ lúc tạo file. Và `--force-step` chỉ có ở `onboard`, thiếu ở `onboar
 production không sửa chữa được, người vận hành phải sửa tay bản ghi state — đúng thứ máy
 trạng thái sinh ra để khỏi phải làm.
 
-File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
+File đã thay đổi: `idpctl`, `test_engine.py`, `platform.env.yaml`,
 `platform.env.company.yaml`, `provisioners/postgres-application.provisioners.yaml`,
 `templates/app-ci-mot-service.yaml`, `templates/app-ci-nhieu-service.yaml`,
 `tools/dung-object-store-harness.sh` (mới), `docs/adr/0010-may-trang-thai-onboarding.md`
@@ -786,7 +786,7 @@ arguments: --with-build`, không một chữ nào nhắc tới merge. Chạy l�
 nhánh phát triển thì qua bước đó, nhưng **tính tag `content` trong khi orchestrator tính
 `commit`** — vì `platform.env.yaml` trên nhánh mặc định còn tắt `features.stack_onboarding`.
 Hai tag khác nhau cho một commit, đúng cái bẫy Phase 5 đã ghim test. Nay
-`write_app_ci_workflow` đọc `git show <nhánh mặc định>:orchestrate.py` và
+`write_app_ci_workflow` đọc `git show <nhánh mặc định>:idpctl` và
 `:platform.env.yaml` rồi **cảnh báo tại chỗ sinh file** cho cả hai trường hợp.
 
 **Lỗi thật thứ mười hai — CI sinh ra không chạy nổi trên một runner tự dựng, và chỉ runner
@@ -803,7 +803,7 @@ công cụ; cài jq rồi chạy lại → xanh cả 4 job.
 
 Hạn chế còn lại: CI sinh ra đã chạy xanh trên GitHub, nhưng bằng một bản sao `ci.yaml`
 **trong kho fixture** được ghim vào nhánh phát triển (template trong `templates/` giữ
-nguyên `ref: main`); dòng đó chỉ đúng sau khi merge. Trong lúc thử, workflow orchestrator
+nguyên `ref: main`); dòng đó chỉ đúng sau khi merge. Trong lúc thử, workflow deploy
 của kho platform bị **tắt tạm** (`gh workflow disable`) để job `dispatch` không kích hoạt
 một lần deploy bằng code của `main` trên self-hosted runner của chính máy này — đã bật lại
 và xác nhận `active`. `--images ci` (chờ CI đẩy ảnh) đã có nhưng chỉ chạy đường "ảnh chưa
@@ -838,7 +838,7 @@ chỉ hữu ích khi có người đọc log.
 
 Branch `feature/secret-onboarding`, verify từ working tree tại SHA `b608a96` (Phase 6).
 
-Unit + integration: `python3 -m pytest test_orchestrate.py -q` → **414 passed**
+Unit + integration: `python3 -m pytest test_engine.py -q` → **414 passed**
 (384 → 414, thêm 30 test). Không có test nào bị skip. Chạy **ba lần liên tiếp** ở mỗi lần
 chạm provisioner: 390/390/390 rồi 397/397/397.
 
@@ -973,7 +973,7 @@ ngay, một cái có **từ trước** thì phải chờ hết backoff.
 
 **Món nợ cũ đã trả (2): `--images ci` nay đã đo với CI THẬT.** Ban đầu tôi ghi nó vào "hạn
 chế còn lại" — sai, và người dùng chỉ ra đúng: mục 0.3.4 đã mô tả sẵn quy trình (ghim `ref:`
-trong bản sao `ci.yaml` của chính kho fixture, tắt tạm workflow orchestrator, bật lại ngay
+trong bản sao `ci.yaml` của chính kho fixture, tắt tạm workflow deploy, bật lại ngay
 sau), mục 0.6 nói rõ "công việc lớn" không phải stop condition, và quyền tạo kho đã được
 cấp. Không có gì cản; đó là đúng loại việc mà lỗi 8, 11 và 12 đều đã sinh ra.
 
@@ -1015,7 +1015,7 @@ lấy từ Vault **có tác dụng thật** (mọi thao tác ghi đòi `X-API-Ke
 `maxSinhVien=20`), ghi không kèm khoá → **401**, có khoá → **201**, sửa → 200, xoá → 204,
 xoá id không tồn tại → 404. Đường đi đầy đủ viết thành `add_app_guide.md`.
 
-**Món nợ cũ đã trả:** `docs/orchestrator-contract.md` — CLAUDE.md và HUONG-DAN-KIEM-THU.md
+**Món nợ cũ đã trả:** `docs/deployment-contract.md` — CLAUDE.md và HUONG-DAN-KIEM-THU.md
 đều trỏ tới file này nhưng nó chưa bao giờ tồn tại. Nay có: hợp đồng "portal gửi Ý ĐỊNH,
 không gửi toạ độ", những gì nền tảng đảm bảo, những gì nó **không** hứa, và quy trình verify
 trên cụm thật theo thứ tự rẻ-trước.
@@ -1026,10 +1026,10 @@ tính năng tắt: **giống nhau từng byte**. `examples/` không bị sửa. 
 (`sample-pg`, `sample-nginx`, `boutique`, `demo`, `helloworld`, `sample-boutique`) đều
 Running và cả sáu GitRepo đều **1/1** sau khi phase kết thúc.
 
-File đã thay đổi: `orchestrate.py`, `test_orchestrate.py`, `platform.env.yaml`,
+File đã thay đổi: `idpctl`, `test_engine.py`, `platform.env.yaml`,
 `platform.env.company.yaml`, `provisioners/postgres-application.provisioners.yaml`,
 `docs/chuyen-doi-postgres-sang-class-application.md` (mới),
-`docs/orchestrator-contract.md` (mới), `docs/canh-bao.md` (mới),
+`docs/deployment-contract.md` (mới), `docs/canh-bao.md` (mới),
 `docs/runbook/` (mới: README + 8 runbook), `tools/kiem-suc-khoe.sh` (mới).
 
 Config key mới: `database.backup.schedule`, `database.backup.first_backup_timeout_seconds`,
@@ -1161,7 +1161,7 @@ Kết quả mong muốn:
 
 ```mermaid
 flowchart LR
-    SCORE["score.yaml<br/>Nhu cầu của workload"] --> RENDER["orchestrate.py<br/>Resolve + validate"]
+    SCORE["score.yaml<br/>Nhu cầu của workload"] --> RENDER["idpctl<br/>Resolve + validate"]
     VALUES[".score-values/values.yaml<br/>Application + environment"] --> RENDER
     RENDER --> SCOREK8S["score-k8s<br/>Kubernetes manifests"]
     RENDER --> VSS["VaultStaticSecret<br/>Chỉ chứa metadata"]
@@ -2010,7 +2010,7 @@ Gate:
 
 Thay đổi chính:
 
-- Load/validate/resolve `.score-values/values.yaml` trong `orchestrate.py`.
+- Load/validate/resolve `.score-values/values.yaml` trong `idpctl`.
 - Tìm alias `type: environment` theo từng workload.
 - Sinh provisioner environment tạm thời.
 - Hỗ trợ literal config theo `staging`/`prod`.
@@ -2120,12 +2120,12 @@ Gate:
 
 | Khu vực | Thay đổi chính | Owner chính |
 |---|---|---|
-| `orchestrate.py` | Values loader/resolver, alias discovery, placeholder scanner, VSO generation, version check, prod digest guard, verify mở rộng | Platform Engineering |
-| `test_orchestrate.py` | Unit/integration fixtures cho values, secret, files, multi-workload, promotion và determinism | Platform Engineering |
+| `idpctl` | Values loader/resolver, alias discovery, placeholder scanner, VSO generation, version check, prod digest guard, verify mở rộng | Platform Engineering |
+| `test_engine.py` | Unit/integration fixtures cho values, secret, files, multi-workload, promotion và determinism | Platform Engineering |
 | `platform.env.yaml` | Vault config, pinned versions, DB profiles, timeout/SLO và security allowlist | Platform Engineering + Ops |
 | `platform.env.company.yaml` | Giá trị thật theo hạ tầng công ty; không chứa secret value | Platform Ops |
 | `provisioners/` | Environment provisioner được sinh/materialize; `postgres.application`; hạ class provisioner demo | Platform Engineering + DBA |
-| `.github/workflows/orchestrator.yaml` | Truyền `--app-dir` cho promotion, pinned tools, onboarding event, verify permissions | Platform Engineering |
+| `.github/workflows/deploy.yaml` | Truyền `--app-dir` cho promotion, pinned tools, onboarding event, verify permissions | Platform Engineering |
 | `tools/tao-app-moi.sh` | Tách thành các step có thể gọi lại; giữ tương thích CLI hiện tại | Platform Engineering |
 | `tools/idp-secret` | Hidden input/stdin, Vault path derivation, OIDC auth và thông báo an toàn | Platform Security |
 | `templates/stacks/` | Component templates và stack manifests có version | Developer Experience |

@@ -10,7 +10,7 @@
 #     cứng tên schema/owner mà chạy được local thì cũng chạy được trên staging.
 #   - Bộ output: host/port/name/database/username/password, đúng thứ tự và đúng tên khoá.
 # Major version thì phải khớp `database_profiles.<env>.application.engine_version`, và
-# `check_local_postgres_image()` trong orchestrate.py CHẶN nếu lệch.
+# `check_local_postgres_image()` trong idpctl CHẶN nếu lệch.
 #
 # ẢNH Ở ĐÂY LÀ `%%images.postgres%%`, KHÔNG PHẢI ảnh operand của CloudNativePG. Đã thử ảnh
 # kia và đo được: `ghcr.io/cloudnative-pg/postgresql:17` có CMD là `bash` và chạy bằng uid

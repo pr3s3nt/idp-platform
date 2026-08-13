@@ -414,7 +414,7 @@ manifest Kubernetes.
 | Kho | Ai ghi | Nội dung |
 |---|---|---|
 | App | người | `score.yaml`, `Dockerfile`, `platform.lock`, `ci.yaml` |
-| Platform | đội nền tảng | `orchestrate.py`, workflow, provisioners, patches |
+| Platform | đội nền tảng | `idpctl`, workflow, provisioners, patches |
 | Config | **máy** | manifest đã sinh. `dev` = staging, `main` = production |
 
 Đẩy code → CI build ảnh → gọi platform → platform render manifest → ghi vào repo cấu hình →

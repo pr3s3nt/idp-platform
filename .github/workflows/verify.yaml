@@ -1,0 +1,113 @@
+name: verify
+
+on:
+  repository_dispatch:
+    types: [verify-request]
+
+# Thin GitHub Actions adapter. Product logic is replayable through idpctl.
+# Infrastructure coordinates come from platform.env.yaml, never this workflow.
+
+env:
+  ENV_CONFIG: platform/platform.env.yaml
+
+jobs:
+  verify:
+    if: github.event.action == 'verify-request'
+    runs-on: [self-hosted, "${{ vars.RUNNER_LABEL || 'platform-orchestrator' }}"]
+    # Cùng nhóm hàng đợi với deploy của chính app đó. Không có dòng này, một lần verify có
+    # thể chạy chen vào giữa lúc deploy đang render và báo đỏ oan vì cụm đang dở dang.
+    concurrency:
+      group: app-${{ github.event.client_payload.app }}
+      cancel-in-progress: false
+    env:
+      APP: ${{ github.event.client_payload.app }}
+      DEPLOY_ENV: ${{ github.event.client_payload.env || 'prod' }}
+    steps:
+      - name: Checkout platform@main (renderer + workflow)
+        uses: actions/checkout@v4
+        with:
+          path: platform
+
+      # HAI ĐƯỜNG, ưu tiên BOT_TOKEN.
+      #   BOT_TOKEN  — PAT fine-grained của một tài khoản bot. Đơn giản nhất: không cần
+      #                App, không cần script. Giới hạn phạm vi bằng cách chỉ cấp cho token
+      #                đúng những repo IDP.
+      #   APP_ID/KEY — GitHub App, token sống 1 giờ và tự làm mới mỗi lần chạy.
+      #
+      # KHÔNG dùng actions/create-github-app-token cho đường App. Action đó KHÔNG nằm trong
+      # bộ action đi kèm GitHub Enterprise Server — đo thật trên GHES của công ty:
+      #   Error: Unable to resolve action `actions/create-github-app-token@v1`,
+      #          repository not found on this server.
+      # Script tự ký JWT bằng openssl rồi đổi lấy installation token — chạy được trên cả
+      # github.com lẫn GHES vì nó đọc GITHUB_API_URL do Actions tự đặt. MỘT đường code cho
+      # cả hai nơi, và sandbox chạy đúng thứ công ty chạy.
+      - name: Lấy token cho bot
+        id: app-token
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BOT_TOKEN:-}" ]; then
+            echo "::add-mask::$BOT_TOKEN"
+            echo "token=$BOT_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "==> dùng BOT_TOKEN (tài khoản bot)"
+          elif [ -n "${APP_ID:-}" ]; then
+            platform/tools/mint-app-token.sh
+          else
+            echo "::error::chưa có BOT_TOKEN lẫn APP_ID — không có danh tính nào để ghi vào repo cấu hình"
+            exit 1
+          fi
+
+      - name: Load environment config
+        run: |
+          set -euo pipefail
+          python3 platform/idpctl --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
+          echo "ORG=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
+          PATTERN=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
+          echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
+          BR=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$DEPLOY_ENV.config_branch" 2>/dev/null \
+               || python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.default_branch)
+          echo "CONFIG_BRANCH=$BR" >> "$GITHUB_ENV"
+          echo "==> kiểm $APP ở môi trường $DEPLOY_ENV (nhánh cấu hình $BR)"
+
+      # Cùng lý do như trong job deploy: phải ghi TRƯỚC khi có bất kỳ lệnh kubectl nào, nếu
+      # không nó lặng lẽ dùng kubeconfig cũ còn sót trong workspace và kiểm nhầm cụm.
+      - name: Write kubeconfigs
+        env:
+          STAGING_B64: ${{ secrets.KUBECONFIG_STAGING }}
+          PROD_B64: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "$STAGING_B64" | base64 -d > cluster-config-staging
+          echo "$PROD_B64"    | base64 -d > cluster-config-prod
+
+      # --require-cluster là cờ bật/tắt, không nhận tên tệp: nó đọc biến môi trường
+      # KUBECONFIG. Truyền tên tệp như một tham số thì argparse báo lỗi ngay.
+      - name: Preflight
+        run: python3 platform/idpctl --env-config "$ENV_CONFIG" preflight --require-cluster
+        env:
+          KUBECONFIG: ${{ github.workspace }}/cluster-config-${{ github.event.client_payload.env || 'prod' }}
+
+      # Lấy đúng nhánh môi trường, tức đúng thứ Fleet đang đồng bộ.
+      - name: Checkout config repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ORG }}/${{ env.CONFIG_REPO_NAME }}
+          ref: ${{ env.CONFIG_BRANCH }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: config
+
+      - name: Kiểm cụm thực sự chạy đúng thứ đang nằm trên nhánh
+        run: |
+          python3 platform/idpctl --env-config "$ENV_CONFIG" verify \
+            --app "$APP" --env "$DEPLOY_ENV" \
+            --manifests "config/$DEPLOY_ENV/manifests.yaml" \
+            --kubeconfig "cluster-config-$DEPLOY_ENV" --timeout 420
+
+      - name: Scrub kubeconfigs
+        if: always()
+        run: rm -f cluster-config-staging cluster-config-prod

@@ -41,7 +41,7 @@ Phân biệt ba lỗi rất giống nhau:
 In ra chính xác policy platform mong đợi, rồi so với cái đang có:
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 idpctl --env-config platform.env.yaml \
   vault-onboard --app <app> --env <env> --print-policy
 vault policy read idp-<app>-<env>-read
 ```
@@ -49,9 +49,9 @@ vault policy read idp-<app>-<env>-read
 Cấp lại phần Kubernetes và phần Vault:
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 idpctl --env-config platform.env.yaml \
   vault-onboard --app <app> --env <env> --apply        # ServiceAccount + VaultAuth
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 idpctl --env-config platform.env.yaml \
   vault-onboard --app <app> --env <env>                # in phần Vault Ops phải chạy
 ```
 
@@ -70,7 +70,7 @@ kubectl -n <app>-<env> get vaultstaticsecret \
 Kiểm luôn rào chắn còn nguyên — một app **không** được đọc tiền tố của app khác:
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 idpctl --env-config platform.env.yaml \
   verify-rbac --app <app> --env <env>
 ```
 

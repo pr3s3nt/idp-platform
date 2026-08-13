@@ -3,7 +3,7 @@
 #
 # VÌ SAO CÓ FILE NÀY: pytest chỉ chứng minh render đúng. Câu "StatefulSet chạy được" chỉ
 # đúng khi nó lên thật trên một cụm thật, PVC Bound thật, chạy được SQL thật, và dữ liệu
-# CÒN LẠI sau khi xoá pod. Script này lái đúng luồng đó bằng chính orchestrate.py render.
+# CÒN LẠI sau khi xoá pod. Script này lái đúng luồng đó bằng chính idpctl render.
 #
 # ĐÂY LÀ HARNESS — KHÔNG chạy ở công ty. Nó ánh xạ toạ độ công ty (StorageClass
 # rook-ceph-block, ảnh Harbor, credential qua Vault/VSO) sang tương đương LOCAL của cụm
@@ -87,7 +87,7 @@ resources:
     class: application
 EOF
 
-python3 orchestrate.py --env-config "$WORK/overlay.yaml" render \
+python3 idpctl --env-config "$WORK/overlay.yaml" render \
   --app "$APP" --tag runtime --registry local.test/idp \
   --catalog . --app-dir "$WORK/app" --work "$WORK/work" \
   --state-file "$WORK/state.yaml" --env "$ENVN" --out "$WORK/out.yaml" >/dev/null

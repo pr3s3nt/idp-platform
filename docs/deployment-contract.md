@@ -1,4 +1,4 @@
-# Hợp đồng portal ↔ orchestrator
+# Hợp đồng portal ↔ platform deployment engine
 
 Tài liệu này là **hợp đồng**: những gì một portal (hoặc bất kỳ thứ gì tự động hoá) được
 phép gửi tới nền tảng, và những gì nó được đảm bảo nhận lại. CLAUDE.md và
@@ -74,14 +74,14 @@ tác có chủ ý (`promote`), không phải hệ quả của việc gửi nhầ
 CI của app không được tự suy ra tên ảnh. Nó gọi:
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml image-plan \
+python3 idpctl --env-config platform.env.yaml image-plan \
   --app <app> --registry <registry> --tag <sha> --app-dir . --with-build
 ```
 
 và build đúng những gì lệnh đó trả về. Hai bên tính khác nhau nghĩa là Fleet apply một ảnh
 chưa ai đẩy lên — đã xảy ra hai lần trong chương trình này.
 
-**Mọi lệnh `orchestrate.py` trong CI/script phải truyền `--env-config`**, kể cả lệnh trông
+**Mọi lệnh `idpctl` trong CI/script phải truyền `--env-config`**, kể cả lệnh trông
 như không cần toạ độ: thiếu nó thì feature flag vô hình và hai bên tính ra hai kết quả.
 
 ### 2.4. Bí mật không bao giờ đi qua hợp đồng này
@@ -99,7 +99,7 @@ cấu hình không thay thế được nó.
 ### 2.6. Trạng thái đọc được từ ngoài
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml onboard-status --app <app>
+python3 idpctl --env-config platform.env.yaml onboard-status --app <app>
 ```
 
 Bản ghi nằm trong ConfigMap `idp-onboarding-<app>` ở namespace `kubernetes.state_namespace`
@@ -132,8 +132,8 @@ Thứ tự này là thứ tự các phase đã dùng, và nó phát hiện lỗi
 
 ```bash
 git branch --show-current && git rev-parse HEAD     # ghi vào evidence
-python3 -m pytest test_orchestrate.py -q            # thiếu score-k8s ⇒ ~26 test tự skip
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 -m pytest test_engine.py -q            # thiếu score-k8s ⇒ ~26 test tự skip
+python3 idpctl --env-config platform.env.yaml \
   preflight --require-cluster --require-vault --require-score-compose
 ```
 
@@ -145,7 +145,7 @@ provisioner nạp sau cùng, và lỗi loại này biểu hiện là test fail *
 ```bash
 # KHÔNG render thẳng vào examples/ — renderer ghi đè image tag vào score.yaml được track.
 cp -r examples/<app> /tmp/app-copy
-python3 orchestrate.py --env-config platform.env.yaml render \
+python3 idpctl --env-config platform.env.yaml render \
   --app <app> --env staging --registry <registry> --tag <sha> \
   --catalog . --app-dir /tmp/app-copy --work /tmp/work --out /tmp/manifests.yaml \
   --state-file /tmp/state.yaml
@@ -161,7 +161,7 @@ render từ **bản sao** thư mục app, với `features.*` tắt. Bốn cặp
 
 ```bash
 kubectl -n <app>-<env> apply -f /tmp/manifests.yaml
-python3 orchestrate.py --env-config platform.env.yaml verify \
+python3 idpctl --env-config platform.env.yaml verify \
   --app <app> --env <env> --manifests /tmp/manifests.yaml
 ```
 

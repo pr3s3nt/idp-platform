@@ -40,7 +40,7 @@ case "$ENV_CONFIG" in /*) CFG_PATH="$ENV_CONFIG" ;; *) CFG_PATH="$HERE/$ENV_CONF
 [[ -f "$CFG_PATH" ]] || { echo "không thấy $CFG_PATH" >&2; exit 2; }
 # `|| true`: một khoá rỗng KHÔNG phải lỗi (endpoint_url rỗng nghĩa là AWS S3), nhưng
 # `config --get` thoát 1 khi khoá không tồn tại và set -e sẽ giết script tại chỗ gán.
-cfg() { python3 "$HERE/orchestrate.py" --env-config "$CFG_PATH" config --get "$1" 2>/dev/null || true; }
+cfg() { python3 "$HERE/idpctl" --env-config "$CFG_PATH" config --get "$1" 2>/dev/null || true; }
 
 CRED_SECRET="$(cfg database.backup.credentials_secret)"
 STORAGE_CLASS="$(cfg kubernetes.storage_class)"

@@ -35,8 +35,8 @@
 # Đo trước khi sửa: một commit chỉ đụng .github/ vẫn build lại đủ 11 service (~13 phút máy
 # chủ) và làm cả 11 Deployment đổi image -> 11 pod restart, kể cả trên production.
 #
-# Quy tắc đặt tên image do orchestrate.py quyết định, KHÔNG chép lại ở đây: job `plan` gọi
-# `orchestrate.py image-plan` để hỏi. Nếu hai bên tự tính riêng rồi lệch nhau thì Fleet sẽ
+# Quy tắc đặt tên image do idpctl quyết định, KHÔNG chép lại ở đây: job `plan` gọi
+# `idpctl image-plan` để hỏi. Nếu hai bên tự tính riêng rồi lệch nhau thì Fleet sẽ
 # apply một manifest trỏ tới image chưa ai push, và chỉ phát hiện được khi pod chết.
 name: ci
 
@@ -86,7 +86,7 @@ jobs:
             echo "::error::máy chạy thiếu:$missing — cài lên runner rồi chạy lại (runner do GitHub cấp thì luôn có sẵn)"
             exit 1
           fi
-          # pyyaml: orchestrate.py import nó. `pip install` trên một bản Linux hiện đại bị
+          # pyyaml: idpctl import nó. `pip install` trên một bản Linux hiện đại bị
           # PEP 668 CHẶN với "error: externally-managed-environment" — runner của GitHub thì
           # không, nên lỗi này chỉ nổ ra ở môi trường thật. Có sẵn thì không cài lại; không
           # có thì thử lần lượt ba cách, cách nào chạy được cũng được.
@@ -116,9 +116,9 @@ jobs:
           repository: ${{ env.PLATFORM_REPO }}
           # LẤY Ở `main`, CỐ Ý — KHÔNG theo platform.lock.
           # platform.lock ghim CATALOG (provisioner, patch) tức DỮ LIỆU, không ghim CODE.
-          # Orchestrator luôn chạy orchestrate.py từ nhánh mặc định, vì GitHub chỉ chạy
+          # Orchestrator luôn chạy idpctl từ nhánh mặc định, vì GitHub chỉ chạy
           # workflow repository_dispatch từ đó. Nếu CI tính tên ảnh bằng một phiên bản
-          # orchestrate.py CŨ hơn, hai bên ra hai tên khác nhau ngay khi quy tắc đặt tên
+          # idpctl CŨ hơn, hai bên ra hai tên khác nhau ngay khi quy tắc đặt tên
           # đổi — CI đẩy nhãn cũ, manifest đòi nhãn mới, pod ImagePullBackOff. Hôm nay
           # chưa nổ chỉ vì mọi platform.lock đều đang ghi "main".
           ref: main
@@ -141,7 +141,7 @@ jobs:
           # nào cũng là thư mục chứa Dockerfile — app sinh từ stack có gói dùng chung ở gốc
           # kho, nên `docker build <workload>/` hỏng ngay ở npm install với "shared: not
           # found". Platform biết điều đó (buildContext của component), CI thì không.
-          python3 platform/orchestrate.py --env-config platform/platform.env.yaml image-plan \
+          python3 platform/idpctl --env-config platform/platform.env.yaml image-plan \
             --with-build --catalog platform \
             --app "$APP" --image "$IMAGE_NAME" --tag "$GITHUB_SHA" \
             --registry "$REGISTRY" --app-dir . > plan.json

@@ -1,11 +1,11 @@
 # CLAUDE.md — bối cảnh cho mọi phiên trên idp-platform
 
-Đọc khi sắp sửa `orchestrate.py`, catalog (`provisioners/`, `patches/`) hoặc `orchestrator.yaml`.
+Đọc khi sắp sửa `idpctl`, catalog (`provisioners/`, `patches/`) hoặc `deploy.yaml`.
 Ngắn gọn có chủ ý — chi tiết ở các tài liệu trỏ bên dưới. Đây là *vì sao* của những chỗ dễ vô
 tình phá, không phải thủ tục phải diễn.
 
 ## Hai lớp kiểm — đừng nhầm lớp này thành lớp kia
-- **pytest chỉ chứng minh *logic* đúng.** `python3 -m pytest test_orchestrate.py -v` (từ gốc
+- **pytest chỉ chứng minh *logic* đúng.** `python3 -m pytest test_engine.py -v` (từ gốc
   repo) kiểm render/commit/verify sinh ra đúng thứ mong đợi — nhanh, chạy local, không cần cụm.
   Test đỏ = vừa đổi một hành vi thật, đọc nó trước khi nới. Nhưng **xanh KHÔNG nghĩa app chạy
   được**: harness không đẩy gì lên cụm (xem `HUONG-DAN-KIEM-THU.md`).
@@ -18,7 +18,7 @@ Mục tiêu: mang nền tảng sang công ty khác chỉ bằng `platform.env.ya
 code. Nên giá trị hạ tầng/công ty (org, registry host, domain, context cụm, storage class,
 gateway, namespace…) đọc từ `platform.env.yaml` (`CONFIG.get(...)` / `--env-config`), không gán
 cứng vào `.py`/`.yaml`/`.sh`. Cần giá trị mới ⇒ thêm key vào `platform.env.yaml`. Code vốn đã
-giúp giữ điều này: `--registry`/`--image` không có default; `orchestrator.yaml` ghi "NO
+giúp giữ điều này: `--registry`/`--image` không có default; `deploy.yaml` ghi "NO
 INFRASTRUCTURE VALUES HERE".
 
 ## Các bất biến khác — và vì sao (comment tại chỗ giải thích kỹ hơn)
@@ -37,4 +37,4 @@ INFRASTRUCTURE VALUES HERE".
 - `HUONG-DAN-TRIEN-KHAI-APP-CHUAN.md` — đường chuẩn onboard một app tới staging (kèm bảng "Bẫy đã biết").
 - `TAI-LIEU-DU-AN.md` — thiết kế + lý do từng quyết định.
 - `docs/adr/` — quyết định kiến trúc (vd `0002-vault-only-secret-store.md`).
-- `docs/orchestrator-contract.md` — hợp đồng portal ↔ orchestrator + verify trên cụm thật.
+- `docs/deployment-contract.md` — hợp đồng portal ↔ deployment engine + verify trên cụm thật.

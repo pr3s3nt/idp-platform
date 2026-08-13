@@ -149,9 +149,9 @@ Score là một chuẩn mở để mô tả "ứng dụng cần gì" mà không 
 thật). Điều này giữ cho **giao diện với lập trình viên ổn định** kể cả khi hạ tầng bên dưới
 thay đổi.
 
-### 5.2. Orchestrator viết bằng Python, không phải Bash
+### 5.2. Deployment engine viết bằng Python, không phải Bash
 
-Script sinh manifest (`orchestrate.py`) cố tình **không đọc biến môi trường của GitHub**.
+Script sinh manifest (`idpctl`) cố tình **không đọc biến môi trường của GitHub**.
 Mọi thứ truyền vào qua tham số dòng lệnh.
 
 Lý do: khi một lần triển khai lỗi, kỹ sư có thể copy đúng dòng lệnh đó từ log, chạy lại trên
@@ -160,6 +160,24 @@ máy chủ và xem chuyện gì xảy ra. Nếu script đọc biến ngầm từ
 Bash bị loại vì nó nuốt lỗi quá dễ. Ví dụ đoạn bash cũ xử lý tạo secret dùng
 `2>/dev/null || echo "đã tồn tại"` — kiểu viết này nuốt luôn cả lỗi sai mật khẩu, lỗi mất
 kết nối cụm, lỗi gõ nhầm tên; báo triển khai thành công trong khi cụm không có gì.
+
+Code được giữ ở mức một monolith có cấu trúc, không chia thành nhiều service:
+
+| Phần | Trách nhiệm |
+|---|---|
+| `idpctl` | Entrypoint duy nhất cho người vận hành và GitHub Actions |
+| `engine/cli.py` | Khai báo CLI và chuyển lệnh tới logic tương ứng |
+| `engine/context.py` | Đọc profile, naming contract, chạy command, YAML plumbing |
+| `engine/render.py` | Score discovery, image plan, state và render manifest |
+| `engine/delivery.py` | Git, GitHub, Fleet, promote và verify rollout |
+| `engine/resources.py` | Vault/VSO, database, Secret, doctor và preflight |
+| `engine/values.py` | ApplicationValues và environment provisioner |
+| `engine/catalog.py` | Stack/component/capability catalog |
+| `engine/onboarding.py` | Vòng đời app và state machine onboarding đang bị kill-switch chặn |
+
+Workflow chỉ là adapter mỏng và được đặt theo hành động: `deploy.yaml`, `promote.yaml`,
+`verify.yaml`. Vì vậy không còn hai thứ cùng mang tên “orchestrator”; logic có thể replay
+bằng `idpctl`, còn tên workflow cho biết chính xác hành động nào đã chạy.
 
 ### 5.3. Trạng thái để trong cụm, không để trong Git, không để trên máy chủ CI
 
@@ -889,7 +907,7 @@ Header của orchestrator ghi rõ: *"platform.lock ghim DỮ LIỆU, không ghim
 GitHub luôn chạy workflow từ nhánh mặc định, nên ghim script sẽ khiến nó lệch với các tham
 số mà workflow truyền vào.
 
-Nhưng CI của ứng dụng lại đang dùng `platform.lock` để ghim **chính `orchestrate.py`** khi
+Nhưng CI của ứng dụng lại đang dùng `platform.lock` để ghim **chính `idpctl`** khi
 chạy `image-plan`:
 
 ```yaml
@@ -908,7 +926,7 @@ Tệ hơn ở kho nhiều service: bước kiểm "ảnh đã tồn tại chưa"
 bản cũ, nên nó kiểm nhãn cũ, thấy có, và **bỏ qua build**. Cơ chế phòng vệ quay sang củng cố
 cho cái sai.
 
-Đã sửa: CI lấy `orchestrate.py` ở nhánh mặc định, còn `platform.lock` vẫn dùng cho catalog
+Đã sửa: CI lấy `idpctl` ở nhánh mặc định, còn `platform.lock` vẫn dùng cho catalog
 đúng như thiết kế. Sửa ở cả 8 kho ứng dụng, cả hai nhánh.
 
 #### Bỏ PAT khỏi bước đẩy image — thử và thất bại
@@ -1308,7 +1326,7 @@ Những điểm cần biết trước khi đưa lên môi trường thật:
 
 ```bash
 # Chạy bộ test
-cd idp && PYTHONPATH=<đường-dẫn-pytest> python3 -m pytest test_orchestrate.py -q
+cd idp && PYTHONPATH=<đường-dẫn-pytest> python3 -m pytest test_engine.py -q
 
 # Xem tình trạng các app trên cụm
 kubectl --kubeconfig <file> get bundle -n fleet-local

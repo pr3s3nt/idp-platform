@@ -1,6 +1,6 @@
-"""Tests for orchestrate.py.
+"""Tests for the IDP engine.
 
-Run from the idp repo root:  python -m pytest test_orchestrate.py -v
+Run from the idp repo root:  python -m pytest test_engine.py -v
 
 The state-stability tests shell out to a real score-k8s, so they need it on PATH along
 with the catalog in this repo (provisioners/ + patches/).
@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-import orchestrate as orc
+import engine as orc
 
 CATALOG = Path(__file__).parent
 # Tests render the real catalog, which now carries %%placeholders%%. Load the repo's own
@@ -1558,7 +1558,7 @@ def test_resource_name_is_stable_across_processes():
     object on every render — the exact churn the state store exists to prevent, sneaking
     back in through the naming function."""
     import sys as _sys
-    code = ("import orchestrate as o;"
+    code = ("import engine as o;"
             "print(o.resource_name('payment-api','staging','web','stripe'))")
     runs = {
         subprocess.run([_sys.executable, "-c", code], cwd=CATALOG, text=True,
@@ -1702,13 +1702,12 @@ def test_every_new_capability_is_off_by_default():
         "application_values", "vault_secrets", "postgres_application", "stack_onboarding"))
 
 
-def test_the_repos_own_config_ships_with_every_feature_off():
-    """platform.env.yaml is what the sandbox deploys with. If a flag lands on by accident,
-    the 'off by default' promise is only true for installs that have no config file."""
+def test_the_harness_profile_explicitly_enables_runtime_capabilities():
+    """Defaults remain off, while the harness opts in so its E2E tests exercise features."""
     shipped = orc.EnvConfig.load(str(CATALOG / "platform.env.yaml"))
     for name in ("application_values", "vault_secrets", "postgres_application",
                  "stack_onboarding"):
-        assert shipped.get(f"features.{name}") is False, name
+        assert shipped.get(f"features.{name}") is True, name
 
 
 def test_company_config_also_ships_with_every_feature_off():
@@ -2136,18 +2135,24 @@ def test_an_app_without_a_values_file_is_untouched(tmp_path):
 
 
 @needs_score_k8s
-def test_using_the_feature_while_it_is_off_fails_with_the_actual_fix(tmp_path):
+def test_using_the_feature_while_it_is_off_fails_with_the_actual_fix(tmp_path, monkeypatch):
     """score-k8s would say "not supported by any provisioner. Please implement a custom
     resource provisioner" — which sends the reader off to write one, when the answer is a
     one-line platform config change they cannot guess from that text."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["features"]["application_values"] = False
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
     app_dir = values_app(tmp_path, ENV_SCORE, ENV_VALUES)
     with pytest.raises(SystemExit, match="features.application_values"):
         render_env(tmp_path, app_dir, "staging", "w")
 
 
-def test_a_values_file_nobody_consumes_only_warns(tmp_path, capsys):
+def test_a_values_file_nobody_consumes_only_warns(tmp_path, capsys, monkeypatch):
     """No `type: environment` anywhere, so nothing is broken — but an inert config file
     that reports nothing is its own trap."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["features"]["application_values"] = False
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
     app_dir = tmp_path / "app"
     write(app_dir / "score.yaml", score_spec("web"))
     write(app_dir / ".score-values" / "values.yaml", ENV_VALUES)
@@ -2185,9 +2190,13 @@ def test_literal_file_is_mounted_from_a_configmap(tmp_path, values_enabled):
 
 
 @needs_score_k8s
-def test_a_secret_value_is_refused_while_vault_is_off(tmp_path, values_enabled):
+def test_a_secret_value_is_refused_while_vault_is_off(
+        tmp_path, values_enabled, monkeypatch):
     """Phase 3 wires these to Vault. Until then, refusing beats rendering a workload whose
     variable is simply absent."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["features"]["vault_secrets"] = False
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
     app_dir = values_app(tmp_path, ENV_SCORE, values_doc(
         application={"LOG_LEVEL": "info", "FEATURE_X": "false"},
         staging={"STRIPE_KEY": SECRET}))
@@ -3170,9 +3179,13 @@ def test_the_demo_database_is_still_allowed_in_staging(tmp_path, postgres_enable
 
 
 @pytest.mark.parametrize("klass", [None, "development"])
-def test_the_guard_is_inert_until_the_platform_adopts_the_capability(tmp_path, klass):
+def test_the_guard_is_inert_until_the_platform_adopts_the_capability(
+        tmp_path, klass, monkeypatch):
     """The brownfield promise: apps deployed before this existed keep rendering prod
     exactly as they always have, with features.postgres_application off."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["features"]["postgres_application"] = False
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
     orc.check_database_classes(pg_service(tmp_path, klass), "prod")
 
 
@@ -4249,10 +4262,13 @@ def test_the_stack_file_supplies_the_strategy_once_the_flag_is_on(tmp_path, stac
     assert orc.resolve_tag_strategy(dest, "") == "commit"
 
 
-def test_the_declared_strategy_is_inert_and_loud_while_the_flag_is_off(tmp_path, capsys,
-                                                                      values_enabled):
+def test_the_declared_strategy_is_inert_and_loud_while_the_flag_is_off(
+        tmp_path, capsys, values_enabled, monkeypatch):
     """Opt-in means opt-in. But silently ignoring it would ship stale images from a
     monorepo, so it says so."""
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["features"]["stack_onboarding"] = False
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
     dest = new_app(tmp_path)
     assert orc.resolve_tag_strategy(dest, "") == "content"
     assert "features.stack_onboarding is off" in capsys.readouterr().err
@@ -4284,7 +4300,11 @@ def test_stack_validate_catches_a_renamed_workload(tmp_path, stack_enabled):
         orc.cmd_stack_validate(args)
 
 
-def test_stack_validate_reports_a_capability_whose_flag_is_off(tmp_path, values_enabled):
+def test_stack_validate_reports_a_capability_whose_flag_is_off(
+        tmp_path, values_enabled, monkeypatch):
+    data = json.loads(json.dumps(orc.CONFIG.data))
+    data["features"]["postgres_application"] = False
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(data))
     dest = new_app(tmp_path)
     args = orc.argparse.Namespace(app_dir=str(dest), catalog=str(CATALOG))
     with pytest.raises(SystemExit, match="features.postgres_application"):
@@ -4519,12 +4539,12 @@ def test_the_shipped_ci_templates_let_the_platform_choose_the_strategy():
         assert "--tag-strategy" not in code, name
         assert 'tag_strategy:"' not in code, name
         assert "image-plan" in code, name
-        plan_call = code[code.index("orchestrate.py"):code.index("image-plan")]
+        plan_call = code[code.index("idpctl"):code.index("image-plan")]
         assert "--env-config" in plan_call, name
 
 
-def test_the_orchestrator_workflow_defers_to_the_app_when_the_payload_is_silent():
-    text = (CATALOG / ".github" / "workflows" / "orchestrator.yaml").read_text()
+def test_the_deploy_workflow_defers_to_the_app_when_the_payload_is_silent():
+    text = (CATALOG / ".github" / "workflows" / "deploy.yaml").read_text()
     assert "client_payload.tag_strategy || ''" in text
     assert "client_payload.tag_strategy || 'content'" not in text
 
@@ -4536,6 +4556,7 @@ def test_the_orchestrator_workflow_defers_to_the_app_when_the_payload_is_silent(
 def onboarding_enabled(monkeypatch):
     """Cấu hình thật của repo với bốn cờ bật — đúng thứ một công ty bật cho app pilot."""
     data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("onboarding", {})["enabled"] = True
     data.setdefault("features", {}).update(
         {"application_values": True, "vault_secrets": True,
          "postgres_application": True, "stack_onboarding": True})
@@ -4849,6 +4870,7 @@ def test_onboarding_refuses_to_start_when_the_platform_flag_is_off(tmp_path):
     """Nếu bỏ qua, một lần onboarding tạo kho + namespace + credential rồi mới phát hiện
     platform chưa bật tính năng — và không ai dọn đống đó."""
     data = json.loads(json.dumps(orc.CONFIG.data))
+    data.setdefault("onboarding", {})["enabled"] = True
     data.setdefault("features", {}).update({"stack_onboarding": False})
     old = orc.CONFIG
     orc.CONFIG = orc.EnvConfig(data)
@@ -4978,7 +5000,7 @@ def test_an_existing_repo_secret_is_left_alone(tmp_path, onboarding_enabled, mon
 
 def _fake_catalog_branch(monkeypatch, *, renderer: str, config: dict | None):
     """Giả lập nội dung ĐÃ COMMIT trên nhánh mặc định của catalog."""
-    files = {"orchestrate.py": renderer}
+    files = {"engine/cli.py": renderer}
     if config is not None:
         files["platform.env.yaml"] = yaml.safe_dump(config)
 
@@ -5646,7 +5668,7 @@ def _noncomment(text: str) -> str:
 def test_no_company_coordinates_leak_into_shared_source():
     """Company endpoints/identifiers live ONLY in platform.env.company.yaml. They must not
     appear in the renderer, the catalog, or the gap register."""
-    targets = [CATALOG / "orchestrate.py"]
+    targets = sorted((CATALOG / "engine").glob("*.py"))
     targets += sorted((CATALOG / "provisioners").glob("*.yaml"))
     targets += sorted((CATALOG / "patches").glob("*.tpl"))
     gap = CATALOG / "GAP-REGISTER.md"
@@ -5672,7 +5694,9 @@ def test_catalog_uses_placeholders_not_literal_infrastructure():
 def test_user_facing_github_host_is_not_hardcoded():
     """The only github.com literal in the renderer is the documented fallback default in
     git_server_url; every other user-facing URL derives from GITHUB_SERVER_URL."""
-    src = (CATALOG / "orchestrate.py").read_text().splitlines()
+    src = []
+    for path in sorted((CATALOG / "engine").glob("*.py")):
+        src.extend(path.read_text().splitlines())
     offenders = []
     for i, line in enumerate(src, 1):
         if "github.com" not in line:

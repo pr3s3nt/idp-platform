@@ -9,8 +9,8 @@ gì, chừa cái gì, và vì sao.
 Nền tảng được thiết kế để "toạ độ ở config, không ở code" (xem `CLAUDE.md`, luật số 1). Hệ quả
 khi port sang công ty:
 
-- **Code chép nguyên xi** — `orchestrate.py`, `.github/workflows/orchestrator.yaml`, `tools/`,
-  `templates/`, `provisioners/`, `patches/`, `test_orchestrate.py`. Code đã viết để chạy **cả
+- **Code chép nguyên xi** — `idpctl`, `.github/workflows/deploy.yaml`, `tools/`,
+  `templates/`, `provisioners/`, `patches/`, `test_engine.py`. Code đã viết để chạy **cả
   github.com lẫn GHES**: workflow dùng `GITHUB_SERVER_URL`/`GH_ENTERPRISE_TOKEN` và né
   `actions/create-github-app-token` (GHES không có); `tools/mint-app-token.sh` đọc `GITHUB_API_URL`;
   CI template đọc `vars.CI_RUNNER_LABEL || 'ubuntu-latest'`. **Không có "file github.com" nào phải
@@ -19,7 +19,7 @@ khi port sang công ty:
   runner đọc đúng file này (`ENV_CONFIG: platform/platform.env.yaml`).
 - Phần công ty còn lại **không phải file** mà là **biến + secret khai trên GHES** (xem cuối).
 
-> Ngoại lệ nhỏ, không chặn: `orchestrate.py` có vài chuỗi `https://github.com/...` gắn cứng
+> Ngoại lệ nhỏ, không chặn: `idpctl` có vài chuỗi `https://github.com/...` gắn cứng
 > (vd `onboarding_config_repo_url`) chỉ dùng để **in cho người đọc**, không dùng cho thao tác
 > git thật. Trên GHES nó in nhầm hostname trong thông báo — cosmetic, sửa sau cũng được.
 
@@ -73,6 +73,6 @@ Có sẵn `platform.env.company.yaml` làm bản mẫu tham chiếu các key.
 
 1. `git status` / `git diff` ở repo công ty — soi kỹ.
 2. Merge tay `platform.env.yaml` theo bảng trên.
-3. `python3 -m pytest test_orchestrate.py -q` — lớp 1 phải xanh (0 skip nếu đủ tool).
+3. `python3 -m pytest test_engine.py -q` — lớp 1 phải xanh (0 skip nếu đủ tool).
 4. Commit + mở pull request. Verify luồng thật theo `HUONG-DAN-KIEM-THU.md`
    ("Test một FEATURE qua luồng thật").

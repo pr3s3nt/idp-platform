@@ -14,7 +14,7 @@ Nhầm ba thứ này với nhau là nguồn gốc của phần lớn rollback sa
 ## 7A. Rollback một lần deploy (thường gặp nhất)
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml promote \
+python3 idpctl --env-config platform.env.yaml promote \
   --app <app> --image <image> --tag <tag-cũ-đã-chạy-tốt> --mode tag-only \
   --config-dir <checkout kho cấu hình>
 ```
@@ -48,7 +48,7 @@ tay — lần render sau sẽ ghi đè.
 ```bash
 # trong kho platform
 git checkout <commit catalog cũ> -- provisioners/ patches/ templates/
-python3 -m pytest test_orchestrate.py -q          # BẮT BUỘC
+python3 -m pytest test_engine.py -q          # BẮT BUỘC
 ```
 
 Sau đó render lại từng app. Kiểm bằng đối chứng byte, đúng cách các phase trước làm:
@@ -91,7 +91,7 @@ chủ ý. App chưa opt-in không thấy gì thay đổi.
 ## Xác minh đã xong
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml verify --app <app> --env <env> \
+python3 idpctl --env-config platform.env.yaml verify --app <app> --env <env> \
   --manifests <đường dẫn manifests.yaml>
 kubectl -n fleet-local get gitrepo      # 1/1
 ```

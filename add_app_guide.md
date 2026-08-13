@@ -5,7 +5,7 @@ thêm/sửa/xoá, có biến môi trường khác nhau giữa staging và prod, 
 Vault. Mọi lệnh dưới đây đã được chạy trên harness và cho ra kết quả ghi kèm.
 
 > Nếu bạn chỉ cần tra cứu contract: `HUONG-DAN-CAU-HINH-UNG-DUNG.md` (values/secret) và
-> `docs/orchestrator-contract.md` (portal ↔ orchestrator). Tài liệu này là đường đi.
+> `docs/deployment-contract.md` (portal ↔ deployment engine). Tài liệu này là đường đi.
 
 ---
 
@@ -13,7 +13,7 @@ Vault. Mọi lệnh dưới đây đã được chạy trên harness và cho ra 
 
 ```bash
 # Công cụ và cụm phải sẵn sàng — bước này bắt lỗi TRƯỚC khi tạo bất cứ thứ gì.
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 idpctl --env-config platform.env.yaml \
   preflight --require-cluster --require-vault
 ```
 
@@ -74,7 +74,7 @@ xảy ra khi bạn chạy `onboard-activate-prod`, và nó đi qua pull request 
 ## 2. Dựng khung và dừng lại để sửa code
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml onboard \
+python3 idpctl --env-config platform.env.yaml onboard \
   --request sinhvien.request.yaml --work ./onboard-sinhvien \
   --images ci --stop-after bootstrap-platform
 ```
@@ -150,7 +150,7 @@ trị thật không đi qua git, không đi qua manifest, không đi qua Score s
 ## 4. Nạp bí mật vào Vault
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml secret-set \
+python3 idpctl --env-config platform.env.yaml secret-set \
   --app sinhvien --env staging --name api-credentials --key api_key --stdin --replace
 ```
 
@@ -185,7 +185,7 @@ nếu hai bên tính khác nhau thì Fleet apply một ảnh chưa ai đẩy lê
 ## 6. Deploy staging
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml onboard \
+python3 idpctl --env-config platform.env.yaml onboard \
   --request sinhvien.request.yaml --work ./onboard-sinhvien --images ci
 ```
 
@@ -196,7 +196,7 @@ lệnh phải chạy — đó là **trạng thái**, không phải lỗi.
 Theo dõi:
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml onboard-status --app sinhvien
+python3 idpctl --env-config platform.env.yaml onboard-status --app sinhvien
 kubectl -n sinhvien-staging get pods,vaultstaticsecret,cluster.postgresql.cnpg.io
 kubectl -n fleet-local get gitrepo | grep sinhvien      # phải 1/1
 ```
@@ -242,9 +242,9 @@ kubectl -n sinhvien-staging get cluster.postgresql.cnpg.io \
 ## 8. Kích hoạt prod
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml secret-set \
+python3 idpctl --env-config platform.env.yaml secret-set \
   --app sinhvien --env prod --name api-credentials --key api_key --stdin --replace
-python3 orchestrate.py --env-config platform.env.yaml \
+python3 idpctl --env-config platform.env.yaml \
   onboard-activate-prod --app sinhvien
 ```
 
@@ -276,7 +276,7 @@ nhiều ngày sau, vì một lý do không liên quan.
 ## 10. Những chỗ đã trả giá để biết
 
 - **Đừng render thẳng vào `examples/`** — renderer ghi đè image tag vào `score.yaml`.
-- **Mọi lệnh `orchestrate.py` trong CI/script phải truyền `--env-config`**, kể cả lệnh trông
+- **Mọi lệnh `idpctl` trong CI/script phải truyền `--env-config`**, kể cả lệnh trông
   như không cần toạ độ: thiếu nó thì feature flag vô hình và hai bên tính ra hai kết quả.
 - **Quantity của Kubernetes là CHUỖI.** `cpu: 1` (số) làm Fleet báo `Modified` vĩnh viễn
   trong khi cụm chạy đúng — và một bundle luôn đỏ là một bundle không ai còn đọc.

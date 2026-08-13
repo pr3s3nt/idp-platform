@@ -76,7 +76,7 @@ Câu thứ ba là chỗ lần chạy `dangky` đi vòng. Đọc kỹ mục 3.
 ## 1. Điều kiện tiên quyết
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml preflight --require-cluster --require-vault
+python3 idpctl --env-config platform.env.yaml preflight --require-cluster --require-vault
 ```
 
 Phải in `preflight OK`.
@@ -108,7 +108,7 @@ dùng chung một bản renderer. Hệ quả: tính năng chưa ở `main` thì 
 gọi lệnh `main` chưa có.
 
 ```bash
-git show main:orchestrate.py | grep -c "with-build"
+git show main:idpctl | grep -c "with-build"
 git show main:platform.env.yaml | grep stack_onboarding
 ```
 
@@ -117,10 +117,10 @@ Có cả hai → bỏ qua mục này. Không → làm hai việc:
 **2.1.** Đẩy một nhánh platform mô phỏng sau-merge (bật cờ trong `platform.env.yaml`), rồi
 **quay lại nhánh làm việc**. Mục 4 sẽ ghim `ci.yaml` của kho app vào nhánh này.
 
-**2.2.** Tắt workflow `orchestrator` của kho platform:
+**2.2.** Tắt workflow `deploy` của kho platform:
 
 ```bash
-gh workflow disable orchestrator -R <org>/<kho-platform>
+gh workflow disable deploy.yaml -R <org>/<kho-platform>
 ```
 
 Job cuối của CI bắn `repository_dispatch`; GitHub chạy workflow đó **từ nhánh mặc định**, tức
@@ -212,7 +212,7 @@ Prod giữ nguyên hình dạng công ty là **cố ý**: prod không cần mở
 ## 4. Sinh khung, rồi DỪNG để viết code
 
 ```bash
-python3 orchestrate.py --env-config "$CFG" onboard \
+python3 idpctl --env-config "$CFG" onboard \
   --request /tmp/$APP.request.yaml --work /tmp/onboard-$APP \
   --images ci --stop-after bootstrap-platform
 ```
@@ -305,7 +305,7 @@ ra cho tới lúc muộn.
 ### 5.4. Nạp bí mật vào Vault
 
 ```bash
-python3 orchestrate.py --env-config "$CFG" secret-set \
+python3 idpctl --env-config "$CFG" secret-set \
   --app $APP --env staging --name api-credentials --key api_key --stdin --replace <<< "..."
 ```
 
@@ -338,7 +338,7 @@ git diff --cached | grep -c "<giá-trị-bí-mật>"     # phải là 0
 ## 7. Deploy
 
 ```bash
-python3 orchestrate.py --env-config "$CFG" onboard \
+python3 idpctl --env-config "$CFG" onboard \
   --request /tmp/$APP.request.yaml --work /tmp/onboard-$APP --images ci
 ```
 
@@ -372,7 +372,7 @@ build (render theo đỉnh nhánh sẽ trỏ tới ảnh chưa ai đẩy). Phả
 
 ```bash
 export NS=$APP-staging
-python3 orchestrate.py --env-config "$CFG" onboard-status --app $APP
+python3 idpctl --env-config "$CFG" onboard-status --app $APP
 kubectl -n $NS get pods
 kubectl -n $NS get vaultstaticsecret -o custom-columns=NAME:.metadata.name,SYNCED:.status.conditions[0].status
 kubectl -n $NS get cluster.postgresql.cnpg.io -o jsonpath='{.items[*].status.firstRecoverabilityPoint}{"\n"}'
@@ -404,7 +404,7 @@ git -C /tmp/onboard-$APP/config-staging log --all -p | grep -c "<giá-trị>"   
 ```
 
 Cuối cùng, kiểm không có tài nguyên thủ công (script ở đầu tài liệu này), và **bật lại
-workflow orchestrator** nếu đã tắt ở mục 2.2.
+workflow deploy** nếu đã tắt ở mục 2.2.
 
 ---
 

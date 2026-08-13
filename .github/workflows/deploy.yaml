@@ -1,0 +1,371 @@
+name: deploy
+
+on:
+  repository_dispatch:
+    types: [deploy-request]
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "App name (drives config repo + namespaces), e.g. sample-nginx"
+        required: true
+      repo:
+        description: "App repo, e.g. org-team/platform-sample-app"
+        required: true
+      sha:
+        description: "Commit SHA to deploy (also the image tag)"
+        required: true
+      image:
+        description: "Registry image name (defaults to app)"
+        required: false
+      env:
+        description: "Môi trường đích"
+        required: false
+        default: staging
+        type: choice
+        options: [staging, prod]
+
+# Thin GitHub Actions adapter. Product logic is replayable through idpctl.
+# Infrastructure coordinates come from platform.env.yaml, never this workflow.
+
+env:
+  ENV_CONFIG: platform/platform.env.yaml
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.action == 'deploy-request'
+    runs-on: [self-hosted, "${{ vars.RUNNER_LABEL || 'platform-orchestrator' }}"]
+    # CONCURRENCY: every run touching the SAME APP queues sequentially. This does two jobs:
+    # it stops two quick commits rendering in parallel and writing the config repo out of
+    # order, and it serializes the read-modify-write of that app's state Secret. Different
+    # apps still run in parallel across runners.
+    concurrency:
+      group: app-${{ github.event.client_payload.app || inputs.app }}
+      cancel-in-progress: false
+    env:
+      APP: ${{ github.event.client_payload.app || inputs.app }}
+      APP_REPO: ${{ github.event.client_payload.repo || inputs.repo }}
+      SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+      IMAGE: ${{ github.event.client_payload.image || inputs.image || github.event.client_payload.app || inputs.app }}
+      # How each workload's image tag is chosen. EMPTY means "the payload did not say", and
+      # idpctl then reads `.idp/stack.yaml` before falling back to `content`. An app
+      # with no stack file therefore renders exactly as it always has.
+      TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || '' }}
+      # Môi trường đích. Mặc định staging: push lên nhánh phát triển của app chỉ đụng
+      # staging. Gửi env=prod khi app merge sang nhánh production.
+      DEPLOY_ENV: ${{ github.event.client_payload.env || inputs.env || 'staging' }}
+    steps:
+      - name: Checkout platform@main (renderer + workflow)
+        uses: actions/checkout@v4
+        with:
+          path: platform
+
+      # Mint một token của GitHub App cho ĐÚNG lần chạy này. Token sống 1 giờ rồi tự chết,
+      # và chỉ có quyền trên những repo App được cài — thay cho PAT cá nhân vốn có
+      # admin:org + delete_repo và không bao giờ hết hạn.
+      #
+      # Đây cũng là thứ làm cổng duyệt production hoạt động được: GitHub CHẶN tự duyệt pull
+      # request của chính mình, nên nếu PR do token của một người tạo ra mà người đó cũng là
+      # người duyệt thì không ai duyệt được.
+      # HAI ĐƯỜNG, ưu tiên BOT_TOKEN.
+      #   BOT_TOKEN  — PAT fine-grained của một tài khoản bot. Đơn giản nhất: không cần
+      #                App, không cần script. Giới hạn phạm vi bằng cách chỉ cấp cho token
+      #                đúng những repo IDP.
+      #   APP_ID/KEY — GitHub App, token sống 1 giờ và tự làm mới mỗi lần chạy.
+      #
+      # KHÔNG dùng actions/create-github-app-token cho đường App. Action đó KHÔNG nằm trong
+      # bộ action đi kèm GitHub Enterprise Server — đo thật trên GHES của công ty:
+      #   Error: Unable to resolve action `actions/create-github-app-token@v1`,
+      #          repository not found on this server.
+      # Script tự ký JWT bằng openssl rồi đổi lấy installation token — chạy được trên cả
+      # github.com lẫn GHES vì nó đọc GITHUB_API_URL do Actions tự đặt. MỘT đường code cho
+      # cả hai nơi, và sandbox chạy đúng thứ công ty chạy.
+      - name: Lấy token cho bot
+        id: app-token
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BOT_TOKEN:-}" ]; then
+            echo "::add-mask::$BOT_TOKEN"
+            echo "token=$BOT_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "==> dùng BOT_TOKEN (tài khoản bot)"
+          elif [ -n "${APP_ID:-}" ]; then
+            platform/tools/mint-app-token.sh
+          else
+            echo "::error::chưa có BOT_TOKEN lẫn APP_ID — không có danh tính nào để ghi vào repo cấu hình"
+            exit 1
+          fi
+
+      - name: Load environment config
+        run: |
+          set -euo pipefail
+          python3 platform/idpctl --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
+          echo "REGISTRY=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get registry.path)" >> "$GITHUB_ENV"
+          echo "ORG=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
+          # Tên repo cấu hình suy ra từ mẫu trong platform.env.yaml, không gắn cứng tiền tố.
+          PATTERN=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
+          echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
+          # Nhánh của repo cấu hình mà môi trường này ghi vào, và có phải đi qua PR không.
+          # Branch protection là chuyện của tổ chức, nên nó nằm trong cấu hình chứ không
+          # phải trong workflow.
+          ENVNAME="${DEPLOY_ENV:-prod}"
+          BR=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.config_branch" 2>/dev/null \
+               || python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.default_branch)
+          echo "CONFIG_BRANCH=$BR" >> "$GITHUB_ENV"
+          RP=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.require_pr" 2>/dev/null || echo False)
+          echo "REQUIRE_PR=$RP" >> "$GITHUB_ENV"
+          echo "==> $ENVNAME -> nhánh $BR, cần PR: $RP"
+
+      # PHẢI đứng trước Preflight: preflight --require-cluster đọc chính file này. Nếu ghi
+      # sau, trên runner sạch file chưa tồn tại nên kubectl bỏ qua KUBECONFIG và rơi về
+      # localhost:8080; còn trên runner đã chạy rồi thì nó lặng lẽ dùng kubeconfig CŨ còn
+      # sót trong workspace — preflight xanh nhưng đang kiểm tra nhầm cụm.
+      - name: Write kubeconfigs
+        env:
+          STAGING_B64: ${{ secrets.KUBECONFIG_STAGING }}
+          PROD_B64: ${{ secrets.KUBECONFIG_PROD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "$STAGING_B64" | base64 -d > cluster-config-staging
+          echo "$PROD_B64"    | base64 -d > cluster-config-prod
+
+      - name: Preflight
+        run: python3 platform/idpctl --env-config "$ENV_CONFIG" preflight --require-cluster
+        env:
+          KUBECONFIG: ${{ github.workspace }}/cluster-config-staging
+
+      - name: Checkout app repo at the exact commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.SHA }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: app
+          # Full history is REQUIRED by the ancestry guard in `commit`: with the default
+          # shallow clone, `git merge-base` cannot compare against the deployed SHA and the
+          # out-of-order protection silently degrades to a warning.
+          fetch-depth: 0
+
+      - name: Resolve catalog version (platform.lock)
+        id: lock
+        run: |
+          REF=$(grep -v '^#' app/platform.lock 2>/dev/null | head -1 | tr -d '[:space:]')
+          [ -n "$REF" ] || REF=main
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "==> app=${APP} pinned catalog: $REF"
+
+      - name: Checkout catalog (provisioners + patches) at the pinned ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.lock.outputs.ref }}
+          path: catalog
+
+      # Kho cấu hình phải TỒN TẠI trước khi checkout — actions/checkout hỏng ngay nếu
+      # chưa có, và thông báo của nó không nói gì về việc "kho chưa được tạo".
+      # Script này idempotent: có rồi thì bỏ qua, chưa có thì tạo kèm hai nhánh và
+      # fleet.yaml. Cùng một script mà người chạy tay khi đăng ký app mới.
+      #
+      # Bot cần quyền tạo repo trong tổ chức. KHÔNG có thì bước này hỏng kèm thông báo
+      # của gh — lúc đó chạy tay script này bằng tài khoản người là xong, phần còn lại
+      # của luồng không đổi.
+      - name: Bảo đảm kho cấu hình tồn tại
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ env.ORG }}
+          APP: ${{ env.APP }}
+          CONFIG_REPO: ${{ env.CONFIG_REPO_NAME }}
+          PLATFORM_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+          export NS_PATTERN="$(python3 platform/idpctl --env-config "$ENV_CONFIG" \
+            config --get kubernetes.namespace_pattern)"
+          # Nhãn máy chạy cho workflow verify trong kho cấu hình — đọc từ cấu hình, không
+          # phải từ nhãn của orchestrator. Job đó chỉ gọi API GitHub nên không cần chiếm
+          # runner riêng của platform. Nhiều nhãn thì cấu hình khai danh sách, và
+          # `config --get` in ra JSON (JSON là YAML hợp lệ nên dán thẳng vào runs-on được).
+          export VERIFY_RUNNER_LABEL="$(python3 platform/idpctl \
+            --env-config "$ENV_CONFIG" config --get ci.verify_runner_label)"
+          bash platform/tools/tao-app-moi.sh
+
+      - name: Checkout config repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ORG }}/${{ env.CONFIG_REPO_NAME }}
+          ref: ${{ env.CONFIG_BRANCH }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: config
+
+      - name: Render ${{ env.DEPLOY_ENV }}
+        run: |
+          python3 platform/idpctl --env-config "$ENV_CONFIG" render \
+            --app "$APP" --image "$IMAGE" --tag "$SHA" --env "$DEPLOY_ENV" \
+            --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
+            --catalog catalog --app-dir app --work work-staging \
+            --out "config/$DEPLOY_ENV/manifests.yaml" \
+            --kubeconfig "cluster-config-$DEPLOY_ENV"
+
+      # Bootstrap prod once so its Fleet bundle exists; afterwards prod only moves through an
+      # explicit promote-request.
+      # Chỉ có ý nghĩa khi prod dùng CHUNG nhánh repo cấu hình với môi trường đang deploy.
+      # Khi mỗi môi trường một nhánh (mô hình dev/main), manifest prod nằm ở nhánh khác nên
+      # không thể ghi từ đây — prod đi qua một lần deploy env=prod riêng, có duyệt.
+      - name: Bootstrap prod (first deploy only)
+        run: |
+          PROD_BRANCH=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get environments.prod.config_branch 2>/dev/null || echo "$CONFIG_BRANCH")
+          if [ "$PROD_BRANCH" != "$CONFIG_BRANCH" ]; then
+            echo "==> prod nằm ở nhánh $PROD_BRANCH, không phải $CONFIG_BRANCH -> bỏ qua, prod deploy riêng"
+            exit 0
+          fi
+          if [ "$DEPLOY_ENV" != "staging" ]; then
+            echo "==> đang deploy $DEPLOY_ENV, không phải staging -> không bootstrap"
+            exit 0
+          fi
+          if [ -f config/prod/manifests.yaml ]; then
+            echo "==> prod already bootstrapped, leaving it alone"
+            exit 0
+          fi
+          python3 platform/idpctl --env-config "$ENV_CONFIG" render \
+            --app "$APP" --image "$IMAGE" --tag "$SHA" --env prod \
+            --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
+            --catalog catalog --app-dir app --work work-prod \
+            --out config/prod/manifests.yaml \
+            --kubeconfig cluster-config-prod
+
+      - name: Apply secrets (${{ env.DEPLOY_ENV }})
+        run: |
+          python3 platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \
+            --app "$APP" --env "$DEPLOY_ENV" --secrets work-staging/secrets.yaml \
+            --harbor-host "${{ secrets.REGISTRY_HOST }}" \
+            --harbor-user "${{ secrets.REGISTRY_USER }}" \
+            --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
+            --kubeconfig "cluster-config-$DEPLOY_ENV"
+
+      - name: Apply secrets (prod, if bootstrapped this run)
+        run: |
+          [ -d work-prod ] || { echo "==> prod not rendered this run"; exit 0; }
+          python3 platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \
+            --app "$APP" --env prod --secrets work-prod/secrets.yaml \
+            --harbor-host "${{ secrets.REGISTRY_HOST }}" \
+            --harbor-user "${{ secrets.REGISTRY_USER }}" \
+            --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
+            --kubeconfig cluster-config-prod
+
+      - name: Commit & push config repo
+        id: commit
+        env:
+          # Bắt buộc: `gh pr create` bên trong idpctl phải chạy bằng token App.
+          # Không đặt thì nó rơi về gh auth có sẵn trên runner — tức tài khoản người, và
+          # pull request sẽ mang tên người đó thay vì App.
+          # gh đọc HAI biến khác nhau tuỳ máy chủ: GH_TOKEN cho github.com, còn
+          # GH_ENTERPRISE_TOKEN cho GitHub Enterprise Server. Đặt cả hai để cùng một
+          # workflow chạy được ở cả hai nơi. Chỉ đặt GH_TOKEN thì trên GHES gh coi như
+          # CHƯA đăng nhập — bước hỏi branch protection trả về rỗng (platform sẽ đoán là
+          # nhánh không được bảo vệ rồi push thẳng vào production), còn `gh pr create`
+          # thì hỏng hẳn.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # GH_HOST cần TÊN MÁY CHỦ, không phải URL — cắt bỏ phần https:// đi.
+          # Không đặt thì gh đoán từ git remote của thư mục đang đứng; đúng trong hầu hết
+          # trường hợp, nhưng khai tường minh thì không phụ thuộc vào việc đứng ở đâu.
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+          OUT=$(python3 platform/idpctl --env-config "$ENV_CONFIG" commit \
+            --config-dir config --app "$APP" --env "$DEPLOY_ENV" --sha "$SHA" \
+            --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}")
+          echo "$OUT"
+          # commit chỉ in URL ra stdout khi nó MỞ pull request. Có PR nghĩa là manifest
+          # chưa được merge, Fleet chưa thấy gì — kiểm cụm lúc này chắc chắn sai.
+          if echo "$OUT" | grep -q "^https://.*/pull/"; then
+            echo "pending_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fleet là thứ KÉO manifest từ git về cụm. Thiếu GitRepo thì mọi bước trên đều
+      # xanh, manifest nằm đúng trong repo cấu hình, mà cụm trống trơn — lỗi im lặng số
+      # một của cả hệ thống. Tạo ở đây để khỏi phải nhớ khi đăng ký app mới.
+      # Không bao giờ ghi đè: cụm thường có GitRepo của đội khác, đè lên là họ ngừng
+      # đồng bộ mà không báo gì.
+      - name: Đăng ký GitRepo với Fleet (tạo nếu chưa có)
+        env:
+          # Cần gh để hỏi kho cấu hình có riêng tư không — kho riêng tư mà thiếu thông tin
+          # đăng nhập cho Fleet thì hỏng chắc chắn, và hỏng ở chỗ không ai nhìn.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+          python3 platform/idpctl --env-config "$ENV_CONFIG" ensure-gitrepo \
+            --app "$APP" --env "$DEPLOY_ENV" --config-dir config \
+            --kubeconfig "cluster-config-$DEPLOY_ENV" --work work-staging
+
+      # CHỖ DUY NHẤT trong toàn luồng thực sự hỏi "ứng dụng có chạy không".
+      # Có bước này vì một sự cố thật: đổi cách đặt tên ảnh làm 5 app cùng
+      # ImagePullBackOff mà mọi bước đều báo xanh — manifest ghi đúng, Fleet đồng bộ
+      # không lỗi, chỉ pod là chết. Bước đối chiếu SHA phía dưới không nhìn vào cụm nên
+      # không thể bắt được.
+      - name: Kiểm cụm thực sự chạy đúng thứ vừa render
+        if: steps.commit.outputs.pending_pr != 'true'
+        run: |
+          python3 platform/idpctl --env-config "$ENV_CONFIG" verify \
+            --app "$APP" --env "$DEPLOY_ENV" \
+            --manifests "config/$DEPLOY_ENV/manifests.yaml" \
+            --kubeconfig "cluster-config-$DEPLOY_ENV" --timeout 420
+
+
+      # CONVERGENCE CHECK. GitHub keeps only one run pending per concurrency group, so a
+      # burst of pushes can leave the newest commit's run CANCELLED — and a cancelled run
+      # is not a failed one, so nothing anywhere goes red while staging quietly sits an
+      # older commit behind main. The app repos collapse bursts before dispatching, but
+      # that is their workflow, not ours; this is the platform noticing for itself.
+      # Deliberately a warning, not a failure: this deploy did exactly what it was asked to.
+      - name: Check staging reached the tip of the app branch
+        id: converged
+        run: |
+          set -euo pipefail
+          TIP=$(git -C app ls-remote origin HEAD | cut -f1)
+          echo "tip=$TIP" >> "$GITHUB_OUTPUT"
+          if [ -z "$TIP" ] || [ "$TIP" = "$SHA" ]; then
+            echo "==> staging is at the tip of the app branch"
+            exit 0
+          fi
+          git -C app fetch -q origin "$TIP" 2>/dev/null || true
+          if git -C app merge-base --is-ancestor "$SHA" "$TIP" 2>/dev/null; then
+            echo "::warning::staging deployed ${SHA} but ${APP} is now at ${TIP}. A newer run was most likely superseded in the concurrency queue — re-dispatch that commit to catch up."
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "==> ${TIP} is not a descendant of ${SHA} (branch moved sideways) — nothing to report"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### \`${APP}\` -> staging"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| commit | \`${SHA}\` |"
+            echo "| image | \`${REGISTRY}/${IMAGE}:${SHA}\` |"
+            echo "| catalog | \`${{ steps.lock.outputs.ref }}\` |"
+            echo "| namespace | \`${APP}-staging\` |"
+            echo "| config repo | \`${ORG}/${CONFIG_PREFIX}${APP}-config\` |"
+            echo "| runner | \`${RUNNER_NAME}\` |"
+            if [ "${{ steps.converged.outputs.behind }}" = "true" ]; then
+              echo ""
+              echo "> ⚠️ **staging is behind \`${APP}\`'s branch tip** (\`${{ steps.converged.outputs.tip }}\`)."
+              echo "> A newer deploy was superseded in the concurrency queue. Re-dispatch that commit."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Scrub kubeconfigs
+        if: always()
+        run: rm -f cluster-config-staging cluster-config-prod
+
+  # ===========================================================================
+  # PROMOTE: move prod to a tag (tag-only) or re-render prod from that commit
+  # ===========================================================================

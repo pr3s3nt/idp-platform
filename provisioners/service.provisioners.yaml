@@ -15,7 +15,7 @@
 # Kept in-tree rather than fetched by URL at render time so renders stay reproducible and
 # work on an air-gapped runner.
 #
-# IMPORTANT: the `fail "unknown workload"` below is why orchestrate.py generates every
+# IMPORTANT: the `fail "unknown workload"` below is why idpctl generates every
 # workload in a SINGLE `score-k8s generate` invocation. WorkloadServices is built from the
 # project state, so a workload referencing a peer that hasn't been generated yet errors out.
 #

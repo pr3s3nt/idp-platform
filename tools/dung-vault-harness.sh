@@ -5,7 +5,7 @@
 # biết trước. Công ty đã có Vault thật rồi — ở đó bạn KHÔNG chạy script này, bạn chỉ điền
 # `vault.*` trong platform.env.company.yaml rồi chạy phần cuối (`vault-foundation`).
 #
-# Mọi toạ độ đọc từ platform.env.yaml qua `orchestrate.py config --get`. Không có giá trị
+# Mọi toạ độ đọc từ platform.env.yaml qua `idpctl config --get`. Không có giá trị
 # hạ tầng nào viết cứng trong file này — đổi Vault/mount/namespace là sửa config, không
 # sửa script.
 #
@@ -29,7 +29,7 @@ done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KCTX=(); [[ -n "$CONTEXT" ]] && KCTX=(--context "$CONTEXT")
 k() { kubectl "${KCTX[@]}" "$@"; }
-cfg() { python3 "$HERE/orchestrate.py" --env-config "$HERE/$ENV_CONFIG" config --get "$1" 2>/dev/null; }
+cfg() { python3 "$HERE/idpctl" --env-config "$HERE/$ENV_CONFIG" config --get "$1" 2>/dev/null; }
 
 ADDRESS=$(cfg vault.address)
 OPERATOR_NS=$(cfg vault.operator_namespace)
@@ -97,19 +97,19 @@ helm upgrade --install vault-secrets-operator hashicorp/vault-secrets-operator \
 
 echo
 echo "===== 4. VaultConnection + VaultAuthGlobal (sinh từ platform.env.yaml) ====="
-python3 "$HERE/orchestrate.py" --env-config "$HERE/$ENV_CONFIG" vault-foundation --apply
+python3 "$HERE/idpctl" --env-config "$HERE/$ENV_CONFIG" vault-foundation --apply
 
 echo
 echo "===== 5. Kiểm lại bằng chính preflight của platform ====="
-python3 "$HERE/orchestrate.py" --env-config "$HERE/$ENV_CONFIG" \
+python3 "$HERE/idpctl" --env-config "$HERE/$ENV_CONFIG" \
   preflight --require-cluster --require-vault
 
 cat <<EOF
 
 XONG. Onboard một app vào Vault:
 
-  python3 orchestrate.py vault-onboard --app <app> --env staging --apply   # phía Kubernetes
-  python3 orchestrate.py vault-onboard --app <app> --env staging           # in phần Vault
+  python3 idpctl vault-onboard --app <app> --env staging --apply   # phía Kubernetes
+  python3 idpctl vault-onboard --app <app> --env staging           # in phần Vault
 
 Phần Vault (policy + role) do người quản trị Vault chạy bằng token CỦA HỌ. Trên harness:
 

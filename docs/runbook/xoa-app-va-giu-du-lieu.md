@@ -5,7 +5,7 @@ Workflow: `offboard` (mục 13.4). Mặc định nó **không xoá gì** — nó
 ## Bước 1 — xem trước, luôn luôn
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml offboard --app <app> --env <env>
+python3 idpctl --env-config platform.env.yaml offboard --app <app> --env <env>
 ```
 
 In ra hai danh sách: **SẼ XOÁ** và **SẼ GIỮ**, mỗi mục kèm lý do. Đọc cả hai. Danh sách
@@ -30,7 +30,7 @@ cố ý không bao giờ bị đụng tới.
 ## Bước 3 — xoá
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml offboard \
+python3 idpctl --env-config platform.env.yaml offboard \
   --app <app> --env <env> --execute --confirm <app>
 # prod:
   ... --execute --confirm <app> --approved-by <tên người duyệt>
@@ -93,7 +93,7 @@ vault policy delete idp-<app>-<env>-write
 kubectl get ns | grep <app>                       # không còn (hoặc Terminating)
 kubectl -n fleet-local get gitrepo | grep <app>   # không còn
 kubectl get all -A -l idp.platform/application=<app>
-python3 orchestrate.py --env-config platform.env.yaml onboard-status --app <app>   # DELETED
+python3 idpctl --env-config platform.env.yaml onboard-status --app <app>   # DELETED
 ```
 
 Và kiểm rằng thứ **phải còn** thì vẫn còn:

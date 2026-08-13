@@ -46,10 +46,10 @@ Hai bài học:
 ```bash
 ./tools/dung-vault-harness.sh --context <context>       # dựng lại mount + auth + VSO CR
 # rồi onboard lại từng app đang chạy:
-python3 orchestrate.py --env-config platform.env.yaml vault-onboard --app <app> --env <env> --apply
+python3 idpctl --env-config platform.env.yaml vault-onboard --app <app> --env <env> --apply
 #   + phần policy/role do Vault Ops chạy (lệnh in ra bởi lệnh trên, không có --apply)
 # rồi ghi lại bí mật — dev mode không giữ dữ liệu:
-python3 orchestrate.py --env-config platform.env.yaml secret-set ... --replace
+python3 idpctl --env-config platform.env.yaml secret-set ... --replace
 ```
 
 Muốn giữ nguyên mật khẩu database đang chạy (để CNPG không phải đổi mật khẩu role), ghi
@@ -57,7 +57,7 @@ lại **đúng giá trị đang có trong Secret** thay vì sinh mới:
 
 ```bash
 kubectl -n <app>-<env> get secret <cluster>-cred -o jsonpath='{.data.password}' | base64 -d \
-  | python3 orchestrate.py --env-config platform.env.yaml \
+  | python3 idpctl --env-config platform.env.yaml \
       secret-set --app <app> --env <env> --name database --key password --stdin --replace
 ```
 
@@ -74,7 +74,7 @@ Kiểm theo thứ tự — mỗi bước loại trừ bước sau:
 ## Xác minh đã xong
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml preflight --require-cluster --require-vault
+python3 idpctl --env-config platform.env.yaml preflight --require-cluster --require-vault
 kubectl -n <app>-<env> get vaultstaticsecret \
   -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.status.conditions[0].status}{"\n"}{end}'
 ```

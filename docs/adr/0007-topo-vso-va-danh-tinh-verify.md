@@ -50,7 +50,7 @@ của controller chứ không phải lúc `kubectl apply`. Vì vậy platform si
 
 **4. Verify dùng một danh tính riêng, không có quyền đọc Secret.**
 
-`orchestrate.py verify-rbac` sinh ServiceAccount + Role + RoleBinding chỉ có
+`idpctl verify-rbac` sinh ServiceAccount + Role + RoleBinding chỉ có
 `get/list/watch` trên: VSO CR, Deployment/StatefulSet/ReplicaSet, Pod/pod log/Service/
 Event, PVC, Job, HTTPRoute. Không có `secrets`.
 

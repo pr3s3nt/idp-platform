@@ -3,7 +3,7 @@
 #
 # Script dựng một OCI registry nhẹ trên Docker network của kind, sinh CA/credential ngẫu
 # nhiên trong thư mục tạm, push một image thật, rồi render workload bằng chính
-# orchestrate.py từ platform.env.company.yaml qua overlay runtime. Nó chứng minh cả hai
+# idpctl từ platform.env.company.yaml qua overlay runtime. Nó chứng minh cả hai
 # nửa supply chain: Docker/runner push được và kubelet pull được bằng imagePullSecret.
 # Mọi tài nguyên, CA và credential test đều được dọn khi kết thúc.
 #
@@ -42,6 +42,11 @@ cleanup() {
   if [[ -n "$IMAGE_REF" ]]; then
     docker image rm "$IMAGE_REF" >/dev/null 2>&1 || true
   fi
+  # registry:2 writes its bind-mounted data as root. Give the exact temporary tree back
+  # to the invoking user while the container still exists, otherwise the final rm leaves
+  # root-owned blobs behind and a passing harness still dirties /tmp.
+  docker exec "$REG_CONTAINER" chown -R "$(id -u):$(id -g)" /var/lib/registry \
+    >/dev/null 2>&1 || true
   docker rm -f "$REG_CONTAINER" >/dev/null 2>&1 || true
   if [[ -n "$NODE_CERT_DIR" ]]; then
     docker exec "$NODE" rm -f "$NODE_CERT_DIR/ca.crt" "$NODE_CERT_DIR/hosts.toml" \
@@ -177,7 +182,7 @@ printf '%s\n' \
   '  web:' \
   '    image: .' > "$WORK/app/score.yaml"
 
-python3 orchestrate.py --env-config "$WORK/overlay.yaml" render \
+python3 idpctl --env-config "$WORK/overlay.yaml" render \
   --app "$APP" --image private-nginx --tag runtime --registry "$REG_ADDR/idp" \
   --catalog . --app-dir "$WORK/app" --work "$WORK/render" \
   --state-file "$WORK/state.yaml" --env "$ENVN" --out "$WORK/out.yaml" >/dev/null
@@ -189,7 +194,7 @@ print("   manifest imagePullSecrets=registry-pull")
 PY
 
 echo "==> orchestrator tạo registry Secret, kubelet pull image private và rollout"
-if ! APPLY_OUTPUT=$(python3 orchestrate.py --env-config "$WORK/overlay.yaml" apply-secrets \
+if ! APPLY_OUTPUT=$(python3 idpctl --env-config "$WORK/overlay.yaml" apply-secrets \
   --app "$APP" --env "$ENVN" --secrets "$WORK/render/secrets.yaml" \
   --harbor-host "$REG_ADDR" --harbor-user "$REG_USER" --harbor-pass "$REG_PASS" 2>&1); then
   printf '%s\n' "${APPLY_OUTPUT//$REG_PASS/<redacted>}" >&2
@@ -205,7 +210,7 @@ fi
 printf '%s\n' "$APPLY_OUTPUT"
 K -n "$NS" apply -f "$WORK/out.yaml" >/dev/null
 K -n "$NS" rollout status deployment/regdemo --timeout=120s
-python3 orchestrate.py --env-config "$WORK/overlay.yaml" verify \
+python3 idpctl --env-config "$WORK/overlay.yaml" verify \
   --app "$APP" --env "$ENVN" --manifests "$WORK/out.yaml" --timeout 120 >/dev/null
 
 LIVE_IMAGE=$(K -n "$NS" get deployment regdemo -o jsonpath='{.spec.template.spec.containers[0].image}')

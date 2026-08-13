@@ -71,16 +71,16 @@ không phải giữa production — đó là cách *giảm tối đa* số vòng
 | `feature/secret-onboarding` HEAD = `6471344…` | `git rev-parse origin/feature/secret-onboarding` |
 | `main` HEAD = `18be8a1…` = feature + 1 commit "bật 4 cờ" | feature là ancestor của main; distance 42b8437..main = 32 |
 | Baseline công ty `42b8437` (2026-08-05) | feature đi trước 31 commit |
-| Thay đổi lớn nằm ở `orchestrate.py` (+6619 dòng), `test_orchestrate.py` (+3877), catalog + docs | `git diff --stat 42b8437..feature` |
+| Thay đổi lớn nằm ở `idpctl` (+6619 dòng), `test_engine.py` (+3877), catalog + docs | `git diff --stat 42b8437..feature` |
 | Subsystem mới (phase 0–7): toolchain pinning + naming contract; **ApplicationValues/ConfigMap**; **Vault/VSO** danh tính-theo-app; **secretRef→VaultStaticSecret**; **postgres class application (CNPG)** + credential qua Vault; golden path `node-fullstack` + `score-compose` local; **onboarding state machine** + duyệt prod; offboard; rotate-db-credential; backup/restore | commit log phase-0..phase-7 |
-| 4 cờ tính năng, **mặc định OFF**: `application_values`, `vault_secrets`, `postgres_application`, `stack_onboarding` | `orchestrate.py:155` + `features:` trong `platform.env.yaml` |
-| Config là nguồn toạ độ DUY NHẤT; `--registry`/`--image` không default; `orchestrator.yaml` ghi "NO INFRASTRUCTURE VALUES HERE" | `platform.env.yaml`, workflow header |
+| 4 cờ tính năng, **mặc định OFF**: `application_values`, `vault_secrets`, `postgres_application`, `stack_onboarding` | `idpctl:155` + `features:` trong `platform.env.yaml` |
+| Config là nguồn toạ độ DUY NHẤT; `--registry`/`--image` không default; `deploy.yaml` ghi "NO INFRASTRUCTURE VALUES HERE" | `platform.env.yaml`, workflow header |
 | Workflow đã GHES-aware | `GITHUB_SERVER_URL`, `GH_ENTERPRISE_TOKEN`, `tools/mint-app-token.sh` đọc `GITHUB_API_URL`, né `create-github-app-token` |
 | Đã có `platform.env.company.yaml` liệt kê ẩn số theo miền (`❓`) và mục đã xác nhận (`✅`) | ~30 dòng `❓/✅`, giá trị tạm dạng `*.invalid` để hỏng-là-rõ |
 | Đã có probe read-only sẵn: `tools/thu-thap-ha-tang.sh`, `tools/kiem-suc-khoe.sh` | `git ls-tree tools/` |
 | Catalog route dùng Gateway API, `parentRefs` đọc `%%ingress.gateway_name/namespace%%` | `provisioners/local.provisioners.yaml` route-traefik |
-| `preflight` hiện chỉ kiểm: tool tồn tại + version pin + cluster reachable + (tùy chọn) Vault foundation | `orchestrate.py:5944` |
-| 373 test, tất cả nạp **duy nhất** `platform.env.yaml` harness làm `orc.CONFIG` | `test_orchestrate.py:28`; **không** có profile công ty trong test |
+| `preflight` hiện chỉ kiểm: tool tồn tại + version pin + cluster reachable + (tùy chọn) Vault foundation | `idpctl:5944` |
+| 373 test, tất cả nạp **duy nhất** `platform.env.yaml` harness làm `orc.CONFIG` | `test_engine.py:28`; **không** có profile công ty trong test |
 | Trạng thái nhánh: `Ready for review`, chưa merge upstream | `BAO-CAO-SAN-SANG-MERGE.md:3` |
 
 ### Khe hở portability **ứng viên** đã thấy trong code (Codex xác nhận & phân loại ở M-B)
@@ -88,8 +88,8 @@ không phải giữa production — đó là cách *giảm tối đa* số vòng
 | # | Vị trí | Mô tả | Phân loại dự kiến |
 |---|---|---|---|
 | PG-1 | route provisioner (`parentRefs`) | Chỉ set `name`/`namespace`, **không có `sectionName`** (chọn listener) và **không xử lý scheme TLS**. Gateway Traefik công ty có thể có nhiều listener + `allowedRoutes` giới hạn namespace/hostname → HTTPRoute không attach vào đúng listener HTTPS. | `PORTABILITY_CODE_GAP` (cần key config `ingress.listener_name`/`ingress.route_scheme`) |
-| PG-2 | `orchestrate.py:5413/5538` `stagingUrls/prodUrls` | In URL cứng `http://` | `PORTABILITY_CODE_GAP` (thấp) — scheme nên theo config gateway |
-| PG-3 | `orchestrate.py:5770` `onboarding_config_repo_url` | Cứng `https://github.com/...`, sai host trên GHES (cosmetic, chỉ để in) | `PORTABILITY_CODE_GAP` (thấp) — dùng `GITHUB_SERVER_URL` |
+| PG-2 | `idpctl:5413/5538` `stagingUrls/prodUrls` | In URL cứng `http://` | `PORTABILITY_CODE_GAP` (thấp) — scheme nên theo config gateway |
+| PG-3 | `idpctl:5770` `onboarding_config_repo_url` | Cứng `https://github.com/...`, sai host trên GHES (cosmetic, chỉ để in) | `PORTABILITY_CODE_GAP` (thấp) — dùng `GITHUB_SERVER_URL` |
 | PG-4 | `preflight` | Không kiểm gateway/storageclass/CNPG/registry-pull/object-store/GHES-scope trước render | `PORTABILITY_CODE_GAP` (đòn bẩy chính giảm vòng lặp) |
 | PG-5 | test suite | Chỉ có harness profile; không có company-like profile matrix, không có hardcode-scan test | thiếu test bảo vệ portability |
 
@@ -354,7 +354,7 @@ Mục tiêu:
 Nơi chạy: trong công ty, kubeconfig staging (+ prod nếu có).
 Quyền: kubectl version/api-resources/api-versions/get/describe/auth can-i; kubectl get gitrepo -A/describe (read-only).
 Không: apply/create/delete; đọc `data` Secret; dán kubeconfig/token ra ngoài; sửa GitRepo đội khác.
-Đầu vào: kubeconfig; kubernetes.* + git.* trong platform.env.company.yaml. Đọc trước: tools/kiem-suc-khoe.sh; ensure-gitrepo trong orchestrate.py.
+Đầu vào: kubeconfig; kubernetes.* + git.* trong platform.env.company.yaml. Đọc trước: tools/kiem-suc-khoe.sh; ensure-gitrepo trong idpctl.
 Đầu ra: INTERNAL/EXTERNAL-kubernetes + INTERNAL/EXTERNAL-fleet (schema §7).
 Bằng chứng: version string; api-resources (đã lược); can-i matrix; `get gitrepo -A` (khử tên đội) + field clientSecret/caBundle (không giá trị).
 PASS: xác định version + có/không 4 CRD (+version) + quyền tạo ns/deploy + fleet_namespace + cơ chế credential + có/không CA.
@@ -420,7 +420,7 @@ Mục tiêu: GHES version; đường xác thực bot (GitHub App APP_ID/KEY hay 
   protection + tạo repo trong org không; ruleset ảnh hưởng push thẳng vs PR.
 Nơi chạy: công ty, gh CLI trỏ GHES (GH_HOST), token bot (KHÔNG log token).
 Quyền: gh api read-only (repos, branch protection, rulesets), gh auth status. Không: tạo repo thật; in token; đẩy commit.
-Đầu vào: git.* ; workflow (GH_ENTERPRISE_TOKEN, mint-app-token.sh). Đọc: .github/workflows/orchestrator.yaml; tools/mint-app-token.sh; tools/tao-app-moi.sh.
+Đầu vào: git.* ; workflow (GH_ENTERPRISE_TOKEN, mint-app-token.sh). Đọc: .github/workflows/deploy.yaml; tools/mint-app-token.sh; tools/tao-app-moi.sh.
 Đầu ra: INTERNAL/EXTERNAL-ghes.
 Bằng chứng: GHES version; JSON protection (khử tên repo/đội); scope token dạng liệt kê (không giá trị).
 PASS: biết đường xác thực + bypass + create-repo policy.
@@ -454,7 +454,7 @@ Dependency: không. Mở khóa: nuôi A4 (ảnh DB); đóng góp G1. Ước lư�
 Milestone M-B · Tổng hợp portability gap-register   (external Codex) — mở tại G1
 Mục tiêu: Ghép mọi EXTERNAL-*.yaml, đối chiếu source, phân loại từng finding (§6) → GAP-REGISTER.md +
   danh sách card cụ thể cho M-C/M-D. Không hard-code công ty; không nhận secret.
-Đầu vào: tất cả EXTERNAL-* đã sanitize. Đọc: orchestrate.py, provisioners/, patches/, templates/, workflows, platform.env*.yaml, test_orchestrate.py.
+Đầu vào: tất cả EXTERNAL-* đã sanitize. Đọc: idpctl, provisioners/, patches/, templates/, workflows, platform.env*.yaml, test_engine.py.
 Đầu ra: GAP-REGISTER.md (finding → classification → điểm sửa file:line) + backlog card M-C/M-D.
 PASS: mọi finding đúng MỘT loại, không loại "fork"; mỗi PORTABILITY_CODE_GAP kèm file:line.
 BLOCKED: thiếu EXTERNAL-* của miền chạm code (Gateway/Vault/Storage/Runner/Harbor).
@@ -526,7 +526,7 @@ kubeconfig, private key ra bất kỳ đâu; sửa GitRepo của đội khác; g
 bằng chứng; tự sửa/tạo tài nguyên hạ tầng.
 
 Cần đọc trước: tools/kiem-suc-khoe.sh (probe read-only có sẵn — ưu tiên tái dùng); hành vi
-ensure-gitrepo trong orchestrate.py (liệt-kê-rồi-khớp); khối kubernetes.* và git.* trong
+ensure-gitrepo trong idpctl (liệt-kê-rồi-khớp); khối kubernetes.* và git.* trong
 platform.env.yaml và platform.env.company.yaml.
 
 Các bước:

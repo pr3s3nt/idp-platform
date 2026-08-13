@@ -1,24 +1,24 @@
 # Harness kiểm thử — trạng thái hiện có
 
-Đọc file này TRƯỚC khi sửa `orchestrate.py`, catalog (`provisioners/`, `patches/`) hoặc
-`orchestrator.yaml`. Nó mô tả bộ kiểm thử đang có, cách chạy, nó bảo vệ điều gì, và cách
+Đọc file này TRƯỚC khi sửa `idpctl`, catalog (`provisioners/`, `patches/`) hoặc
+`deploy.yaml`. Nó mô tả bộ kiểm thử đang có, cách chạy, nó bảo vệ điều gì, và cách
 dùng nó để tự verify khi code thêm. Mục tiêu: một phiên mới không phá vỡ bất biến của dự án
 chỉ vì không biết có harness.
 
 ## Harness là gì (một câu)
 
-Là **hai lớp dùng chung source/catalog thật**: `test_orchestrate.py` kiểm logic nhanh, còn
+Là **hai lớp dùng chung source/catalog thật**: `test_engine.py` kiểm logic nhanh, còn
 `tools/dung-*-harness.sh` + `tools/thu-nghiem-*.sh` dựng capability trên các cụm `kind-*` và
 đo workload chạy thật. Pytest xanh không thay thế lớp runtime.
 
 ## Chạy thế nào
 
 ```bash
-# từ gốc repo idp-platform (nơi có orchestrate.py)
-python3 -m pytest test_orchestrate.py -v
+# từ gốc repo idp-platform (nơi có idpctl)
+python3 -m pytest test_engine.py -v
 ```
 
-- Test **import `orchestrate as orc`** ⇒ phải chạy ở thư mục có `orchestrate.py` (gốc repo).
+- Test **import `engine as orc`** ⇒ phải chạy ở thư mục có `engine/` (gốc repo).
 - Test **nạp `platform.env.yaml` của chính repo** để resolve `%%placeholder%%` ⇒ nó kiểm cả
   catalog + config thật, không phải mô hình giả.
 - Cần trên PATH: `score-k8s`, `kubectl`, `git`, `gh`, và `pyyaml` (import `yaml`).
@@ -59,11 +59,11 @@ Mỗi "mảng" test canh một bất biến. Test đỏ ở mảng nào = bạn 
 - `--state-file <path>`: giữ state trong file (`FileStateStore`) — dùng để test và replay tay
   trên runner. Đây là cách các test render mà không cần cụm.
 - `--no-state`: tắt persistence — **tái hiện đúng bug churn**, chỉ dùng để đối chứng trong test.
-- Kiểm nhanh runner đủ công cụ: `python3 orchestrate.py --env-config platform.env.yaml preflight`.
+- Kiểm nhanh runner đủ công cụ: `python3 idpctl --env-config platform.env.yaml preflight`.
 
 ## Cách một phiên mới DÙNG harness để verify (quy trình bắt buộc)
 
-1. **Trước khi coi là xong**, chạy full: `python3 -m pytest test_orchestrate.py -v`. Đỏ = hành vi sai.
+1. **Trước khi coi là xong**, chạy full: `python3 -m pytest test_engine.py -v`. Đỏ = hành vi sai.
 2. **Không bao giờ sửa/nới lỏng test cho pass.** Test đỏ nghĩa là code sai, không phải test sai.
    Nếu thật sự đổi hợp đồng có chủ ý, đổi test kèm lý do rõ ràng (và cập nhật ADR/tài liệu).
 3. **Thêm hành vi mới ⇒ thêm test** vào đúng mảng ở trên (đặt cạnh test cùng chủ đề). Ví dụ
@@ -76,18 +76,18 @@ Mỗi "mảng" test canh một bất biến. Test đỏ ở mảng nào = bạn 
   lên cụm thật. `pytest xanh` chỉ nghĩa "logic render/commit/verify đúng", **không** đảm bảo
   cụm đã chạy. Đúng như triết lý "mỗi lớp xanh độc lập" của dự án.
 - Lớp e2e thật nằm ngoài file này: các cụm `kind-staging`/`kind-prod` sống + các lần
-  `repository_dispatch` chạy `orchestrator.yaml`. Muốn kiểm tới cụm thì đối chiếu trực tiếp
-  (`kubectl`, `gh api`) — xem `docs/orchestrator-contract.md`.
+  `repository_dispatch` chạy `deploy.yaml`. Muốn kiểm tới cụm thì đối chiếu trực tiếp
+  (`kubectl`, `gh api`) — xem `docs/deployment-contract.md`.
 
-## Test một FEATURE qua luồng thật (AI tự lái) — khi sửa orchestrate.py/catalog
+## Test một FEATURE qua luồng thật (AI tự lái) — khi sửa idpctl/catalog
 
 `pytest` xanh chỉ nói **logic** đúng (mục trên). Để biết một feature **chạy được**, phải cho nó
 đi hết luồng thật trên harness sống. Có một nút thắt và một cửa thoát:
 
 - **Nút thắt:** `repository_dispatch` (app CI gọi platform) LUÔN chạy code platform từ nhánh mặc
   định `main` — nên code feature trên nhánh **chưa merge** không được chạy qua đường app-CI thường.
-- **Cửa thoát:** `workflow_dispatch` cho chọn ref. `gh workflow run orchestrator.yaml --ref <nhánh>`
-  chạy đúng `orchestrator.yaml` **và** checkout `orchestrate.py` **theo nhánh** (bước "Checkout
+- **Cửa thoát:** `workflow_dispatch` cho chọn ref. `gh workflow run deploy.yaml --ref <nhánh>`
+  chạy đúng `deploy.yaml` **và** checkout `idpctl` **theo nhánh** (bước "Checkout
   platform" không ghim `ref`). Đây là cách chạy code chưa merge trên runner + cụm thật.
 
 **Ranh giới cô lập = TÊN APP, không phải nhánh git.** Platform tách mọi tài nguyên theo tên app
@@ -100,7 +100,7 @@ vào config repo của app đó → Fleet áp lên cụm → đổi app thật, 
 
 | Lớp | AI làm gì | Bắt lỗi gì | Khi nào |
 |---|---|---|---|
-| 1. pytest | `pytest test_orchestrate.py` | logic render/commit/verify | mỗi lần sửa |
+| 1. pytest | `pytest test_engine.py` | logic render/commit/verify | mỗi lần sửa |
 | 2. `--ref` + ảnh thật | vòng dưới | render/deploy/state + tên ảnh, trên cụm thật | vài lần/ngày |
 | 3. CI dispatch → v2 | app test CI build+dispatch tới `idp-platform-v2` (main=feature) → `kind-v2` | khúc CI dựng payload `repository_dispatch` mà lớp 2 bỏ qua | trước khi merge |
 
@@ -111,7 +111,7 @@ vào config repo của app đó → Fleet áp lên cụm → đổi app thật, 
      (CI của app test nên là BUILD-ONLY: nếu nó tự dispatch, cú đó đi vào main = code cũ.
       Tách vai rõ — CI lo build ảnh, AI lo trigger + verify.)
 2. Poll registry tới khi tag ảnh thật sự có mặt.                # chốt "đợi ảnh"
-3. gh workflow run orchestrator.yaml --ref <nhánh> \
+3. gh workflow run deploy.yaml --ref <nhánh> \
      -f app=<app-test> -f repo=<org/app-test> -f sha=<sha CI vừa build> -f env=staging
 4. Verify (đo, đừng tin):
    - ảnh trong manifest render == ảnh thật trong registry       # chốt "khớp tên ảnh" (chống §6.14)
@@ -151,7 +151,7 @@ lấy trạng thái SỐNG:
 
 | Phase | Cần | Kiểm nhanh |
 |---|---|---|
-| 2 — Vault/VSO | VSO (CRD `secrets.hashicorp.com`) + một Vault + VaultConnection/Auth | `python3 orchestrate.py preflight --require-cluster --require-vault` (kiểm CRD + phiên bản VSO + hai object nền tảng, một lệnh) |
+| 2 — Vault/VSO | VSO (CRD `secrets.hashicorp.com`) + một Vault + VaultConnection/Auth | `python3 idpctl preflight --require-cluster --require-vault` (kiểm CRD + phiên bản VSO + hai object nền tảng, một lệnh) |
 | 3 — App secret | Phase 2 chạy được (VSO sync ra Secret trong ns) | `kubectl get vaultstaticsecret,secretstore -A` |
 | 4 — Postgres capability | DB provider/operator production-grade | probe: tìm operator postgres; `kubectl get crd \| grep -iE 'postgres\|cnpg\|zalando'` |
 | 5 — Stack + score-compose | `score-compose` bản đã ghim + `docker` + `make` | `score-compose --version`; `docker info` |
@@ -170,7 +170,7 @@ nào), cài Vault **dev mode** + VSO đúng phiên bản đã ghim, bật KV/kub
 apply `VaultConnection`+`VaultAuthGlobal` sinh từ config, rồi tự kiểm bằng `preflight`.
 Vault dev mode **mất sạch dữ liệu khi pod restart** — chạy lại script để dựng lại mount,
 nhưng secret đã ghi thì phải ghi lại. Công ty đã có Vault thật ⇒ **không** chạy script này,
-chỉ điền `vault.*` rồi chạy `orchestrate.py vault-foundation --apply`.
+chỉ điền `vault.*` rồi chạy `idpctl vault-foundation --apply`.
 
 **Vault/VSO E2E thật (có chủ ý làm Vault gián đoạn):**
 
@@ -188,16 +188,16 @@ những fixture khác phải tự seed lại policy/role/secret nếu còn cần
 Onboard một app vào Vault (hai nửa, hai chủ sở hữu — xem ADR `0007`):
 
 ```bash
-python3 orchestrate.py vault-onboard --app <app> --env staging --apply  # SA + VaultAuth
-python3 orchestrate.py vault-onboard --app <app> --env staging          # in policy/role Vault
-python3 orchestrate.py verify-rbac  --app <app> --env staging --apply   # danh tính verify
+python3 idpctl vault-onboard --app <app> --env staging --apply  # SA + VaultAuth
+python3 idpctl vault-onboard --app <app> --env staging          # in policy/role Vault
+python3 idpctl verify-rbac  --app <app> --env staging --apply   # danh tính verify
 ```
 
 **Golden path và phát triển local (Phase 5):**
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml stack-list
-python3 orchestrate.py --env-config platform.env.yaml stack-new \
+python3 idpctl --env-config platform.env.yaml stack-list
+python3 idpctl --env-config platform.env.yaml stack-new \
   --stack node-fullstack --app <app> --owner <đội> --out /duong/dan/kho-moi
 cd /duong/dan/kho-moi && make dev          # cần docker + score-compose, KHÔNG cần cụm
 ```
@@ -231,10 +231,10 @@ export REGISTRY_USER=... REGISTRY_PASS=...     # KHÔNG bao giờ là tham số 
 export APP_DISPATCH_TOKEN=...                  # bỏ trống -> onboarding chỉ BÁO là còn thiếu
 
 # 4. Chạy. Cùng một file request chạy lại bao nhiêu lần cũng được.
-python3 orchestrate.py --env-config platform.env.yaml onboard \
+python3 idpctl --env-config platform.env.yaml onboard \
   --request request-<app>.yaml --work /duong/dan/tam/onboard-<app>
-python3 orchestrate.py --env-config platform.env.yaml onboard-status --app <app>
-python3 orchestrate.py --env-config platform.env.yaml onboard-activate-prod \
+python3 idpctl --env-config platform.env.yaml onboard-status --app <app>
+python3 idpctl --env-config platform.env.yaml onboard-activate-prod \
   --app <app> --work /duong/dan/tam/onboard-<app>
 ```
 
@@ -269,8 +269,8 @@ platform.env.company.yaml` (công ty). Mọi lệnh đọc đúng file đó làm
 **doctor — kiểm capability cụm khớp config (read-only, theo feature/backend):**
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml doctor                 # với cụm đang trỏ
-python3 orchestrate.py --env-config platform.env.company.yaml doctor --no-cluster   # chỉ config
+python3 idpctl --env-config platform.env.yaml doctor                 # với cụm đang trỏ
+python3 idpctl --env-config platform.env.company.yaml doctor --no-cluster   # chỉ config
 ```
 
 Doctor chỉ kiểm thứ feature đang bật cần: `postgres_application` off → KHÔNG kiểm CNPG/
@@ -308,10 +308,10 @@ runner push image thật, chứng minh pod thiếu Secret bị từ chối, rồ
 `apply-secrets` + manifest có `imagePullSecrets` để kubelet pull và đưa workload lên Ready.
 Registry fixture và credential ngẫu nhiên luôn tự teardown; không sửa profile công ty.
 
-**Test hai profile (trong `test_orchestrate.py`, mảng "COMPANY-PROFILE COMPATIBILITY"):**
+**Test hai profile (trong `test_engine.py`, mảng "COMPANY-PROFILE COMPATIBILITY"):**
 
 ```bash
-python3 -m pytest test_orchestrate.py -q -k "profile or backend or doctor or statefulset or sectionName or company_coordinates or github"
+python3 -m pytest test_engine.py -q -k "profile or backend or doctor or statefulset or sectionName or company_coordinates or github"
 ```
 
 Phủ: cả hai profile load hợp lệ + default tương thích ngược; chọn backend qua config; render
@@ -333,8 +333,8 @@ doctor read-only trên `kind-staging`.
 - `KE-HOACH-TRIEN-KHAI-SECRET-VA-APP-ONBOARDING.md` — master plan; **bảng trạng thái phase ở mục 0.5** (đã làm tới đâu).
 - `TAI-LIEU-DU-AN.md` — thiết kế + lý do từng quyết định.
 - `docs/adr/` — quyết định kiến trúc (vd `0002-vault-only-secret-store.md` cho tính năng secret).
-- `docs/orchestrator-contract.md` — hợp đồng portal ↔ orchestrator, kèm cách verify trên cụm thật.
-- Comment tại chỗ trong `orchestrate.py` — phần lớn giải thích "vì sao", đọc trước khi đổi hành vi.
+- `docs/deployment-contract.md` — hợp đồng portal ↔ deployment engine, kèm cách verify trên cụm thật.
+- Comment tại chỗ trong `idpctl` — phần lớn giải thích "vì sao", đọc trước khi đổi hành vi.
 
 > Gợi ý: thêm một dòng trỏ tới file này trong `CLAUDE.md` ở gốc repo, để phiên Claude mới
 > **tự động** đọc thay vì phải nhớ mở ra.

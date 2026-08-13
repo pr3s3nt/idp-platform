@@ -116,7 +116,7 @@ cat <<EOF
   2. Merge tay platform.env.yaml (nếu có diff ở trên): thêm KEY mới, GIỮ value công ty.
   3. Khai trên GHES (KHÔNG phải file): biến RUNNER_LABEL / CI_RUNNER_LABEL; secret
      APP_ID+APP_PRIVATE_KEY (hoặc BOT_TOKEN), KUBECONFIG_STAGING/PROD, REGISTRY_HOST/USER/PASS.
-  4. python3 -m pytest test_orchestrate.py -q   — lớp 1 phải xanh trước khi commit.
+  4. python3 -m pytest test_engine.py -q   — lớp 1 phải xanh trước khi commit.
   5. git add -A && git commit && mở pull request.
 
 Chi tiết: HUONG-DAN-DONG-BO-CONG-TY.md

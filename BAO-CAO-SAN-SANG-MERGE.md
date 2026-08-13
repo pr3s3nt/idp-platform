@@ -26,7 +26,7 @@ git diff --stat 36372b9...feature/secret-onboarding    ->  75 files changed, 165
 git status --short                                     ->  (rỗng)
 ```
 
-Riêng Phase 7 (`b608a96..351a92c`, 10 commit): `orchestrate.py`, `test_orchestrate.py`,
+Riêng Phase 7 (`b608a96..351a92c`, 10 commit): `idpctl`, `test_engine.py`,
 `provisioners/postgres-application.provisioners.yaml`, `platform.env*.yaml`, và 13 file tài
 liệu/công cụ mới.
 

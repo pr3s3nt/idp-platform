@@ -29,12 +29,12 @@ Hai khe hở code phụ nhỏ được xử lý kèm (URL scheme/host user-facin
 - **Bằng chứng Discovery:** `database.yaml` DATABASE-02 (`PORTABILITY_CODE_GAP`, blocker),
   `required_database_backend: statefulset`; `kubernetes.yaml` K8S-01 (không có CNPG CRD).
 - **Bằng chứng source:** `provisioners/postgres-application.provisioners.yaml` chỉ có Cluster;
-  `orchestrate.py` glob mọi provisioner, không chọn backend.
+  `idpctl` glob mọi provisioner, không chọn backend.
 - **Bằng chứng harness:** render + `tools/thu-nghiem-db-statefulset.sh` (runtime kind).
 - **Phân loại:** ban đầu `PORTABILITY_CODE_GAP` → cuối `PORTABILITY_CODE_GAP`.
 - **Feature:** `postgres_application`.
 - **Sửa code:** CÓ.
-  - `orchestrate.py`: `database.backend` (DEFAULTS, mặc định `cnpg`), `database_backend()` +
+  - `idpctl`: `database.backend` (DEFAULTS, mặc định `cnpg`), `database_backend()` +
     enum validate, `select_provisioner_files()` (chọn đúng MỘT file `class: application`),
     guard prod chặn statefulset (không HA/backup).
   - `provisioners/postgres-application-statefulset.provisioners.yaml` (mới): StatefulSet +

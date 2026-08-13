@@ -59,7 +59,7 @@ resource database thô — **platform suy ra hết**. Rồi:
 ```bash
 export VAULT_ADDR=... VAULT_TOKEN=...          # nửa Vault: token RIÊNG, không suy ra từ gh
 export REGISTRY_USER=... REGISTRY_PASS=...     # để tạo imagePullSecret
-python3 orchestrate.py --env-config platform.env.yaml onboard \
+python3 idpctl --env-config platform.env.yaml onboard \
   --request request-don-hang.yaml --work /tmp/onboard-don-hang
 ```
 
@@ -81,7 +81,7 @@ Hai lần dừng là bình thường, không phải lỗi:
 Production là một **lệnh riêng**, không phải bước tiếp theo:
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml onboard-activate-prod \
+python3 idpctl --env-config platform.env.yaml onboard-activate-prod \
   --app don-hang --work /tmp/onboard-don-hang
 ```
 
@@ -89,7 +89,7 @@ Nó dựng tài nguyên prod, render prod bằng **đúng bộ ảnh staging đ�
 mở pull request — kể cả khi nhánh prod chưa bật bảo vệ. Bí mật **không** được sao chép từ
 staging sang prod: prod sẽ dừng ở `WAITING_FOR_USER_SECRETS` cho tới khi có người nạp.
 
-Xem đang ở đâu: `orchestrate.py onboard-status --app don-hang` (thêm `--json` để xem bản
+Xem đang ở đâu: `idpctl onboard-status --app don-hang` (thêm `--json` để xem bản
 ghi đầy đủ). Trạng thái sống trong ConfigMap `idp-onboarding-<app>`.
 
 Phần còn lại của tài liệu này mô tả **từng việc onboarding làm thay bạn** — đọc khi cần
@@ -132,9 +132,9 @@ Thay vì viết tay `score.yaml`, `Dockerfile`, `platform.lock` (mục A1–A3),
 từ một **stack** đã phát hành:
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml stack-list
+python3 idpctl --env-config platform.env.yaml stack-list
 
-python3 orchestrate.py --env-config platform.env.yaml stack-new \
+python3 idpctl --env-config platform.env.yaml stack-new \
   --stack node-fullstack --app demo --owner đội-cua-ban --out ../idp-demo
 ```
 
@@ -177,8 +177,8 @@ staging cùng có nó; một `compose.yaml` chép tay sẽ lệch mà không bá
 ### Nâng phiên bản stack
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml stack-validate --app-dir ../idp-demo
-python3 orchestrate.py --env-config platform.env.yaml stack-upgrade  --app-dir ../idp-demo
+python3 idpctl --env-config platform.env.yaml stack-validate --app-dir ../idp-demo
+python3 idpctl --env-config platform.env.yaml stack-upgrade  --app-dir ../idp-demo
 ```
 
 `stack-upgrade` **in diff** và không ghi gì; thêm `--write` để ghi vào working tree rồi tự
@@ -406,7 +406,7 @@ Sau đó platform tự chọn cách ghi, **dựa trên branch protection thật 
 Không phải khai gì trong file cấu hình. Muốn siết thì bật branch protection, platform
 tự chuyển sang chế độ pull request ngay lần deploy sau.
 
-Vẫn chạy tay được từ giao diện GitHub: *Actions → orchestrator → Run workflow*, chọn
+Vẫn chạy tay được từ giao diện GitHub: *Actions → deploy → Run workflow*, chọn
 `env: prod`.
 
 ---

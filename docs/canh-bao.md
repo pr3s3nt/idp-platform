@@ -132,7 +132,7 @@ khẩu mà database từ chối, còn pod cũ vẫn chạy bằng mật khẩu c
 | **Điều kiện** | `Cluster.status.managedRolesStatus.passwordStatus.<role>.resourceVersion` **khác** `resourceVersion` của Secret credential |
 | **Ngưỡng** | **15 phút** |
 | **Đã đo** | lệch kéo dài **> 8 phút** và không tự hết; chạm vào Cluster thì hết trong < 20 giây |
-| **Xử lý** | chạy `orchestrate.py rotate-db-credential`, lệnh này làm đúng thứ tự và chờ từng bước |
+| **Xử lý** | chạy `idpctl rotate-db-credential`, lệnh này làm đúng thứ tự và chờ từng bước |
 
 ```bash
 kubectl get cluster.postgresql.cnpg.io -A -o json | python3 -c "

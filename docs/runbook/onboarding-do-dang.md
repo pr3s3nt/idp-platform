@@ -12,7 +12,7 @@ sinh ra để khỏi phải làm.
 ## Xác nhận đang ở đâu
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml onboard-status --app <app>
+python3 idpctl --env-config platform.env.yaml onboard-status --app <app>
 kubectl -n cluster-state get configmap idp-onboarding-<app> -o jsonpath='{.data.record\.json}' \
   | python3 -m json.tool | head -40
 ```
@@ -30,7 +30,7 @@ kubectl -n cluster-state get configmap idp-onboarding-<app> -o jsonpath='{.data.
 ## Retry
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml onboard --request <file> ...   # đúng lệnh cũ
+python3 idpctl --env-config platform.env.yaml onboard --request <file> ...   # đúng lệnh cũ
 ```
 
 Bước đã `done` bị bỏ qua. Muốn chạy lại một bước cụ thể (mọi bước đều kiểm-trước-khi-tạo
@@ -60,7 +60,7 @@ Muốn dừng sớm để xem xét: `--stop-after <bước>`.
 ## Xác minh đã xong
 
 ```bash
-python3 orchestrate.py --env-config platform.env.yaml onboard-status --app <app>   # READY
+python3 idpctl --env-config platform.env.yaml onboard-status --app <app>   # READY
 kubectl -n <app>-staging get pods,cluster.postgresql.cnpg.io
 kubectl -n fleet-local get gitrepo | grep <app>
 ```

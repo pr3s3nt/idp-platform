@@ -9,7 +9,7 @@
 # Workflow hỏng ngay ở bước lấy token, trước khi làm được bất cứ việc gì.
 #
 # Script này làm đúng việc của action đó bằng openssl + curl + python3 — đều có sẵn trên
-# runner (workflow vốn đã cần python3 cho orchestrate.py).
+# runner (workflow vốn đã cần python3 cho idpctl).
 #
 # CHẠY TRÊN CẢ HAI LOẠI GITHUB
 # Không ghim địa chỉ API. GitHub Actions tự đặt GITHUB_API_URL:

@@ -96,7 +96,7 @@ jobs:
             echo "::error::máy chạy thiếu:$missing — cài lên runner rồi chạy lại (runner do GitHub cấp thì luôn có sẵn)"
             exit 1
           fi
-          # pyyaml: orchestrate.py import nó. `pip install` trên một bản Linux hiện đại bị
+          # pyyaml: idpctl import nó. `pip install` trên một bản Linux hiện đại bị
           # PEP 668 CHẶN với "error: externally-managed-environment" — runner của GitHub thì
           # không, nên lỗi này chỉ nổ ra ở môi trường thật. Có sẵn thì không cài lại; không
           # có thì thử lần lượt ba cách, cách nào chạy được cũng được.
@@ -114,16 +114,16 @@ jobs:
       # Dùng PAT chứ không phải GITHUB_TOKEN: cùng một token này còn phải dispatch chéo
       # sang idp-platform ở bước dưới, nên giữ một credential duy nhất cho dễ debug.
 
-      # HỎI platform tên ảnh phải build, KHÔNG tự tính. Quy tắc đặt tên do orchestrate.py
+      # HỎI platform tên ảnh phải build, KHÔNG tự tính. Quy tắc đặt tên do idpctl
       # giữ; nếu CI tự tính rồi lệch thì Fleet apply một manifest trỏ tới ảnh chưa ai đẩy,
       # và chỉ lộ ra khi pod ImagePullBackOff. Đã xảy ra thật một lần khi đổi mặc định
       # sang nhãn theo nội dung: 5 app hỏng cùng lúc vì CI còn gắn cứng :${GITHUB_SHA}.
       #
       # LẤY Ở `main`, CỐ Ý — KHÔNG theo platform.lock.
       # platform.lock ghim CATALOG (provisioner, patch) tức DỮ LIỆU, không ghim CODE.
-      # Orchestrator luôn chạy orchestrate.py từ nhánh mặc định, vì GitHub chỉ chạy
+      # Orchestrator luôn chạy idpctl từ nhánh mặc định, vì GitHub chỉ chạy
       # workflow repository_dispatch từ đó. Nếu CI tính tên ảnh bằng một phiên bản
-      # orchestrate.py CŨ hơn, hai bên sẽ ra hai tên khác nhau ngay khi quy tắc đặt tên
+      # idpctl CŨ hơn, hai bên sẽ ra hai tên khác nhau ngay khi quy tắc đặt tên
       # thay đổi — CI đẩy nhãn cũ, manifest đòi nhãn mới, pod ImagePullBackOff. Hôm nay
       # chưa nổ chỉ vì mọi platform.lock đều đang ghi "main".
       - uses: actions/checkout@v4
@@ -144,7 +144,7 @@ jobs:
           # --with-build: platform trả về CẢ cách build, không chỉ tên ảnh. Cần thế vì
           # context không phải lúc nào cũng là thư mục chứa Dockerfile — app sinh từ stack
           # có gói dùng chung nằm ở gốc kho, build sai context là hỏng ngay ở npm install.
-          python3 platform/orchestrate.py --env-config platform/platform.env.yaml \
+          python3 platform/idpctl --env-config platform/platform.env.yaml \
             image-plan --with-build --catalog platform \
             --app "$APP" --image "$IMAGE_NAME" --tag "$GITHUB_SHA" \
             --registry "$REGISTRY" --app-dir . > plan.json
