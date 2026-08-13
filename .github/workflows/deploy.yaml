@@ -347,7 +347,7 @@ jobs:
           python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage commit_config --status success || true
           echo "STAGE=fleet_register" >> "$GITHUB_ENV"
-          echo "STAGE_T0=$(date +%s%3N)" >> "$GITHUB_ENV"
+          echo "STAGE_T0=$(date +%s%N)" >> "$GITHUB_ENV"
 
       - name: Đăng ký GitRepo với Fleet (tạo nếu chưa có)
         env:
@@ -368,11 +368,11 @@ jobs:
       # không thể bắt được.
       - name: Audit — fleet_register ok
         run: |
-          DUR=$(( $(date +%s%3N) - ${STAGE_T0:-$(date +%s%3N)} ))
+          DUR=$(( ( $(date +%s%N) - ${STAGE_T0:-$(date +%s%N)} ) / 1000000 ))
           python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage fleet_converge --status success --duration-ms "$DUR" || true
           echo "STAGE=rollout_verify" >> "$GITHUB_ENV"
-          echo "STAGE_T0=$(date +%s%3N)" >> "$GITHUB_ENV"
+          echo "STAGE_T0=$(date +%s%N)" >> "$GITHUB_ENV"
 
       - name: Kiểm cụm thực sự chạy đúng thứ vừa render
         if: steps.commit.outputs.pending_pr != 'true'
@@ -387,7 +387,7 @@ jobs:
       - name: Audit — rollout_verify ok + snapshot
         if: steps.commit.outputs.pending_pr != 'true'
         run: |
-          DUR=$(( $(date +%s%3N) - ${STAGE_T0:-$(date +%s%3N)} ))
+          DUR=$(( ( $(date +%s%N) - ${STAGE_T0:-$(date +%s%N)} ) / 1000000 ))
           python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage rollout_verify --status success --duration-ms "$DUR" || true
           python3 platform/idpctl --env-config "$ENV_CONFIG" audit-snapshot $AUDIT_ID \
