@@ -33,6 +33,9 @@ jobs:
       MODE: ${{ github.event.client_payload.mode }}
       IMAGE: ${{ github.event.client_payload.image || github.event.client_payload.app }}
       TAG_STRATEGY: ${{ github.event.client_payload.tag_strategy || '' }}
+      # Promote luôn nhắm prod. Fail-open, khớp audit.database_url_env.
+      DEPLOY_ENV: prod
+      AUDIT_DATABASE_URL: ${{ secrets.AUDIT_DATABASE_URL }}
     steps:
       - name: Checkout platform@main (renderer)
         uses: actions/checkout@v4
@@ -98,6 +101,20 @@ jobs:
           RP=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.require_pr" 2>/dev/null || echo False)
           echo "REQUIRE_PR=$RP" >> "$GITHUB_ENV"
           echo "==> $ENVNAME -> nhánh $BR, cần PR: $RP"
+
+      # AUDIT (no-op khi tắt). Workflow=promote, môi trường prod.
+      - name: Audit — migrate + ghi bắt đầu promote
+        run: |
+          set -uo pipefail
+          echo "AUDIT_ID=--app $APP --env prod --workflow promote" >> "$GITHUB_ENV"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          echo "RUN_URL=$RUN_URL" >> "$GITHUB_ENV"
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-migrate || true
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-start \
+            --app "$APP" --env prod --workflow promote \
+            --trigger "$GITHUB_EVENT_NAME" --actor "$GITHUB_ACTOR" --run-url "$RUN_URL" \
+            --app-sha "$TAG" --platform-sha "$GITHUB_SHA" --runner-name "$RUNNER_NAME" || true
+          echo "STAGE=render" >> "$GITHUB_ENV"
 
       - name: Preflight
         run: python3 platform/idpctl --env-config "$ENV_CONFIG" preflight
@@ -186,6 +203,12 @@ jobs:
             --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
             --kubeconfig cluster-config-prod
 
+      - name: Audit — render/promote ok
+        run: |
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+            --stage render --status success || true
+          echo "STAGE=commit_config" >> "$GITHUB_ENV"
+
       # --app-dir is what arms the ordering guard: without it `commit` cannot tell whether
       # this tag is older than what prod already runs, and promotes silently roll back.
       - name: Commit & push config repo
@@ -207,6 +230,37 @@ jobs:
           python3 platform/idpctl --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app
 
+
+      # ---- Audit finalizers. Prod: verify chạy ở job verify riêng (kho cấu hình gọi sau
+      # khi manifest thật nằm trên nhánh), nên ở đây chỉ đóng sổ commit_config.
+      - name: Audit — đóng sổ thành công
+        if: success()
+        run: |
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+            --stage commit_config --status success || true
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+            --status success || true
+
+      - name: Audit — ghi thất bại + báo lỗi cho developer
+        if: failure()
+        run: |
+          set -uo pipefail
+          FAIL_STAGE="${STAGE:-unknown}"
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+            --stage "$FAIL_STAGE" --status failure --message "promote dừng ở $FAIL_STAGE" || true
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+            --status failure --failure-stage "$FAIL_STAGE" || true
+          python3 platform/idpctl --env-config "$ENV_CONFIG" notify-failure \
+            --app "$APP" --env prod --workflow promote \
+            --stage "$FAIL_STAGE" --commit "$TAG" --commit-repo "$APP_REPO" \
+            --run-url "$RUN_URL" --platform-sha "$GITHUB_SHA" \
+            --token "${{ steps.app-token.outputs.token }}" || true
+
+      - name: Audit — ghi bị hủy
+        if: cancelled()
+        run: |
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+            --status cancelled --failure-stage "${STAGE:-unknown}" || true
 
       - name: Scrub kubeconfig
         if: always()

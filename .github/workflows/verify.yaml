@@ -22,6 +22,8 @@ jobs:
     env:
       APP: ${{ github.event.client_payload.app }}
       DEPLOY_ENV: ${{ github.event.client_payload.env || 'prod' }}
+      # Fail-open: rỗng/không tới được chỉ warn. Khớp audit.database_url_env.
+      AUDIT_DATABASE_URL: ${{ secrets.AUDIT_DATABASE_URL }}
     steps:
       - name: Checkout platform@main (renderer + workflow)
         uses: actions/checkout@v4
@@ -73,6 +75,21 @@ jobs:
           echo "CONFIG_BRANCH=$BR" >> "$GITHUB_ENV"
           echo "==> kiểm $APP ở môi trường $DEPLOY_ENV (nhánh cấu hình $BR)"
 
+      # AUDIT (no-op khi tắt). Workflow=verify để tách bạch với deploy trong lịch sử.
+      - name: Audit — migrate + ghi bắt đầu verify
+        run: |
+          set -uo pipefail
+          echo "AUDIT_ID=--app $APP --env $DEPLOY_ENV --workflow verify" >> "$GITHUB_ENV"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          echo "RUN_URL=$RUN_URL" >> "$GITHUB_ENV"
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-migrate || true
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-start \
+            --app "$APP" --env "$DEPLOY_ENV" --workflow verify \
+            --trigger "$GITHUB_EVENT_NAME" --actor "$GITHUB_ACTOR" --run-url "$RUN_URL" \
+            --platform-sha "$GITHUB_SHA" --runner-name "$RUNNER_NAME" || true
+          echo "STAGE=rollout_verify" >> "$GITHUB_ENV"
+          echo "STAGE_T0=$(date +%s%3N)" >> "$GITHUB_ENV"
+
       # Cùng lý do như trong job deploy: phải ghi TRƯỚC khi có bất kỳ lệnh kubectl nào, nếu
       # không nó lặng lẽ dùng kubeconfig cũ còn sót trong workspace và kiểm nhầm cụm.
       - name: Write kubeconfigs
@@ -107,6 +124,38 @@ jobs:
             --app "$APP" --env "$DEPLOY_ENV" \
             --manifests "config/$DEPLOY_ENV/manifests.yaml" \
             --kubeconfig "cluster-config-$DEPLOY_ENV" --timeout 420
+
+      - name: Audit — rollout_verify ok + snapshot
+        run: |
+          DUR=$(( $(date +%s%3N) - ${STAGE_T0:-$(date +%s%3N)} ))
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+            --stage rollout_verify --status success --duration-ms "$DUR" || true
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-snapshot $AUDIT_ID \
+            --manifests "config/$DEPLOY_ENV/manifests.yaml" \
+            --kubeconfig "cluster-config-$DEPLOY_ENV" \
+            --config-repo "$ORG/$CONFIG_REPO_NAME" --platform-sha "$GITHUB_SHA" || true
+
+      - name: Audit — đóng sổ thành công
+        if: success()
+        run: |
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+            --status success || true
+
+      - name: Audit — ghi thất bại + báo lỗi
+        if: failure()
+        run: |
+          set -uo pipefail
+          FAIL_STAGE="${STAGE:-rollout_verify}"
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+            --stage "$FAIL_STAGE" --status failure --message "verify dừng ở $FAIL_STAGE" || true
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+            --status failure --failure-stage "$FAIL_STAGE" || true
+
+      - name: Audit — ghi bị hủy
+        if: cancelled()
+        run: |
+          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+            --status cancelled --failure-stage "${STAGE:-rollout_verify}" || true
 
       - name: Scrub kubeconfigs
         if: always()
