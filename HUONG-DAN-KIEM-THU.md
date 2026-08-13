@@ -238,6 +238,76 @@ Ba trạng thái KHÔNG phải lỗi và cũng KHÔNG phải xong:
 > config key + validation/preflight + checklist, **không** tự đánh dấu pass, và **không** để
 > nó chặn phần verify được ở local.
 
+## Company compatibility — một source, hai profile
+
+Cùng một source chạy được cả harness (github.com + GHCR + CNPG + Traefik HTTP) lẫn hình dạng
+công ty (GHES + Harbor/HTTPS + PostgreSQL StatefulSet trên StorageClass mạng + Traefik có
+listener HTTPS). Khác biệt nằm HẾT ở `platform.env.company.yaml`, không fork code. Xem
+`GAP-REGISTER.md` để biết từng khe hở đã phân loại và sửa ra sao.
+
+**Chọn profile:** `--env-config platform.env.yaml` (harness) hay `--env-config
+platform.env.company.yaml` (công ty). Mọi lệnh đọc đúng file đó làm nguồn toạ độ.
+
+**doctor — kiểm capability cụm khớp config (read-only, theo feature/backend):**
+
+```bash
+python3 orchestrate.py --env-config platform.env.yaml doctor                 # với cụm đang trỏ
+python3 orchestrate.py --env-config platform.env.company.yaml doctor --no-cluster   # chỉ config
+```
+
+Doctor chỉ kiểm thứ feature đang bật cần: `postgres_application` off → KHÔNG kiểm CNPG/
+StorageClass/object-store; backend `statefulset` → KHÔNG kiểm CNPG; `vault_secrets` off →
+KHÔNG kiểm Vault/VSO. Thiếu-quyền-kiểm là WARN (không bao giờ báo xanh giả). FAIL = blocker.
+
+**database backend (`database.backend: cnpg | statefulset`):**
+- `cnpg` (mặc định, harness): CloudNativePG Cluster — hành vi cũ, không đổi.
+- `statefulset` (công ty): PostgreSQL StatefulSet do platform quản, một bản sao, không HA,
+  không backup nội tại → render prod bị CHẶN. App nhận BỘ OUTPUT GIỐNG HỆT hai backend.
+
+**Runtime StatefulSet backend trên kind (chứng minh chạy thật, không chỉ render):**
+
+```bash
+./tools/thu-nghiem-db-statefulset.sh --context kind-staging   # [--keep] để giữ ns soi
+```
+
+Nó render backend statefulset qua một overlay runtime (ánh xạ StorageClass/ảnh/credential công
+ty sang tương đương local — profile công ty KHÔNG bị sửa), apply lên kind, chờ StatefulSet
+Ready, kiểm PVC `Bound`, chạy SQL thật, xoá pod rồi kiểm dữ liệu CÒN LẠI. Teardown tự động
+(xoá namespace) trừ khi `--keep`.
+
+**Runtime Gateway HTTPS và registry private kiểu công ty:**
+
+```bash
+./tools/dung-harness-cong-ty.sh --up --context kind-staging
+./tools/thu-nghiem-gateway-https.sh --context kind-staging
+./tools/thu-nghiem-registry-private.sh --context kind-staging
+./tools/dung-harness-cong-ty.sh --down --context kind-staging   # teardown listener test
+```
+
+Gateway test render `sectionName=websecure`, đòi `Accepted=True` + `ResolvedRefs=True` và
+curl HTTPS bằng CA thật. Registry test tự dựng OCI registry HTTPS có custom CA và auth, cho
+runner push image thật, chứng minh pod thiếu Secret bị từ chối, rồi dùng chính
+`apply-secrets` + manifest có `imagePullSecrets` để kubelet pull và đưa workload lên Ready.
+Registry fixture và credential ngẫu nhiên luôn tự teardown; không sửa profile công ty.
+
+**Test hai profile (trong `test_orchestrate.py`, mảng "COMPANY-PROFILE COMPATIBILITY"):**
+
+```bash
+python3 -m pytest test_orchestrate.py -q -k "profile or backend or doctor or statefulset or sectionName or company_coordinates or github"
+```
+
+Phủ: cả hai profile load hợp lệ + default tương thích ngược; chọn backend qua config; render
+matrix (statefulset vs cnpg khác nhau CHỈ ở toạ độ); prod statefulset bị chặn; sectionName
+theo config; URL theo `GITHUB_SERVER_URL`/scheme; doctor ma trận feature/backend (FakeProbe);
+hardcode-scan (không literal công ty trong source dùng chung + GAP-REGISTER).
+
+**Đã chứng minh RUNTIME (cụm thật):** StatefulSet backend (Ready · PVC Bound · SQL · bền qua
+restart); Gateway HTTPS (`sectionName`, route conditions, TLS 200); registry private
+(TLS/custom CA/auth, push, imagePullSecret, pull); doctor read-only trên `kind-staging`.
+**Mới chứng minh RENDER/MOCK:** route scheme, GHES URL, backend selection, guard prod.
+**Prerequisite production còn thiếu:** backup backend cho database prod, VSO + Vault role cho
+`vault_secrets`, và mirror đủ ảnh nền về Harbor thật.
+
 ## Tài liệu gốc liên quan
 
 - `KE-HOACH-TRIEN-KHAI-SECRET-VA-APP-ONBOARDING.md` — master plan; **bảng trạng thái phase ở mục 0.5** (đã làm tới đâu).

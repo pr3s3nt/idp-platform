@@ -65,7 +65,18 @@ DEFAULTS: dict = {
         "storage_class": "",
         "sha_record_dir": ".platform",
     },
-    "ingress": {"gateway_name": "", "gateway_namespace": ""},
+    "ingress": {"gateway_name": "", "gateway_namespace": "",
+                # Which Gateway listener a route attaches to (parentRefs.sectionName). A
+                # Gateway with both an HTTP and an HTTPS listener will attach an
+                # HTTPRoute that names NO section to whichever listener the controller
+                # picks — usually the plain HTTP one — and nothing reports the mismatch.
+                # EMPTY is the backward-compatible default: no sectionName is written, so
+                # a single-listener Gateway renders byte-identically to before.
+                "section_name": "",
+                # Scheme for USER-FACING urls the platform prints (onboarding output).
+                # Not a routing decision — the Gateway terminates TLS — just what URL a
+                # human is told to open. http keeps the historical output unchanged.
+                "route_scheme": "http"},
     "images": {},
     "environments": {},
     # Empty version strings mean "do not check" — see check_tool_versions. A brownfield
@@ -99,6 +110,17 @@ DEFAULTS: dict = {
     },
     "database_profiles": {},
     "database": {
+        # Which implementation backs `class: application`. An infrastructure decision, so
+        # it lives in config rather than being fixed in the catalog:
+        #   cnpg        -> a CloudNativePG Cluster (HA, managed backup). The default, so an
+        #                  install that says nothing renders exactly as it always has.
+        #   statefulset -> a plain PostgreSQL StatefulSet the platform owns. For a cluster
+        #                  that has no CNPG operator and does not want one. No HA and no
+        #                  built-in backup, so it is refused in prod (see check_database_
+        #                  classes) until a backup backend exists.
+        # The app-facing OUTPUT contract is identical for both — host/port/database/
+        # username/password — so switching backend never touches app code.
+        "backend": "cnpg",
         # Which operator provides `class: application`. Named in config because the choice
         # is an infrastructure decision: a company with a DBA-run service replaces this
         # provisioner wholesale rather than running an operator at all.
@@ -359,6 +381,27 @@ def feature(name: str) -> bool:
     radius of a bug is the apps that opted in, not every app at once.
     """
     return bool(CONFIG.get(f"features.{name}", False))
+
+
+DATABASE_BACKENDS = ("cnpg", "statefulset")
+
+
+def database_backend() -> str:
+    """Which implementation serves `class: application` — validated, with a safe default.
+
+    An unknown value is fatal rather than silently falling back: a typo like `statefull`
+    would otherwise render the CNPG default while the operator that config claims to be
+    avoiding is nowhere on the cluster — exactly the silent-wrong-place failure the whole
+    config layer exists to prevent.
+    """
+    value = str(CONFIG.get("database.backend") or "cnpg").strip()
+    if value not in DATABASE_BACKENDS:
+        raise SystemExit(
+            f"database.backend={value!r} is not one of {DATABASE_BACKENDS}. "
+            "Leave it unset for the CloudNativePG default, or set 'statefulset' for a "
+            "plain platform-owned PostgreSQL StatefulSet."
+        )
+    return value
 
 
 # --------------------------------------------------------------------------------------
@@ -925,6 +968,19 @@ def check_database_classes(scores: list[tuple], env: str) -> None:
                     "refused in prod. Use `class: application`, which reads its capacity, "
                     "HA and retention from database_profiles in platform.env.yaml."
                 )
+
+    # The StatefulSet backend is single-instance with no built-in backup, so a production
+    # database on it cannot be made HA or restorable by any config value — the missing
+    # piece is an infrastructure backend, not a coordinate. Refuse prod outright rather
+    # than deploy something that looks like a production database and is not one. Staging
+    # on this backend is fine and unaffected.
+    if application_users and env == "prod" and database_backend() == "statefulset":
+        raise SystemExit(
+            f"workload(s) {[w for w, _ in application_users]} ask for a production "
+            "database, but database.backend=statefulset is single-instance with no "
+            "backup or failover — it is refused in prod. Use database.backend=cnpg (with "
+            "a configured backup object store), or provide a production-grade backend."
+        )
 
     # Fail-closed rather than deploying a production database nobody can restore. The
     # object store is infrastructure, so it is a config value, not a code path.
@@ -2133,13 +2189,20 @@ def run(
     capture: bool = False,
     cwd: Path | None = None,
     stdin: str | None = None,
+    sensitive: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
-    """Run a command, always logging the full argv.
+    """Run a command, logging replayable argv with explicit secret values redacted.
 
     Bash gives you `set -x` for free; in Python you have to be deliberate about it. Every
-    external call is logged so a failed run reads like a transcript you can replay.
+    external call is logged so a failed run reads like a transcript you can replay. A few
+    kubectl create commands still have no stdin form convenient for hand replay, so their
+    callers MUST name credential values in ``sensitive`` rather than leak them here.
     """
-    log(f"$ {' '.join(argv)}" + (f"   (cwd={cwd})" if cwd else ""))
+    shown = list(argv)
+    for secret in sensitive:
+        if secret:
+            shown = [part.replace(secret, "<redacted>") for part in shown]
+    log(f"$ {' '.join(shown)}" + (f"   (cwd={cwd})" if cwd else ""))
     return subprocess.run(
         argv,
         check=check,
@@ -2546,6 +2609,40 @@ def split_manifests(manifests: Path, work: Path) -> tuple[Path, Path]:
     return sec_path, pub_path
 
 
+# The two catalog files that BOTH declare `type: postgres, class: application`. Exactly one
+# may be handed to score-k8s per render — a provisioner with a class matches only that
+# class, but TWO provisioners for the same type+class is the ambiguous-match trap the
+# route/postgres comments already warn about (last one loaded wins, load order is a temp
+# filename). So the backend config picks one and the other is left out of the render.
+_POSTGRES_APPLICATION_FILES = {
+    "cnpg": "postgres-application.provisioners.yaml",
+    "statefulset": "postgres-application-statefulset.provisioners.yaml",
+}
+
+
+def select_provisioner_files(catalog: Path) -> list[Path]:
+    """The provisioner files to render, with the database backend resolved from config.
+
+    Every `*.provisioners.yaml` is used EXCEPT the `class: application` file for the
+    backend NOT chosen. Default backend is cnpg, so a catalog that only ships the CNPG
+    file behaves exactly as before; the StatefulSet file is inert unless it exists AND
+    database.backend is statefulset.
+    """
+    backend = database_backend()
+    drop = {name for key, name in _POSTGRES_APPLICATION_FILES.items() if key != backend}
+    chosen = [p for p in sorted(catalog.glob("provisioners/*.provisioners.yaml"))
+              if p.name not in drop]
+    if not chosen:
+        raise SystemExit(f"no provisioners found under {catalog}/provisioners")
+    wanted = _POSTGRES_APPLICATION_FILES[backend]
+    if feature("postgres_application") and not any(p.name == wanted for p in chosen):
+        raise SystemExit(
+            f"database.backend={backend!r} needs {wanted} in {catalog}/provisioners, "
+            "but the catalog does not ship it."
+        )
+    return chosen
+
+
 def materialise_catalog(
     provisioners: list[Path], patch: Path, dest: Path, env: str, app: str | None = None,
 ) -> dict[str, object]:
@@ -2873,9 +2970,7 @@ def cmd_render(args) -> None:
                        resolve_tag_strategy(app_dir, getattr(args, "tag_strategy", "")))
     rewrite_images(services, plan)
 
-    provisioners = sorted(catalog.glob("provisioners/*.provisioners.yaml"))
-    if not provisioners:
-        raise SystemExit(f"no provisioners found under {catalog}/provisioners")
+    provisioners = select_provisioner_files(catalog)
     patch = catalog / "patches" / f"{args.env}.tpl"
     if not patch.is_file():
         raise SystemExit(f"missing patch template {patch}")
@@ -2996,7 +3091,8 @@ def ensure_backup_credentials(ns: str, args) -> None:
         kubectl(["create", "secret", "generic", name, "-n", ns,
                  f"--from-literal=ACCESS_KEY_ID={key_id}",
                  f"--from-literal=ACCESS_SECRET_KEY={secret_key}"],
-                kubeconfig=args.kubeconfig, check=False, capture=True),
+                kubeconfig=args.kubeconfig, check=False, capture=True,
+                sensitive=(key_id, secret_key)),
         f"secret backup {name} in {ns}",
     )
 
@@ -3013,6 +3109,7 @@ def cmd_apply_secrets(args) -> None:
                  f"--docker-username={args.harbor_user}",
                  f"--docker-password={args.harbor_pass}"],
                 kubeconfig=args.kubeconfig, check=False, capture=True,
+                sensitive=(args.harbor_pass,),
             ),
             f"{pull_secret()} in {ns}",
         )
@@ -5410,7 +5507,8 @@ def step_verify_staging(ctx: OnboardContext) -> None:
     urls = sorted({h for doc in load_all(manifests)
                    if doc.get("kind") == "HTTPRoute"
                    for h in (doc.get("spec") or {}).get("hostnames") or []})
-    ctx.out("stagingUrls", [f"http://{h}" for h in urls])
+    scheme = str(CONFIG.get("ingress.route_scheme") or "http")
+    ctx.out("stagingUrls", [f"{scheme}://{h}" for h in urls])
 
 
 def step_staging_ready(ctx: OnboardContext) -> None:
@@ -5535,7 +5633,8 @@ def step_verify_prod(ctx: OnboardContext) -> None:
         timeout=config_int("onboarding.verify_timeout_seconds", 420)))
     urls = sorted({h for doc in load_all(manifests) if doc.get("kind") == "HTTPRoute"
                    for h in (doc.get("spec") or {}).get("hostnames") or []})
-    ctx.out("prodUrls", [f"http://{h}" for h in urls])
+    scheme = str(CONFIG.get("ingress.route_scheme") or "http")
+    ctx.out("prodUrls", [f"{scheme}://{h}" for h in urls])
 
 
 def step_prod_ready(ctx: OnboardContext) -> None:
@@ -5764,10 +5863,22 @@ def _foreign_applications(ns: str, app: str, kubeconfig) -> set[str]:
     return found
 
 
+def git_server_url() -> str:
+    """Base URL of the Git server, from the environment GitHub Actions already sets.
+
+    `GITHUB_SERVER_URL` is `https://github.com` on github.com and the GHES base URL on an
+    Enterprise runner — the same variable the orchestrator workflow already relies on for
+    auth. Hardcoding github.com here is not just a cosmetic URL: this value is compared
+    against a Fleet GitRepo's `spec.repo` during offboard, and on GHES that repo URL is the
+    Enterprise host, so a github.com literal would silently match nothing.
+    """
+    return (os.environ.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
+
+
 def onboarding_config_repo_url(app: str) -> str:
     org = CONFIG.get("git.org") or ""
     pattern = CONFIG.get("git.config_repo_pattern") or "{app}-config"
-    return f"https://github.com/{org}/{pattern.replace('{app}', app)}"
+    return f"{git_server_url()}/{org}/{pattern.replace('{app}', app)}"
 
 
 def cmd_offboard(args) -> None:
@@ -5941,6 +6052,181 @@ def cmd_image_plan(args) -> None:
     print(json.dumps(plan, indent=2, sort_keys=True))
 
 
+# --------------------------------------------------------------------------------------
+# doctor — read-only, feature/backend-aware capability check
+# --------------------------------------------------------------------------------------
+# preflight proves the RUNNER can render (tools + versions + cluster reachable). doctor
+# proves the CLUSTER matches what config CLAIMS, per feature and per database backend,
+# BEFORE a render is committed and Fleet applies it — so an infrastructure mismatch (no
+# CNPG operator, wrong StorageClass name, missing Gateway) surfaces here and not as a
+# silently-never-attached route or a permanently-Pending PVC days later.
+#
+# Every check is READ-ONLY (get/version) and every result carries the config key it is
+# about, so a FAIL names the exact line to fix. A check that cannot run (no permission,
+# no cluster) is a WARN, never a false OK — the whole point is to not report green when
+# the truth is unknown.
+DOCTOR_FAIL, DOCTOR_WARN, DOCTOR_OK, DOCTOR_SKIP = "FAIL", "WARN", "OK", "SKIP"
+
+
+def _resource_present(probe, args: list[str]):
+    """True/False whether a cluster resource exists, or None if it could not be checked.
+
+    None (not False) on permission-denied or unreachable is deliberate: absent and
+    can't-tell are different answers, and only the first is a blocker.
+    """
+    rc, out, err = probe(args + ["-o", "name"])
+    if rc == 0:
+        return bool(out.strip())
+    low = (err or "").lower()
+    if "notfound" in low or "not found" in low:
+        return False
+    return None
+
+
+def run_doctor_checks(probe=None) -> list[dict]:
+    """Capability findings for the CURRENT config. probe=None → config-only (no cluster).
+
+    Pure over CONFIG + probe, so tests drive it with a fake probe and no cluster.
+    """
+    results: list[dict] = []
+
+    def add(level, capability, key, msg):
+        results.append({"level": level, "capability": capability,
+                        "config_key": key, "message": msg})
+
+    def cluster(args):
+        """None-safe cluster presence check; skipped entirely when probe is None."""
+        return None if probe is None else _resource_present(probe, args)
+
+    # ---- database (only when the feature is on) --------------------------------------
+    if not feature("postgres_application"):
+        add(DOCTOR_SKIP, "database", "features.postgres_application",
+            "postgres_application off — không kiểm CNPG / StorageClass / object store")
+    else:
+        backend = database_backend()
+        repo = CONFIG.get("database.image_repository") or ""
+        if not repo:
+            add(DOCTOR_FAIL, "database.image", "database.image_repository",
+                "ảnh database rỗng — Cluster/StatefulSet sẽ không có image")
+        else:
+            add(DOCTOR_OK, "database.image", "database.image_repository", f"image={repo}:<engine_version>")
+
+        sc = CONFIG.get("database.storage_class") or CONFIG.get("kubernetes.storage_class") or ""
+        if not sc:
+            add(DOCTOR_FAIL, "database.storage", "kubernetes.storage_class",
+                "StorageClass rỗng — PVC sẽ treo Pending")
+        else:
+            present = cluster(["get", "storageclass", sc])
+            if present is True:
+                add(DOCTOR_OK, "database.storage", "kubernetes.storage_class", f"StorageClass {sc} có mặt")
+            elif present is False:
+                add(DOCTOR_FAIL, "database.storage", "kubernetes.storage_class",
+                    f"StorageClass {sc} KHÔNG tồn tại trên cụm")
+            else:
+                add(DOCTOR_WARN, "database.storage", "kubernetes.storage_class",
+                    f"chưa kiểm được StorageClass {sc} (thiếu quyền / không có cụm)")
+
+        if backend == "cnpg":
+            present = cluster(["get", "crd", "clusters.postgresql.cnpg.io"])
+            if present is True:
+                add(DOCTOR_OK, "database.cnpg", "database.backend", "CNPG CRD có mặt")
+            elif present is False:
+                add(DOCTOR_FAIL, "database.cnpg", "database.backend",
+                    "backend=cnpg nhưng CNPG CRD (clusters.postgresql.cnpg.io) KHÔNG có — "
+                    "cài operator hoặc đổi database.backend=statefulset")
+            else:
+                add(DOCTOR_WARN, "database.cnpg", "database.backend", "chưa kiểm được CNPG CRD")
+            if not (CONFIG.get("database.backup.object_store_url") or ""):
+                add(DOCTOR_WARN, "database.backup", "database.backup.object_store_url",
+                    "object store rỗng — render prod sẽ bị CHẶN (staging vẫn OK)")
+        else:  # statefulset
+            add(DOCTOR_OK, "database.backend", "database.backend",
+                "backend=statefulset — KHÔNG kiểm CNPG (đúng chủ ý)")
+            add(DOCTOR_WARN, "database.backup", "database.backend",
+                "backend=statefulset không có backup nội tại — render prod bị CHẶN (staging OK)")
+
+        ps = CONFIG.get("registry.pull_secret") or ""
+        if not ps:
+            add(DOCTOR_FAIL, "registry.pull_secret", "registry.pull_secret",
+                "imagePullSecret rỗng — workload không kéo được ảnh private")
+
+    # ---- gateway (whenever one is configured — routes need it regardless of feature) --
+    gw = CONFIG.get("ingress.gateway_name") or ""
+    gns = CONFIG.get("ingress.gateway_namespace") or ""
+    if gw:
+        present = cluster(["get", "gateway", gw, "-n", gns])
+        if present is True:
+            add(DOCTOR_OK, "gateway", "ingress.gateway_name", f"Gateway {gns}/{gw} có mặt")
+        elif present is False:
+            add(DOCTOR_FAIL, "gateway", "ingress.gateway_name",
+                f"Gateway {gns}/{gw} KHÔNG tồn tại — HTTPRoute sẽ không bao giờ attach")
+        else:
+            add(DOCTOR_WARN, "gateway", "ingress.gateway_name",
+                f"chưa kiểm được Gateway {gns}/{gw} (thiếu quyền / không có cụm)")
+    sec = CONFIG.get("ingress.section_name") or ""
+    if sec:
+        add(DOCTOR_OK, "gateway.section", "ingress.section_name",
+            f"route attach listener sectionName={sec}")
+
+    # ---- vault (only when the feature is on) -----------------------------------------
+    if feature("vault_secrets"):
+        addr = str(CONFIG.get("vault.address") or "")
+        if not addr:
+            add(DOCTOR_FAIL, "vault.address", "vault.address", "vault_secrets bật nhưng vault.address rỗng")
+        else:
+            add(DOCTOR_OK, "vault.address", "vault.address", f"vault.address={addr}")
+        present = cluster(["get", "crd", "vaultstaticsecrets.secrets.hashicorp.com"])
+        if present is True:
+            add(DOCTOR_OK, "vault.vso", "vault.operator_version", "VSO CRD có mặt")
+        elif present is False:
+            add(DOCTOR_FAIL, "vault.vso", "vault.operator_version",
+                "vault_secrets bật nhưng VSO CRD (secrets.hashicorp.com) KHÔNG có")
+        else:
+            add(DOCTOR_WARN, "vault.vso", "vault.operator_version", "chưa kiểm được VSO CRD")
+        if addr.startswith("https") and not CONFIG.get("vault.skip_tls_verify", False) \
+                and not (CONFIG.get("vault.ca_cert_secret") or ""):
+            add(DOCTOR_WARN, "vault.tls", "vault.ca_cert_secret",
+                "Vault HTTPS, skip_tls_verify=false, chưa khai ca_cert_secret — "
+                "chỉ chạy được nếu CA đã nằm trong trust store hệ thống")
+    else:
+        add(DOCTOR_SKIP, "vault", "features.vault_secrets",
+            "vault_secrets off — không kiểm Vault / VSO / CA")
+
+    # ---- registry (config presence) --------------------------------------------------
+    rh = CONFIG.get("registry.host") or ""
+    if rh:
+        add(DOCTOR_OK, "registry", "registry.host", f"registry.host={rh}")
+    else:
+        add(DOCTOR_WARN, "registry", "registry.host", "registry.host rỗng")
+
+    return results
+
+
+def cmd_doctor(args) -> None:
+    probe = None
+    if not getattr(args, "no_cluster", False):
+        cp = kubectl(["version", "--output=json"], kubeconfig=args.kubeconfig,
+                     check=False, capture=True)
+        if cp.returncode != 0:
+            warn(f"cụm không truy cập được ({(cp.stderr or '').strip()[:80]}) — "
+                 "chạy doctor ở chế độ CHỈ-CONFIG. Thêm --no-cluster để tắt cảnh báo này.")
+        else:
+            def probe(pargs):
+                r = kubectl(pargs, kubeconfig=args.kubeconfig, check=False, capture=True)
+                return r.returncode, (r.stdout or ""), (r.stderr or "")
+
+    results = run_doctor_checks(probe)
+    icon = {DOCTOR_OK: "  ok ", DOCTOR_WARN: " warn", DOCTOR_FAIL: "FAIL ", DOCTOR_SKIP: " skip"}
+    print("\n=== doctor: capability vs config (read-only) ===\n")
+    for r in results:
+        print(f"[{icon[r['level']]}] {r['capability']:22} {r['message']}  ({r['config_key']})")
+    fails = [r for r in results if r["level"] == DOCTOR_FAIL]
+    warns = [r for r in results if r["level"] == DOCTOR_WARN]
+    print(f"\n==> {len(fails)} blocker, {len(warns)} cảnh báo.")
+    if fails:
+        raise SystemExit(1)
+
+
 def cmd_preflight(args) -> None:
     # gh cần cho việc đọc branch protection và mở pull request trong bước commit.
     missing = [t for t in ("score-k8s", "kubectl", "git", "gh") if not shutil.which(t)]
@@ -6110,6 +6396,13 @@ def main(argv: list[str] | None = None) -> None:
                    help="also demand VSO at its pinned version plus VaultConnection/VaultAuthGlobal")
     p.add_argument("--kubeconfig")
     p.set_defaults(func=cmd_preflight)
+
+    p = sub.add_parser("doctor",
+                       help="kiểm capability cụm khớp config theo feature/backend (read-only)")
+    p.add_argument("--kubeconfig")
+    p.add_argument("--no-cluster", action="store_true",
+                   help="chỉ kiểm config, không truy cập cụm")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("vault-foundation",
                        help="in VaultConnection + VaultAuthGlobal (một bộ cho mỗi cụm)")

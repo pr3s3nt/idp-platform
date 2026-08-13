@@ -31,6 +31,13 @@
         parentRefs:
         - name: %%ingress.gateway_name%%
           namespace: %%ingress.gateway_namespace%%
+          # Gateway có nhiều listener (vd một Traefik với web/HTTP và websecure/HTTPS) thì
+          # một HTTPRoute KHÔNG khai sectionName attach vào listener controller tự chọn —
+          # thường là HTTP — và không đâu báo lệch. ingress.section_name chọn listener.
+          # RỖNG = không ghi dòng nào, manifest y hệt bản một-listener trước đây.
+          {{ if ne "%%ingress.section_name%%" "" }}
+          sectionName: %%ingress.section_name%%
+          {{ end }}
         hostnames:
         - {{ .Params.host | quote }}
         rules:

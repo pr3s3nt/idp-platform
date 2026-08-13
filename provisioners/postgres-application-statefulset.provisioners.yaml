@@ -1,0 +1,259 @@
+# `postgres` class `application` — BACKEND: statefulset.
+#
+# The SAME resource an app asks for as the CNPG backend (postgres-application.provisioners
+# .yaml), rendered as a plain PostgreSQL StatefulSet the platform owns. Selected by
+# `database.backend: statefulset` in platform.env.yaml; the two files never load together
+# (see select_provisioner_files) because both declare `type: postgres, class: application`
+# and score-k8s cannot be handed two provisioners for one type+class.
+#
+# WHY A SECOND BACKEND EXISTS
+# A cluster may have no CloudNativePG operator and no intent to run one — its database
+# offering is a StatefulSet on a network StorageClass. The app must not know the
+# difference: it declares the same three lines
+#   resources:
+#     db:
+#       type: postgres
+#       class: application
+# and receives the SAME outputs (host/port/database/username/password) at the SAME
+# `<cluster>-rw` Service name CNPG would have created. Switching backend is a config edit,
+# never an app change.
+#
+# WHAT THIS BACKEND DELIBERATELY IS NOT
+# One instance, no replication, no automatic failover, no built-in backup. A plain
+# postgres image scaled past one replica is N independent databases behind one Service —
+# split data, not HA — so replicas is fixed at 1 and prod is refused (check_database_
+# classes) until a real backup/HA backend exists. Everything sizeable (storage, cpu,
+# memory) still comes from database_profiles in platform.env.yaml, so staging and prod
+# differ only in config, exactly like the CNPG backend.
+#
+# THE PASSWORD NEVER LIVES HERE, same as CNPG: Vault -> VSO -> a basic-auth Secret; the
+# StatefulSet reads POSTGRES_PASSWORD from it, and the app reads the same Secret via
+# encodeSecretRef. The username is platform-derived (.State.username), so the app and the
+# database agree on it without trusting whatever the Vault entry's username field holds.
+- uri: template://platform/postgres-application-statefulset
+  type: postgres
+  class: application
+  description: PostgreSQL StatefulSet do platform quản lý (không CNPG), profile theo môi trường.
+  init: |
+    {{ if not "%%computed.database.image%%" }}{{ fail "database.image_repository hoặc engine_version của profile đang rỗng — xem platform.env.yaml" }}{{ end }}
+    {{ if not "%%computed.database.storage%%" }}{{ fail "database_profiles.<env>.application.storage chưa được đặt" }}{{ end }}
+    {{ if not "%%computed.database.storage_class%%" }}{{ fail "database.storage_class / kubernetes.storage_class đang rỗng — PVC sẽ treo Pending" }}{{ end }}
+  # Tên object và database/username suy ra y hệt backend CNPG, nên state của một app đã
+  # onboard vẫn khớp khi đổi backend qua lại (cùng resource uid postgres.application#...).
+  state: |
+    cluster: pg-{{ .SourceWorkload }}-{{ substr 0 8 .Guid | lower }}
+    database: {{ dig "database" (print "app_" (.SourceWorkload | replace "-" "_")) .State | quote }}
+    username: {{ dig "username" (print "app_" (.SourceWorkload | replace "-" "_")) .State | quote }}
+  # BỘ OUTPUT GIỐNG HỆT backend CNPG: app không phân biệt được hai backend.
+  outputs: |
+    host: {{ .State.cluster }}-rw
+    port: 5432
+    name: {{ .State.database }}
+    database: {{ .State.database }}
+    username: {{ .State.username }}
+    password: {{ encodeSecretRef (print .State.cluster "-cred") "password" }}
+  manifests: |
+    # Credential: Vault -> VSO -> Secret dạng basic-auth. KHỐI NÀY GIỐNG HỆT backend CNPG,
+    # nên đường Vault và policy của app không đổi khi chuyển backend. StatefulSet đọc
+    # POSTGRES_PASSWORD từ Secret này; app đọc cùng Secret đó. Không có đường nào khác cho
+    # mật khẩu đi, và mật khẩu KHÔNG BAO GIỜ nằm trong manifest hay Score state.
+    - apiVersion: secrets.hashicorp.com/v1beta1
+      kind: VaultStaticSecret
+      metadata:
+        name: {{ .State.cluster }}-cred
+        {{ if ne .Namespace "" }}
+        namespace: {{ .Namespace }}
+        {{ end }}
+        annotations:
+          k8s.score.dev/source-workload: {{ .SourceWorkload }}
+          k8s.score.dev/resource-uid: {{ .Uid }}
+          k8s.score.dev/resource-guid: {{ .Guid }}
+          idp.platform/logical-secret: %%database.credential_secret%%
+        labels:
+          app.kubernetes.io/name: {{ .State.cluster }}
+          app.kubernetes.io/part-of: idp-platform
+      spec:
+        vaultAuthRef: %%vault.auth_ref%%
+        mount: %%vault.kv_mount%%
+        type: %%vault.kv_type%%
+        path: apps/%%computed.app%%/%%env.name%%/%%database.credential_secret%%
+        refreshAfter: %%vault.refresh_after%%
+        hmacSecretData: true
+        destination:
+          name: {{ .State.cluster }}-cred
+          create: true
+          type: kubernetes.io/basic-auth
+          transformation:
+            excludeRaw: true
+            includes:
+            - ^username$
+            - ^password$
+    # Governing (headless) Service — bắt buộc cho StatefulSet.serviceName, cho ổ định danh
+    # mạng ổn định của pod. KHÔNG phải nơi app kết nối tới.
+    - apiVersion: v1
+      kind: Service
+      metadata:
+        name: {{ .State.cluster }}-hl
+        {{ if ne .Namespace "" }}
+        namespace: {{ .Namespace }}
+        {{ end }}
+        annotations:
+          k8s.score.dev/source-workload: {{ .SourceWorkload }}
+          k8s.score.dev/resource-uid: {{ .Uid }}
+          k8s.score.dev/resource-guid: {{ .Guid }}
+        labels:
+          app.kubernetes.io/name: {{ .State.cluster }}
+          app.kubernetes.io/instance: {{ .State.cluster }}
+          app.kubernetes.io/part-of: idp-platform
+          app.kubernetes.io/component: datastore
+      spec:
+        clusterIP: None
+        selector:
+          app.kubernetes.io/instance: {{ .State.cluster }}
+        ports:
+        - name: postgres
+          port: 5432
+          targetPort: 5432
+    # Read-write Service — TÊN `<cluster>-rw` khớp đúng output CNPG sinh ra, nên host mà app
+    # nhận được giống hệt ở cả hai backend.
+    - apiVersion: v1
+      kind: Service
+      metadata:
+        name: {{ .State.cluster }}-rw
+        {{ if ne .Namespace "" }}
+        namespace: {{ .Namespace }}
+        {{ end }}
+        annotations:
+          k8s.score.dev/source-workload: {{ .SourceWorkload }}
+          k8s.score.dev/resource-uid: {{ .Uid }}
+          k8s.score.dev/resource-guid: {{ .Guid }}
+        labels:
+          app.kubernetes.io/name: {{ .State.cluster }}
+          app.kubernetes.io/instance: {{ .State.cluster }}
+          app.kubernetes.io/part-of: idp-platform
+          app.kubernetes.io/component: datastore
+      spec:
+        type: ClusterIP
+        selector:
+          app.kubernetes.io/instance: {{ .State.cluster }}
+        ports:
+        - name: postgres
+          port: 5432
+          targetPort: 5432
+    - apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: {{ .State.cluster }}
+        {{ if ne .Namespace "" }}
+        namespace: {{ .Namespace }}
+        {{ end }}
+        annotations:
+          k8s.score.dev/source-workload: {{ .SourceWorkload }}
+          k8s.score.dev/resource-uid: {{ .Uid }}
+          k8s.score.dev/resource-guid: {{ .Guid }}
+        labels:
+          app.kubernetes.io/name: {{ .State.cluster }}
+          app.kubernetes.io/instance: {{ .State.cluster }}
+          app.kubernetes.io/part-of: idp-platform
+          # component=datastore: patch môi trường bỏ qua override replicas/resources cho
+          # datastore và để provisioner tự khai sizing — nhưng vẫn tiêm imagePullSecrets.
+          app.kubernetes.io/component: datastore
+      spec:
+        # MỘT bản sao: postgres image thường nhân bản là N database độc lập sau một Service,
+        # tức chia dữ liệu chứ không phải HA. HA/replication là lý do backend cnpg tồn tại;
+        # backend này bị chặn ở prod thay vì giả vờ có HA.
+        replicas: 1
+        serviceName: {{ .State.cluster }}-hl
+        selector:
+          matchLabels:
+            app.kubernetes.io/instance: {{ .State.cluster }}
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/name: {{ .State.cluster }}
+              app.kubernetes.io/instance: {{ .State.cluster }}
+              app.kubernetes.io/part-of: idp-platform
+              app.kubernetes.io/component: datastore
+            annotations:
+              k8s.score.dev/source-workload: {{ .SourceWorkload }}
+              k8s.score.dev/resource-uid: {{ .Uid }}
+              k8s.score.dev/resource-guid: {{ .Guid }}
+          spec:
+            automountServiceAccountToken: false
+            containers:
+            - name: postgres-db
+              image: %%computed.database.image%%
+              ports:
+              - name: postgres
+                containerPort: 5432
+              env:
+              - name: PGDATA
+                value: /var/lib/postgresql/data/pgdata
+              # Username là platform-derived (.State.username) để app và database chắc chắn
+              # dùng cùng một tên; password đến từ Secret do VSO đồng bộ từ Vault.
+              - name: POSTGRES_USER
+                value: {{ .State.username | quote }}
+              - name: POSTGRES_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: {{ .State.cluster }}-cred
+                    key: password
+              - name: POSTGRES_DB
+                value: {{ .State.database | quote }}
+              volumeMounts:
+              - name: pgdata
+                mountPath: /var/lib/postgresql/data
+              # NHÁY KÉP BẮT BUỘC: Quantity của Kubernetes là CHUỖI. Profile prod đặt
+              # cpu_request: "1", không nháy thì YAML ra số 1, API server lưu thành "1", và
+              # desired (số) != live (chuỗi) MÃI MÃI — Fleet báo Modified không dứt.
+              resources:
+                requests:
+                  cpu: "%%computed.database.cpu_request%%"
+                  memory: "%%computed.database.memory_request%%"
+              securityContext:
+                runAsUser: 1000
+                runAsGroup: 1000
+                allowPrivilegeEscalation: false
+                privileged: false
+                capabilities:
+                  drop:
+                    - ALL
+              readinessProbe:
+                exec:
+                  command:
+                  - pg_isready
+                  - -U
+                  - {{ .State.username | quote }}
+                  - -d
+                  - {{ .State.database | quote }}
+                periodSeconds: 3
+            securityContext:
+              runAsNonRoot: true
+              fsGroup: 1000
+              seccompProfile:
+                type: RuntimeDefault
+        volumeClaimTemplates:
+        - metadata:
+            name: pgdata
+            annotations:
+              k8s.score.dev/source-workload: {{ .SourceWorkload }}
+              k8s.score.dev/resource-uid: {{ .Uid }}
+              k8s.score.dev/resource-guid: {{ .Guid }}
+            labels:
+              app.kubernetes.io/name: {{ .State.cluster }}
+              app.kubernetes.io/instance: {{ .State.cluster }}
+              app.kubernetes.io/part-of: idp-platform
+              app.kubernetes.io/component: datastore
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: %%computed.database.storage_class%%
+            resources:
+              requests:
+                storage: %%computed.database.storage%%
+  expected_outputs:
+    - host
+    - port
+    - name
+    - database
+    - username
+    - password

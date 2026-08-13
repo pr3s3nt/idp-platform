@@ -3925,17 +3925,36 @@ def test_every_postgres_provisioner_declares_its_class():
     the demo StatefulSet on some runs and as a managed Cluster on others, with nothing
     changed in between. For a database that means the data is in two different places.
 
-    So: every postgres provisioner in the catalog names its class, and this test fails if
-    anyone adds one that does not."""
-    entries = []
+    So: every postgres provisioner names its class, AND no two postgres provisioners that
+    are handed to score-k8s TOGETHER share a class.
+
+    The catalog now ships two `class: application` files (CNPG and StatefulSet), but they
+    are mutually exclusive by construction — select_provisioner_files hands exactly one to
+    a render, chosen by database.backend. So the no-duplicate-class invariant is asserted
+    over the SELECTED set of each backend, not the raw glob; that is a stronger check,
+    since it is precisely the set score-k8s actually sees."""
+    # Every postgres provisioner in the whole catalog still declares a class.
     for path in (CATALOG / "provisioners").glob("*.provisioners.yaml"):
-        entries += [e for e in (yaml.safe_load(path.read_text()) or [])
-                    if e.get("type") == "postgres"]
-    assert entries, "no postgres provisioner found — did the catalog move?"
-    for entry in entries:
-        assert entry.get("class"), f"{entry['uri']} does not declare a class"
-    classes = [e["class"] for e in entries]
-    assert len(classes) == len(set(classes)), f"two provisioners share a class: {classes}"
+        for e in (yaml.safe_load(path.read_text()) or []):
+            if e.get("type") == "postgres":
+                assert e.get("class"), f"{e['uri']} does not declare a class"
+
+    # For EACH backend, the set score-k8s is handed has no two postgres provisioners
+    # sharing a class.
+    for backend in orc.DATABASE_BACKENDS:
+        orig = orc.CONFIG
+        try:
+            orc.CONFIG = orc.EnvConfig({"database": {"backend": backend}})
+            selected = orc.select_provisioner_files(CATALOG)
+        finally:
+            orc.CONFIG = orig
+        classes = [e["class"] for p in selected
+                   for e in (yaml.safe_load(p.read_text()) or [])
+                   if e.get("type") == "postgres"]
+        assert classes, f"backend {backend}: no postgres provisioner selected"
+        assert len(classes) == len(set(classes)), \
+            f"backend {backend}: two provisioners share a class: {classes}"
+        assert "application" in classes, f"backend {backend}: no class:application served"
 
 
 @needs_score_k8s
@@ -5338,3 +5357,333 @@ def test_vault_key_names_never_return_the_values(monkeypatch):
     names = orc.vault_secret_key_names("donhang", "staging", "stripe")
     assert names == {"api_key"}
     assert "sk-live-123" not in repr(names)
+
+
+# =====================================================================================
+# COMPANY-PROFILE COMPATIBILITY — one source tree, two profiles.
+#
+# platform.env.yaml is the harness (github.com + GHCR + CNPG + HTTP Traefik).
+# platform.env.company.yaml is the company shape (GHES + Harbor/HTTPS + StatefulSet
+# postgres on rook-ceph-block + Traefik with an HTTPS websecure listener). These tests
+# prove the SAME renderer serves both: the difference is only coordinates and capability,
+# never a code fork. A "feature off" profile must not grow a prerequisite either.
+# =====================================================================================
+HARNESS_PROFILE = CATALOG / "platform.env.yaml"
+COMPANY_PROFILE = CATALOG / "platform.env.company.yaml"
+
+# The company's real coordinates. This list is a DENYLIST: it exists so the hardcode-scan
+# below can prove none of them leaked into shared source. It is the one place they may be
+# written down in the test suite.
+COMPANY_COORDINATES = (
+    "harbor.stg.exampledevops.com", "stg.exampledevops.com", "exampledevops",
+    "rook-ceph-block", "traefik-gateway", "example-org",
+)
+
+
+def profile_config(profile: Path, **features) -> orc.EnvConfig:
+    """Load a profile, optionally flipping feature flags on for a render test."""
+    data = yaml.safe_load(profile.read_text()) or {}
+    if features:
+        data.setdefault("features", {}).update(features)
+    return orc.EnvConfig(data)
+
+
+PG_APPLICATION_SCORE = {
+    "apiVersion": "score.dev/v1b1",
+    "metadata": {"name": "api"},
+    "containers": {"main": {"image": "."}},
+    "service": {"ports": {"http": {"port": 8080, "targetPort": 8080}}},
+    "resources": {"db": {"type": "postgres", "class": "application"}},
+}
+
+ROUTE_SCORE = {
+    "apiVersion": "score.dev/v1b1",
+    "metadata": {"name": "api"},
+    "containers": {"main": {"image": "."}},
+    "service": {"ports": {"http": {"port": 8080, "targetPort": 8080}}},
+    "resources": {"web": {"type": "route",
+                          "params": {"host": "api.example.test", "port": 8080, "path": "/"}}},
+}
+
+
+def render_docs(tmp_path: Path, score: dict, *, env="staging", app="api",
+                registry="reg.example.test/idp", name="run") -> list[dict]:
+    """Render one score app with whatever orc.CONFIG is currently set, return manifests."""
+    app_dir = tmp_path / f"app-{name}"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    write(app_dir / "score.yaml", score)
+    args = orc.argparse.Namespace(
+        app=app, image=app, tag="sha1", env=env, registry=registry,
+        catalog=str(CATALOG), app_dir=str(app_dir),
+        work=str(tmp_path / name), out=str(tmp_path / name / "out.yaml"),
+        kubeconfig=None, state_file=str(tmp_path / f"{name}-state.yaml"), no_state=False,
+    )
+    orc.cmd_render(args)
+    return orc.load_all(Path(args.work) / "manifests.yaml")
+
+
+# ----------------------------------------------------------------- config: both profiles
+@pytest.mark.parametrize("profile", [HARNESS_PROFILE, COMPANY_PROFILE])
+def test_both_profiles_load_and_expose_required_keys(profile):
+    cfg = orc.EnvConfig.load(str(profile))
+    for key in ("kubernetes.namespace_pattern", "kubernetes.state_namespace",
+                "ingress.gateway_name", "ingress.gateway_namespace",
+                "ingress.section_name", "ingress.route_scheme",
+                "registry.pull_secret", "database.backend"):
+        assert cfg.get(key) is not None, f"{key} missing from {profile.name}"
+
+
+def test_new_keys_have_backward_compatible_defaults():
+    """An install with NO config file (empty) keeps the historical behaviour: CNPG backend,
+    no sectionName, http scheme."""
+    empty = orc.EnvConfig({})
+    assert empty.get("database.backend") == "cnpg"
+    assert empty.get("ingress.section_name") == ""
+    assert empty.get("ingress.route_scheme") == "http"
+
+
+def test_database_backend_enum(monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({}))
+    assert orc.database_backend() == "cnpg"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"database": {"backend": "statefulset"}}))
+    assert orc.database_backend() == "statefulset"
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"database": {"backend": "statefull"}}))
+    with pytest.raises(SystemExit, match="statefull"):
+        orc.database_backend()
+
+
+def test_profiles_choose_their_backend():
+    assert orc.EnvConfig.load(str(HARNESS_PROFILE)).get("database.backend") == "cnpg"
+    assert orc.EnvConfig.load(str(COMPANY_PROFILE)).get("database.backend") == "statefulset"
+
+
+def test_route_scheme_and_section_per_profile():
+    harness = orc.EnvConfig.load(str(HARNESS_PROFILE))
+    company = orc.EnvConfig.load(str(COMPANY_PROFILE))
+    assert (harness.get("ingress.route_scheme"), harness.get("ingress.section_name")) == ("http", "")
+    assert company.get("ingress.route_scheme") == "https"
+    assert company.get("ingress.section_name") == "websecure"
+
+
+# --------------------------------------------------------- provisioner backend selection
+def test_backend_selects_exactly_one_postgres_application_file(monkeypatch):
+    cases = [("cnpg", "postgres-application.provisioners.yaml",
+              "postgres-application-statefulset.provisioners.yaml"),
+             ("statefulset", "postgres-application-statefulset.provisioners.yaml",
+              "postgres-application.provisioners.yaml")]
+    for backend, want, drop in cases:
+        monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig({"database": {"backend": backend}}))
+        names = [p.name for p in orc.select_provisioner_files(CATALOG)]
+        assert want in names and drop not in names, backend
+        # every OTHER provisioner is always present regardless of backend
+        assert "local.provisioners.yaml" in names and "secret.provisioners.yaml" in names
+
+
+# ----------------------------------------------------------------- render matrix (real)
+@needs_score_k8s
+def test_statefulset_backend_renders_a_real_statefulset_from_config(tmp_path, monkeypatch):
+    cfg = profile_config(COMPANY_PROFILE, postgres_application=True, vault_secrets=True)
+    monkeypatch.setattr(orc, "CONFIG", cfg)
+    docs = render_docs(tmp_path, PG_APPLICATION_SCORE, name="sts")
+    kinds = {d["kind"] for d in docs}
+    assert "StatefulSet" in kinds
+    # backend=statefulset must NOT emit any CNPG object
+    assert not any(str(d.get("apiVersion", "")).startswith("postgresql.cnpg.io") for d in docs)
+
+    sts = next(d for d in docs if d["kind"] == "StatefulSet")
+    vct = sts["spec"]["volumeClaimTemplates"][0]
+    # StorageClass + size come from config/profile, never a literal in the catalog
+    assert vct["spec"]["storageClassName"] == cfg.get("kubernetes.storage_class")
+    assert vct["spec"]["resources"]["requests"]["storage"] == \
+        cfg.get("database_profiles.staging.application.storage")
+    # image = repository(config):engine_version(profile)
+    want_image = f'{cfg.get("database.image_repository")}:' \
+                 f'{cfg.get("database_profiles.staging.application.engine_version")}'
+    container = sts["spec"]["template"]["spec"]["containers"][0]
+    assert container["image"] == want_image
+    # imagePullSecret injected from config (private registry pull)
+    assert sts["spec"]["template"]["spec"]["imagePullSecrets"] == \
+        [{"name": cfg.get("registry.pull_secret")}]
+    # password is NEVER a literal: it comes from the VSO-synced Secret via secretKeyRef
+    pw = next(e for e in container["env"] if e["name"] == "POSTGRES_PASSWORD")
+    assert "value" not in pw and pw["valueFrom"]["secretKeyRef"]["key"] == "password"
+    # credential is a VaultStaticSecret (reference), and no core Secret carries data
+    assert any(d["kind"] == "VaultStaticSecret" for d in docs)
+    assert not any(d["kind"] == "Secret" and d.get("data") for d in docs)
+    # app-facing host is the SAME `<cluster>-rw` Service name CNPG would create
+    assert any(d["kind"] == "Service" and d["metadata"]["name"].endswith("-rw") for d in docs)
+    # single instance — no accidental HA/split-brain
+    assert sts["spec"]["replicas"] == 1
+
+
+@needs_score_k8s
+def test_cnpg_backend_is_unchanged_by_the_new_key(tmp_path, monkeypatch):
+    cfg = profile_config(HARNESS_PROFILE, postgres_application=True, vault_secrets=True)
+    assert cfg.get("database.backend") == "cnpg"
+    monkeypatch.setattr(orc, "CONFIG", cfg)
+    docs = render_docs(tmp_path, PG_APPLICATION_SCORE, name="cnpg")
+    assert any(str(d.get("apiVersion", "")).startswith("postgresql.cnpg.io")
+               and d["kind"] == "Cluster" for d in docs)
+    assert not any(d["kind"] == "StatefulSet" for d in docs)
+
+
+@needs_score_k8s
+def test_statefulset_prod_is_refused_no_backup_no_ha(tmp_path, monkeypatch):
+    cfg = profile_config(COMPANY_PROFILE, postgres_application=True, vault_secrets=True)
+    monkeypatch.setattr(orc, "CONFIG", cfg)
+    with pytest.raises(SystemExit, match="statefulset"):
+        render_docs(tmp_path, PG_APPLICATION_SCORE, env="prod", name="stsprod")
+
+
+# ------------------------------------------------------------------ gateway sectionName
+@needs_score_k8s
+def test_route_sectionName_is_config_driven(tmp_path, monkeypatch):
+    # empty section_name (harness) -> no sectionName written, old manifest shape
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig.load(str(HARNESS_PROFILE)))
+    docs = render_docs(tmp_path, ROUTE_SCORE, name="route-h")
+    route = next(d for d in docs if d["kind"] == "HTTPRoute")
+    assert "sectionName" not in route["spec"]["parentRefs"][0]
+
+    # company -> attaches to the HTTPS websecure listener
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig.load(str(COMPANY_PROFILE)))
+    docs = render_docs(tmp_path, ROUTE_SCORE, name="route-c")
+    route = next(d for d in docs if d["kind"] == "HTTPRoute")
+    pref = route["spec"]["parentRefs"][0]
+    assert pref["name"] == "traefik-gateway" and pref["sectionName"] == "websecure"
+
+
+# ------------------------------------------------------------------- github.com vs GHES
+def test_config_repo_url_follows_github_server_url(monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"git": {"org": "acme", "config_repo_pattern": "{app}-config"}}))
+    monkeypatch.delenv("GITHUB_SERVER_URL", raising=False)
+    assert orc.onboarding_config_repo_url("shop") == "https://github.com/acme/shop-config"
+    # GHES runner exports the enterprise base URL; the platform must use it verbatim
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://ghes.example.internal")
+    assert orc.onboarding_config_repo_url("shop") == \
+        "https://ghes.example.internal/acme/shop-config"
+    # a trailing slash on the env var must not double up
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://ghes.example.internal/")
+    assert orc.onboarding_config_repo_url("shop") == \
+        "https://ghes.example.internal/acme/shop-config"
+
+
+# --------------------------------------------------------------------------- doctor matrix
+def make_probe(present):
+    """Fake read-only cluster probe: a resource named in `present` exists, else NotFound."""
+    def probe(args):
+        # args is ["get", <kind>, <name>, ...tail..., "-o", "name"]
+        name = args[2]
+        if name in present:
+            return (0, name + "\n", "")
+        return (1, "", "Error from server (NotFound): namespaces \"x\" not found")
+    return probe
+
+
+def _levels(results, capability):
+    return [r["level"] for r in results if r["capability"] == capability]
+
+
+def test_doctor_skips_database_and_vault_when_features_off(monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", profile_config(COMPANY_PROFILE))  # all flags off
+    res = orc.run_doctor_checks(make_probe(set()))
+    caps = {r["capability"] for r in res}
+    assert not any(c.startswith("database.") for c in caps)  # no DB prerequisite at all
+    assert "vault.vso" not in caps
+    assert any(r["capability"] == "database" and r["level"] == "SKIP" for r in res)
+    assert any(r["capability"] == "vault" and r["level"] == "SKIP" for r in res)
+
+
+def test_doctor_cnpg_backend_checks_cnpg_crd(monkeypatch):
+    cfg = profile_config(HARNESS_PROFILE, postgres_application=True)
+    monkeypatch.setattr(orc, "CONFIG", cfg)
+    # storageclass present, CNPG CRD absent -> blocker on cnpg
+    res = orc.run_doctor_checks(make_probe({cfg.get("kubernetes.storage_class")}))
+    assert "FAIL" in _levels(res, "database.cnpg")
+    # CNPG CRD present -> ok
+    res = orc.run_doctor_checks(make_probe(
+        {cfg.get("kubernetes.storage_class"), "clusters.postgresql.cnpg.io"}))
+    assert _levels(res, "database.cnpg") == ["OK"]
+
+
+def test_doctor_statefulset_backend_never_checks_cnpg(monkeypatch):
+    cfg = profile_config(COMPANY_PROFILE, postgres_application=True)
+    monkeypatch.setattr(orc, "CONFIG", cfg)
+    res = orc.run_doctor_checks(make_probe({cfg.get("kubernetes.storage_class")}))
+    assert not any(r["capability"] == "database.cnpg" for r in res)
+    assert "OK" in _levels(res, "database.storage")   # rook-ceph-block resolved + present
+    assert "OK" in _levels(res, "database.backend")   # states it skips CNPG on purpose
+
+
+def test_doctor_missing_storageclass_and_gateway_are_blockers(monkeypatch):
+    cfg = profile_config(COMPANY_PROFILE, postgres_application=True)
+    monkeypatch.setattr(orc, "CONFIG", cfg)
+    res = orc.run_doctor_checks(make_probe(set()))   # nothing exists
+    assert "FAIL" in _levels(res, "database.storage")
+    assert "FAIL" in _levels(res, "gateway")
+
+
+def test_doctor_vault_on_requires_vso(monkeypatch):
+    cfg = profile_config(HARNESS_PROFILE, vault_secrets=True)
+    monkeypatch.setattr(orc, "CONFIG", cfg)
+    res = orc.run_doctor_checks(make_probe(set()))   # VSO CRD absent
+    assert "FAIL" in _levels(res, "vault.vso")
+
+
+def test_doctor_config_only_mode_never_false_fails_cluster_facts(monkeypatch):
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig.load(str(COMPANY_PROFILE)))
+    res = orc.run_doctor_checks(probe=None)   # no cluster
+    # a can't-check is a WARN, never a FAIL — no green-on-unknown, no false-red either
+    assert "WARN" in _levels(res, "gateway")
+    assert not any(r["level"] == "FAIL" for r in res)
+
+
+# --------------------------------------------------------------------------- hardcode scan
+def _noncomment(text: str) -> str:
+    return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+
+
+def test_no_company_coordinates_leak_into_shared_source():
+    """Company endpoints/identifiers live ONLY in platform.env.company.yaml. They must not
+    appear in the renderer, the catalog, or the gap register."""
+    targets = [CATALOG / "orchestrate.py"]
+    targets += sorted((CATALOG / "provisioners").glob("*.yaml"))
+    targets += sorted((CATALOG / "patches").glob("*.tpl"))
+    gap = CATALOG / "GAP-REGISTER.md"
+    if gap.exists():
+        targets.append(gap)
+    for f in targets:
+        text = f.read_text()
+        for lit in COMPANY_COORDINATES:
+            assert lit not in text, f"company coordinate {lit!r} leaked into {f.name}"
+
+
+def test_catalog_uses_placeholders_not_literal_infrastructure():
+    """Provisioners and patches carry SHAPE; every infra coordinate is a %%placeholder%%.
+    A literal registry host or storage backend here is the exact leak this scan blocks."""
+    banned = ("ghcr.io", "mirror.gcr.io", "harbor.", "rook-ceph", "cloudnative-pg/")
+    for f in sorted((CATALOG / "provisioners").glob("*.yaml")) + \
+            sorted((CATALOG / "patches").glob("*.tpl")):
+        body = _noncomment(f.read_text())
+        for lit in banned:
+            assert lit not in body, f"{lit!r} hardcoded (non-comment) in {f.name}"
+
+
+def test_user_facing_github_host_is_not_hardcoded():
+    """The only github.com literal in the renderer is the documented fallback default in
+    git_server_url; every other user-facing URL derives from GITHUB_SERVER_URL."""
+    src = (CATALOG / "orchestrate.py").read_text().splitlines()
+    offenders = []
+    for i, line in enumerate(src, 1):
+        if "github.com" not in line:
+            continue
+        # allow: comments, docstring prose, and the single fallback expression
+        stripped = line.strip()
+        if stripped.startswith("#") or "GITHUB_SERVER_URL" in line:
+            continue
+        if '"https://github.com"' in line or "`https://github.com`" in line:
+            continue
+        if "github.com" in line and ("Hardcoding" in line or "a github.com literal" in line):
+            continue  # git_server_url docstring
+        offenders.append((i, stripped))
+    assert not offenders, f"hardcoded github.com outside allowlist: {offenders}"

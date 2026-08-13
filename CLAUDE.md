@@ -28,6 +28,7 @@ INFRASTRUCTURE VALUES HERE".
 - `guard_ordering` — không để commit cũ đè commit mới hơn.
 - `verify` chờ rollout thật (`updatedReplicas`/`observedGeneration`), không nhìn `availableReplicas` (nhìn nhầm sẽ báo xanh khi cụm chưa lên).
 - **Catalog = hình dạng; `platform.env.yaml` = toạ độ theo env** (`%%placeholder%%`). Trộn hai thứ là nguồn lỗi im lặng.
+- **`database.backend: cnpg|statefulset`** chọn hiện thực `class: application` qua config (mặc định `cnpg` = cũ). `select_provisioner_files` chỉ đưa MỘT file `class: application` cho score-k8s; backend `statefulset` một-bản-sao, bị chặn ở prod (không HA/backup). Output app GIỐNG NHAU hai backend — xem `GAP-REGISTER.md`, `HUONG-DAN-KIEM-THU.md` (company compatibility).
 - GitRepo: liệt-kê-rồi-khớp, không giả định tên `{app}-{env}`, không ghi đè của team khác.
 - Giữ tương thích ngược; các comment "vì sao" là lịch sử lỗi đã trả giá — đọc trước khi đổi, đừng xoá.
 
