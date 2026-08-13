@@ -1148,8 +1148,14 @@ def write_environment_provisioner(resolved: dict, dest: Path, *, app: str, env: 
         warn(f"{VALUES_REL}: secret value(s) {secret_keys} are not referenced by any "
              "workload — no VaultStaticSecret generated for them.")
 
-    body = yaml.safe_dump(literals, sort_keys=True, default_flow_style=False,
-                          allow_unicode=True) if literals else "{}\n"
+    # A secret-only environment must not start with ``{}``.  Appending secret reference
+    # fields after that flow-style empty mapping produces two top-level YAML values; the
+    # provisioner decoder keeps the empty map, so Score reports every secret key missing.
+    # Emit an empty prefix when bindings will supply the mapping entries.  Keep ``{}`` for
+    # the genuinely empty/unused case so the provisioner still has a valid output object.
+    body = (yaml.safe_dump(literals, sort_keys=True, default_flow_style=False,
+                           allow_unicode=True) if literals else
+            ("" if bindings else "{}\n"))
     outputs = _indent(_go_template_safe(body), 4)
     manifests = ""
     for workload in sorted({b["workload"] for b in bindings}):

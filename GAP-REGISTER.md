@@ -9,7 +9,7 @@
 
 | Loại | Số | Có sửa code |
 |---|---|---|
-| `PORTABILITY_CODE_GAP` | 3 | ✅ DATABASE-02 (backend statefulset), GATEWAY-06 (sectionName), REGISTRY-05 (log credential) |
+| `PORTABILITY_CODE_GAP` | 4 | ✅ DATABASE-02 (backend statefulset), GATEWAY-06 (sectionName), REGISTRY-05 (log credential), VAULT-08 (secret-only output) |
 | `CONFIG_ONLY` | 9 | không (source đã hỗ trợ, chỉ điền config) |
 | `SECRET_OR_VARIABLE` | 3 | không (source đã biểu diễn reference) |
 | `INFRA_PREREQUISITE` | 6 | không (đội hạ tầng cấp) |
@@ -77,6 +77,21 @@ Hai khe hở code phụ nhỏ được xử lý kèm (URL scheme/host user-facin
 - **Test bảo vệ:** `tools/thu-nghiem-registry-private.sh` fail nếu log chứa password thật
   hoặc không có marker `<redacted>`.
 - **Trạng thái:** ĐÃ SỬA — runtime registry PASS, transcript chỉ còn `<redacted>`.
+
+### VAULT-08 — environment chỉ có `secretRef` render thành map rỗng
+- **Domain:** vault + application values.
+- **Mô tả:** app chỉ dùng secret, không có literal config, từng sinh provisioner với `{}` ở
+  đầu `outputs` rồi mới nối key `secretRef`. Score nhận map rỗng và báo key không tồn tại.
+- **Bằng chứng source:** `write_environment_provisioner()` dùng `{}` mỗi khi `literals` rỗng,
+  dù phía sau còn binding theo workload.
+- **Bằng chứng harness:** `tools/thu-nghiem-vault-e2e.sh` phát hiện bằng render thật; sau sửa,
+  cùng fixture render/apply được, VSO `Synced` và container nhận đúng giá trị.
+- **Phân loại:** phát hiện bổ sung → `PORTABILITY_CODE_GAP`.
+- **Sửa code:** CÓ. Chỉ sinh `{}` khi output thật sự rỗng; secret-only bắt đầu trực tiếp bằng
+  các entry do `encodeSecretRef` tạo.
+- **Test bảo vệ:** Vault/VSO runtime E2E (bao gồm secret-only, không `_raw`, prefix isolation,
+  RBAC, outage/recovery và owner cleanup).
+- **Trạng thái:** ĐÃ SỬA — runtime PASS.
 
 ### PORT-URL — scheme/host của URL người-dùng-thấy (khe hở phụ)
 - **Domain:** gateway + ghes

@@ -7,9 +7,9 @@ chỉ vì không biết có harness.
 
 ## Harness là gì (một câu)
 
-Là **một bộ test pytest duy nhất** — `test_orchestrate.py` — import thẳng `orchestrate.py`,
-render **catalog thật** của repo với `platform.env.yaml` thật, rồi khẳng định hành vi.
-Không có server, không Makefile, không CI riêng để dựng. Chỉ pytest.
+Là **hai lớp dùng chung source/catalog thật**: `test_orchestrate.py` kiểm logic nhanh, còn
+`tools/dung-*-harness.sh` + `tools/thu-nghiem-*.sh` dựng capability trên các cụm `kind-*` và
+đo workload chạy thật. Pytest xanh không thay thế lớp runtime.
 
 ## Chạy thế nào
 
@@ -46,7 +46,7 @@ Mỗi "mảng" test canh một bất biến. Test đỏ ở mảng nào = bạn 
 | `environment config` | Đọc đúng giá trị theo env từ `platform.env.yaml`. |
 | `image naming` / `retag` / `per-service tagging` | `image-plan`, `tag_strategy` commit vs content. |
 | `multi-workload` / `cross-repo service dependencies` | `${resources.x}` chéo workload/repo resolve đúng. |
-| `app-owned secrets` / `vault paths` / `secretRef shape` | **Tính năng secret đang làm** (nhánh `feature/secret-onboarding`): secret ref/Vault path render ra `secretRef`, giá trị **không** vào manifest. |
+| `app-owned secrets` / `vault paths` / `secretRef shape` | Secret ref/Vault path render ra `secretRef`, giá trị **không** vào manifest. |
 | `kiểm cụm sau khi triển khai` | Logic `verify`: chờ rollout thật, không nhìn `availableReplicas`. |
 | `PHASE 5 — stack catalog` | Catalog `templates/stacks/` tự nhất quán; sinh app không để sót `__TOKEN__`; `.env.example` không lệch khỏi values. |
 | `PHASE 5 — tích hợp score-compose` | Chạy **chính `make generate`** của app sinh ra: routing `/api` phải đứng trước `/` bất kể tên workload, và nginx phải re-resolve DNS. |
@@ -171,6 +171,19 @@ apply `VaultConnection`+`VaultAuthGlobal` sinh từ config, rồi tự kiểm b�
 Vault dev mode **mất sạch dữ liệu khi pod restart** — chạy lại script để dựng lại mount,
 nhưng secret đã ghi thì phải ghi lại. Công ty đã có Vault thật ⇒ **không** chạy script này,
 chỉ điền `vault.*` rồi chạy `orchestrate.py vault-foundation --apply`.
+
+**Vault/VSO E2E thật (có chủ ý làm Vault gián đoạn):**
+
+```bash
+./tools/thu-nghiem-vault-e2e.sh --context kind-staging
+```
+
+Nó dùng một app throwaway để đi hết `secret-set` → render `VaultStaticSecret` → VSO sync →
+container nhận biến, kiểm không có `_raw`, chặn prefix app khác và kiểm RBAC không đọc được
+Kubernetes Secret. Sau đó script scale Vault dev về 0, xác minh app đang chạy vẫn sống và
+VSO thấy lỗi nguồn, dựng/bootstrap Vault lại, ghi lại secret rồi đòi VSO `Synced` và owner
+cleanup. Vì restart xoá **toàn bộ** dữ liệu Vault dev, chỉ chạy bài này trên harness thử nghiệm;
+những fixture khác phải tự seed lại policy/role/secret nếu còn cần.
 
 Onboard một app vào Vault (hai nửa, hai chủ sở hữu — xem ADR `0007`):
 
@@ -303,7 +316,9 @@ hardcode-scan (không literal công ty trong source dùng chung + GAP-REGISTER).
 
 **Đã chứng minh RUNTIME (cụm thật):** StatefulSet backend (Ready · PVC Bound · SQL · bền qua
 restart); Gateway HTTPS (`sectionName`, route conditions, TLS 200); registry private
-(TLS/custom CA/auth, push, imagePullSecret, pull); doctor read-only trên `kind-staging`.
+(TLS/custom CA/auth, push, imagePullSecret, pull); Vault/VSO (secret-only render, sync,
+prefix isolation, no-secret RBAC, outage continuity, bootstrap + resync, owner cleanup);
+doctor read-only trên `kind-staging`.
 **Mới chứng minh RENDER/MOCK:** route scheme, GHES URL, backend selection, guard prod.
 **Prerequisite production còn thiếu:** backup backend cho database prod, VSO + Vault role cho
 `vault_secrets`, và mirror đủ ảnh nền về Harbor thật.
