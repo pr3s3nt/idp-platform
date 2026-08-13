@@ -161,6 +161,10 @@ DEFAULTS: dict = {
         "ready_timeout_seconds": 600,
     },
     "onboarding": {
+        # Kill switch riêng cho máy trạng thái tạo app. Không dùng
+        # features.stack_onboarding cho việc này: cờ feature đó còn quyết định cách các
+        # app stack ĐÃ TỒN TẠI resolve tag strategy khi deploy.
+        "enabled": True,
         # Bản ghi state của một lần onboarding. Tên ConfigMap là quy ước đặt tên, tức là
         # thứ một công ty có thể đã có luật riêng.
         "state_configmap_pattern": "idp-onboarding-{app}",
@@ -381,6 +385,15 @@ def feature(name: str) -> bool:
     radius of a bug is the apps that opted in, not every app at once.
     """
     return bool(CONFIG.get(f"features.{name}", False))
+
+
+def require_onboarding_enabled() -> None:
+    """Fail before onboarding can create or mutate any external resource."""
+    if not bool(CONFIG.get("onboarding.enabled", True)):
+        raise SystemExit(
+            "App onboarding is disabled by onboarding.enabled=false in the environment "
+            "config. Existing app deploys and `onboard-status` remain available."
+        )
 
 
 DATABASE_BACKENDS = ("cnpg", "statefulset")
@@ -5048,6 +5061,7 @@ def step_validate(ctx: OnboardContext) -> None:
     namespace và credential rồi mới phát hiện platform chưa bật tính năng là để lại một
     đống rác mà không ai dọn.
     """
+    require_onboarding_enabled()
     if not feature("stack_onboarding"):
         raise SystemExit(
             "features.stack_onboarding is off in platform.env.yaml. Onboarding sinh ra kho "
@@ -5728,6 +5742,9 @@ def onboarding_summary(record: dict) -> str:
 
 
 def cmd_onboard(args) -> None:
+    # Gate before even loading the request or creating its state ConfigMap. A disabled
+    # command must have zero external side effects, including when resuming an old record.
+    require_onboarding_enabled()
     request = load_onboarding_request(args.request, getattr(args, "catalog", None))
     store = make_onboarding_store(request["application"]["name"], args)
     record = load_or_create_record(store, request)
@@ -5759,6 +5776,9 @@ def cmd_onboard_status(args) -> None:
 def cmd_onboard_activate_prod(args) -> None:
     """12 của mục 13.3. Lệnh RIÊNG, không phải một cờ của `onboard` — và đó là chủ ý:
     đưa một app lên production là một quyết định, không phải một bước tiếp theo."""
+    # Production activation is part of onboarding too; disabling only the initial command
+    # would leave an existing STAGING_READY record able to mutate production.
+    require_onboarding_enabled()
     ctx = _record_context(args)
     allowed = ("STAGING_READY", "PENDING_PROD_ACTIVATION", "PROVISIONING_PROD",
                "PENDING_PROD_APPROVAL", "VERIFYING_PROD", "READY",

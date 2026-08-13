@@ -212,6 +212,11 @@ và chỉ ghi khi có `--write`.
 
 **Onboarding một app mới từ đầu (Phase 6):**
 
+Onboarding hiện bị tắt bằng `onboarding.enabled: false`. Khi cần mở lại có chủ ý, đổi key
+đó thành `true`; `features.stack_onboarding` là capability của stack/deploy và không phải
+kill switch vận hành. Khi tắt, `onboard` (kể cả resume) và `onboard-activate-prod` dừng trước
+mọi thao tác ghi, còn `onboard-status` và deploy app hiện hữu vẫn hoạt động.
+
 ```bash
 # 1. Kho object cho backup — BẮT BUỘC nếu app xin database và có bật prod.
 #    Render prod bị CHẶN khi database.backup.object_store_url rỗng (fail-closed có chủ ý).
