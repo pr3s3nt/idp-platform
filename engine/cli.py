@@ -8,6 +8,7 @@ from . import catalog as _catalog
 from . import render as _render
 from . import delivery as _delivery
 from . import onboarding as _onboarding
+from . import audit as _audit
 for _module in (_context, _resources, _catalog, _render, _delivery, _onboarding):
     globals().update({n: getattr(_module, n) for n in dir(_module) if not n.startswith("__")})
 def cmd_config(args) -> None:
@@ -59,6 +60,97 @@ def cmd_image_plan(args) -> None:
         specs = build_specs(app_dir, services, getattr(args, "catalog", None))
         plan = {w: dict(specs[w], image=ref) for w, ref in plan.items()}
     print(json.dumps(plan, indent=2, sort_keys=True))
+
+# ---- audit / KPI subcommands. All SQL lives in engine/audit.py; these are thin adapters.
+# Every one returns fast when audit is disabled, so a workflow can call them unconditionally
+# and a brownfield install (audit off) pays nothing and touches no database.
+def _audit_identity(args):
+    return _audit.identity_from(
+        args.app, args.env,
+        repository=(getattr(args, "repository", "") or None),
+        run_id=(getattr(args, "run_id", "") or None),
+        run_attempt=(getattr(args, "run_attempt", "") or None),
+        workflow=(getattr(args, "workflow", "") or None),
+    )
+
+
+def _print_json(obj) -> None:
+    print(json.dumps(obj if obj is not None else {"audit": "disabled"},
+                     indent=2, sort_keys=True, default=str))
+
+
+def cmd_audit_migrate(args) -> None:
+    if not _audit.settings().enabled:
+        _print_json({"audit": "disabled"})
+        return
+    _print_json({"applied": _audit.run_migrations() or []})
+
+
+def cmd_audit_start(args) -> None:
+    ident = _audit_identity(args)
+    _print_json(_audit.start_deployment(
+        ident, trigger=args.trigger or None, actor=args.actor or None,
+        run_url=args.run_url or None, app_sha=args.app_sha or None,
+        platform_sha=args.platform_sha or None, runner_label=args.runner_label or None,
+        runner_name=args.runner_name or None, queued_at=args.queued_at or None,
+        owner=args.owner or None, stack_id=args.stack_id or None,
+        stack_version=args.stack_version or None))
+
+
+def cmd_audit_event(args) -> None:
+    ident = _audit_identity(args)
+    metadata = json.loads(args.metadata) if args.metadata else None
+    _print_json(_audit.record_event(
+        ident, stage=args.stage, status=args.status, category=args.category or None,
+        message=args.message or None, duration_ms=args.duration_ms, metadata=metadata,
+        seq=args.seq, key=args.key or None))
+
+
+def cmd_audit_finish(args) -> None:
+    ident = _audit_identity(args)
+    _print_json(_audit.finish_deployment(
+        ident, status=args.status, failure_stage=args.failure_stage or None,
+        failure_category=args.failure_category or None, message=args.message or None))
+
+
+def cmd_audit_snapshot(args) -> None:
+    if not _audit.settings().enabled:
+        _print_json({"audit": "disabled"})
+        return
+    ident = _audit_identity(args)
+    snap = _audit.collect_snapshot(
+        args.app, args.env, args.manifests, kubeconfig=args.kubeconfig,
+        config_repo=args.config_repo or None, config_commit=args.config_commit or None,
+        app_sha=args.app_sha or None, platform_sha=args.platform_sha or None,
+        read_cluster=not args.no_cluster)
+    _print_json(_audit.save_snapshot(ident, snap))
+
+
+def cmd_audit_report(args) -> None:
+    data = _audit.report(date_from=args.date_from or None, date_to=args.date_to or None,
+                         app=args.app or None, environment=args.environment or None)
+    if args.format == "json":
+        _print_json(data)
+    else:
+        print(_audit.format_report(data))
+
+
+def cmd_notify_failure(args) -> None:
+    ident = _audit_identity(args)
+    # Explicit flag wins; then the category finish_deployment already stored for this
+    # deployment (so comment and DB agree); then a fresh classify from stage/message.
+    category = (args.category or _audit.stored_category(ident)
+                or _audit.classify(args.stage, args.message or None))
+    # The comment lands on the APP commit, so its repo (--commit-repo) is separate from the
+    # identity repo (the platform repo the workflow runs in). Keeping them apart means the
+    # dedup key still matches the deployment audit-start created.
+    res = _audit.notify_failure(
+        ident, stage=args.stage, category=category,
+        commit_sha=args.commit or args.app_sha or "", run_url=args.run_url or "",
+        token=args.token or None, platform_sha=args.platform_sha or None,
+        repository=args.commit_repo or args.repository or None)
+    _print_json(res)
+
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -341,6 +433,96 @@ def main(argv: list[str] | None = None) -> None:
                    choices=("from-staging", "tag-only", "re-render"))
     p.add_argument("--config-dir", required=True)
     p.set_defaults(func=cmd_promote)
+
+    # ---- audit / KPI. The identity flags default from the GitHub Actions environment, so
+    # a workflow step only spells out what differs; a hand-replay passes them explicitly.
+    # The deployment id is DERIVED from (repository, run id, run attempt, app, env,
+    # workflow) — a random id would turn a same-attempt re-run into a phantom deployment.
+    def add_audit_identity(p):
+        p.add_argument("--app", required=True)
+        p.add_argument("--env", required=True, choices=("staging", "prod"))
+        p.add_argument("--workflow", default="")
+        p.add_argument("--repository", default="")
+        p.add_argument("--run-id", default="")
+        p.add_argument("--run-attempt", default="")
+
+    p = sub.add_parser("audit-migrate",
+                       help="tạo/di cư schema audit (chạy lại an toàn); no-op nếu audit tắt")
+    p.set_defaults(func=cmd_audit_migrate)
+
+    p = sub.add_parser("audit-start",
+                       help="ghi bắt đầu một lần deploy (idempotent theo run/attempt)")
+    add_audit_identity(p)
+    p.add_argument("--trigger", default="")
+    p.add_argument("--actor", default="")
+    p.add_argument("--run-url", default="")
+    p.add_argument("--app-sha", default="")
+    p.add_argument("--platform-sha", default="")
+    p.add_argument("--runner-label", default="")
+    p.add_argument("--runner-name", default="")
+    p.add_argument("--queued-at", default="")
+    p.add_argument("--owner", default="")
+    p.add_argument("--stack-id", default="")
+    p.add_argument("--stack-version", default="")
+    p.set_defaults(func=cmd_audit_start)
+
+    p = sub.add_parser("audit-event", help="ghi một mốc timeline (append-only, chống trùng)")
+    add_audit_identity(p)
+    p.add_argument("--stage", required=True)
+    p.add_argument("--status", required=True,
+                   choices=("start", "success", "failure", "warning", "cancelled", "info"))
+    p.add_argument("--category", default="")
+    p.add_argument("--message", default="")
+    p.add_argument("--duration-ms", type=int, default=None)
+    p.add_argument("--metadata", default="", help="JSON không nhạy cảm")
+    p.add_argument("--seq", type=int, default=None)
+    p.add_argument("--key", default="", help="khoá chống trùng, mặc định <stage>:<status>")
+    p.set_defaults(func=cmd_audit_event)
+
+    p = sub.add_parser("audit-finish", help="đóng một lần deploy với trạng thái cuối")
+    add_audit_identity(p)
+    p.add_argument("--status", required=True,
+                   choices=("success", "failure", "cancelled"))
+    p.add_argument("--failure-stage", default="")
+    p.add_argument("--failure-category", default="")
+    p.add_argument("--message", default="")
+    p.set_defaults(func=cmd_audit_finish)
+
+    p = sub.add_parser("audit-snapshot",
+                       help="chụp read-only tài nguyên/ảnh/backend của một deploy đã verify")
+    add_audit_identity(p)
+    p.add_argument("--manifests", required=True)
+    p.add_argument("--kubeconfig")
+    p.add_argument("--config-repo", default="")
+    p.add_argument("--config-commit", default="")
+    p.add_argument("--app-sha", default="")
+    p.add_argument("--platform-sha", default="")
+    p.add_argument("--no-cluster", action="store_true",
+                   help="chỉ đọc manifest, không truy cập cụm (test/hand-replay)")
+    p.set_defaults(func=cmd_audit_snapshot)
+
+    p = sub.add_parser("audit-report", help="KPI vận hành của nền tảng (baseline)")
+    p.add_argument("--from", dest="date_from", default="")
+    p.add_argument("--to", dest="date_to", default="")
+    p.add_argument("--app", default="")
+    p.add_argument("--environment", default="")
+    p.add_argument("--format", choices=("table", "json"), default="table")
+    p.set_defaults(func=cmd_audit_report)
+
+    p = sub.add_parser("notify-failure",
+                       help="bình luận lỗi deploy lên commit app (chống spam theo marker)")
+    add_audit_identity(p)
+    p.add_argument("--stage", default="")
+    p.add_argument("--category", default="")
+    p.add_argument("--message", default="")
+    p.add_argument("--commit", default="", help="SHA commit app để bình luận (mặc định --app-sha)")
+    p.add_argument("--commit-repo", default="",
+                   help="repo chứa commit app để bình luận (mặc định = repo danh tính)")
+    p.add_argument("--app-sha", default="")
+    p.add_argument("--run-url", default="")
+    p.add_argument("--platform-sha", default="")
+    p.add_argument("--token", default="", help="mặc định GITHUB_TOKEN/GH_TOKEN")
+    p.set_defaults(func=cmd_notify_failure)
 
     args = ap.parse_args(argv)
     set_config(EnvConfig.load(args.env_config))

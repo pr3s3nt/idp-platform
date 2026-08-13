@@ -9,9 +9,9 @@ from __future__ import annotations
 import sys
 from types import ModuleType
 
-from . import context, resources, values, catalog, render, delivery, onboarding, cli
+from . import context, resources, values, catalog, render, delivery, onboarding, audit, cli
 
-_MODULES = (context, resources, values, catalog, render, delivery, onboarding, cli)
+_MODULES = (context, resources, values, catalog, render, delivery, onboarding, audit, cli)
 
 
 def __getattr__(name: str):

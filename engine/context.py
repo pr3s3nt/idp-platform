@@ -164,6 +164,28 @@ DEFAULTS: dict = {
         "postgres_application": False,
         "stack_onboarding": False,
     },
+    # Audit/history store. OFF by default and self-contained: with `enabled: false`
+    # every `idpctl audit-*` command returns before touching a driver or a socket, so a
+    # brownfield install renders and deploys exactly as it did before this module existed.
+    # The connection string is NEVER stored here — only the NAME of the environment
+    # variable that carries it (see engine/audit.py, docs/adr/0002-vault-only-secret-store).
+    "audit": {
+        "enabled": False,
+        # fail-open (False) vs fail-closed (True): may a history-store outage let the
+        # deploy proceed with a warning, or must it fail the run? Default fail-open so the
+        # audit trail never becomes a new way to take real deploys down.
+        "required": False,
+        # Name of the env var holding the libpq connection string. Value lives in a CI
+        # secret; it is never logged and never written to the database.
+        "database_url_env": "AUDIT_DATABASE_URL",
+        # A short connect timeout keeps the history store from ever hanging a deploy.
+        "connect_timeout_seconds": 5,
+        # Minimum retention for the manual prune helper; audit itself never UPDATEs or
+        # DELETEs history. 0 means "keep everything".
+        "retention_days": 365,
+        "notify_failure": True,
+        "notification_mode": "commit-comment",
+    },
 }
 
 # The two environment names the platform accepts, everywhere. `production` is deliberately
