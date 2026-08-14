@@ -235,9 +235,17 @@ jobs:
       # GITHUB_TOKEN mặc định KHÔNG dispatch được sang repo khác, nên bắt buộc dùng PAT.
       - name: Dispatch deploy-request tới platform
         env:
+          # gh chọn token theo host: github.com đọc GH_TOKEN, host GHES đọc
+          # GH_ENTERPRISE_TOKEN. Set cả hai bằng CÙNG một secret để chạy đúng ở cả hai loại
+          # host mà không phải biết trước đang ở đâu. Thừa một biến ở host kia là vô hại.
           GH_TOKEN: ${{ secrets.PLATFORM_DISPATCH_TOKEN }}
+          GH_ENTERPRISE_TOKEN: ${{ secrets.PLATFORM_DISPATCH_TOKEN }}
         run: |
           set -euo pipefail
+          # gh với đường dẫn tương đối mặc định gọi github.com; trên GHES token GHES bị trả
+          # 401. Ép gh gọi đúng host của lần chạy này qua GITHUB_SERVER_URL (Actions luôn đặt:
+          # github.com -> "github.com", GHES -> host công ty). Bỏ scheme vì GH_HOST cần host trần.
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
           # Nhánh quyết định môi trường đích.
           DEPLOY_ENV=staging
           [ "$GITHUB_REF_NAME" = "main" ] && DEPLOY_ENV=prod

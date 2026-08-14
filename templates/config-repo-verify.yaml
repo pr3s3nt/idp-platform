@@ -19,6 +19,9 @@
 #   cấu hình. Làm một lần, kho cấu hình mới tự có, không phải nhớ bước 3 nữa.
 #
 # GITHUB_TOKEN mặc định KHÔNG gọi được sang kho khác nên bắt buộc phải có token riêng.
+#
+# Chạy được ở cả github.com lẫn GitHub Enterprise Server: host lấy từ GITHUB_SERVER_URL của
+# lần chạy, không gán cứng; token cấp qua cả GH_TOKEN lẫn GH_ENTERPRISE_TOKEN để gh tự chọn.
 # =============================================================================
 name: verify
 
@@ -56,9 +59,19 @@ jobs:
     steps:
       - name: Gọi platform kiểm cụm
         env:
+          # gh chọn token theo host: github.com đọc GH_TOKEN, host GHES đọc
+          # GH_ENTERPRISE_TOKEN. Set cả hai bằng CÙNG một secret để chạy đúng ở cả hai loại
+          # host mà không phải biết trước đang ở đâu. Thừa một biến ở host kia là vô hại.
           GH_TOKEN: ${{ secrets.PLATFORM_DISPATCH_TOKEN }}
+          GH_ENTERPRISE_TOKEN: ${{ secrets.PLATFORM_DISPATCH_TOKEN }}
         run: |
           set -euo pipefail
+          # gh với đường dẫn tương đối mặc định gọi github.com. Trên GHES, token GHES gửi lên
+          # github.com bị trả 401 Bad credentials. Ép gh gọi đúng host của CHÍNH lần chạy này:
+          # GITHUB_SERVER_URL do Actions luôn đặt — "https://github.com" trên github.com,
+          # "https://<host-ghes>" trên GHES. Bỏ scheme vì GH_HOST cần host trần. Một dòng này
+          # đúng cho cả hai loại host, không phải rẽ nhánh.
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
           # Nhánh quyết định môi trường, giống hệt quy ước bên kho mã ứng dụng.
           case "$GITHUB_REF_NAME" in
             main) ENVNAME=prod ;;
