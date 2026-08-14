@@ -9,6 +9,9 @@ on:
 
 env:
   ENV_CONFIG: platform/platform.env.yaml
+  # Runner mặc định python3=3.10 (một số chỗ trong code lỗi ở 3.10); runner build sẵn
+  # python3.12. Công ty khác đổi interpreter qua repo variable PYTHON_BIN, giống RUNNER_LABEL.
+  PYTHON: ${{ vars.PYTHON_BIN || 'python3.12' }}
 
 jobs:
   promote:
@@ -85,20 +88,20 @@ jobs:
       - name: Load environment config
         run: |
           set -euo pipefail
-          python3 platform/idpctl --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
-          echo "REGISTRY=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get registry.path)" >> "$GITHUB_ENV"
-          echo "ORG=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
+          echo "REGISTRY=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get registry.path)" >> "$GITHUB_ENV"
+          echo "ORG=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
           # Tên repo cấu hình suy ra từ mẫu trong platform.env.yaml, không gắn cứng tiền tố.
-          PATTERN=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
+          PATTERN=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
           echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
           # Nhánh của repo cấu hình mà môi trường này ghi vào, và có phải đi qua PR không.
           # Branch protection là chuyện của tổ chức, nên nó nằm trong cấu hình chứ không
           # phải trong workflow.
           ENVNAME="${DEPLOY_ENV:-prod}"
-          BR=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.config_branch" 2>/dev/null \
-               || python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.default_branch)
+          BR=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.config_branch" 2>/dev/null \
+               || $PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get git.default_branch)
           echo "CONFIG_BRANCH=$BR" >> "$GITHUB_ENV"
-          RP=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.require_pr" 2>/dev/null || echo False)
+          RP=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.require_pr" 2>/dev/null || echo False)
           echo "REQUIRE_PR=$RP" >> "$GITHUB_ENV"
           echo "==> $ENVNAME -> nhánh $BR, cần PR: $RP"
 
@@ -109,15 +112,15 @@ jobs:
           echo "AUDIT_ID=--app $APP --env prod --workflow promote" >> "$GITHUB_ENV"
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           echo "RUN_URL=$RUN_URL" >> "$GITHUB_ENV"
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-migrate || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-start \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-migrate || true
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-start \
             --app "$APP" --env prod --workflow promote \
             --trigger "$GITHUB_EVENT_NAME" --actor "$GITHUB_ACTOR" --run-url "$RUN_URL" \
             --app-sha "$TAG" --platform-sha "$GITHUB_SHA" --runner-name "$RUNNER_NAME" || true
           echo "STAGE=render" >> "$GITHUB_ENV"
 
       - name: Preflight
-        run: python3 platform/idpctl --env-config "$ENV_CONFIG" preflight
+        run: $PYTHON platform/idpctl --env-config "$ENV_CONFIG" preflight
 
       - name: Checkout config repo
         uses: actions/checkout@v4
@@ -171,7 +174,7 @@ jobs:
       - name: Promote (from-staging)
         if: github.event.client_payload.mode == 'from-staging'
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" promote \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" promote \
             --app "$APP" --image "$IMAGE" --tag "$TAG" --mode from-staging \
             --config-dir config
 
@@ -180,14 +183,14 @@ jobs:
       - name: Promote (tag-only)
         if: github.event.client_payload.mode == 'tag-only'
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" promote \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" promote \
             --app "$APP" --image "$IMAGE" --tag "$TAG" --mode tag-only \
             --config-dir config
 
       - name: Promote (re-render)
         if: github.event.client_payload.mode == 're-render'
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" promote \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" promote \
             --app "$APP" --image "$IMAGE" --tag "$TAG" --mode re-render \
             --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" --config-dir config \
             --catalog catalog --app-dir app --work work-prod \
@@ -196,7 +199,7 @@ jobs:
       - name: Apply secrets (re-render only)
         if: github.event.client_payload.mode == 're-render'
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \
             --app "$APP" --env prod --secrets work-prod/secrets.yaml \
             --harbor-host "${{ secrets.REGISTRY_HOST }}" \
             --harbor-user "${{ secrets.REGISTRY_USER }}" \
@@ -205,7 +208,7 @@ jobs:
 
       - name: Audit — render/promote ok
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage render --status success || true
           echo "STAGE=commit_config" >> "$GITHUB_ENV"
 
@@ -227,7 +230,7 @@ jobs:
         run: |
           set -euo pipefail
           export GH_HOST="${GITHUB_SERVER_URL#https://}"
-          python3 platform/idpctl --env-config "$ENV_CONFIG" commit \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env prod --sha "$TAG" --app-dir app
 
 
@@ -236,9 +239,9 @@ jobs:
       - name: Audit — đóng sổ thành công
         if: success()
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage commit_config --status success || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
             --status success || true
 
       - name: Audit — ghi thất bại + báo lỗi cho developer
@@ -246,11 +249,11 @@ jobs:
         run: |
           set -uo pipefail
           FAIL_STAGE="${STAGE:-unknown}"
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage "$FAIL_STAGE" --status failure --message "promote dừng ở $FAIL_STAGE" || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
             --status failure --failure-stage "$FAIL_STAGE" || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" notify-failure \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" notify-failure \
             --app "$APP" --env prod --workflow promote \
             --stage "$FAIL_STAGE" --commit "$TAG" --commit-repo "$APP_REPO" \
             --run-url "$RUN_URL" --platform-sha "$GITHUB_SHA" \
@@ -259,7 +262,7 @@ jobs:
       - name: Audit — ghi bị hủy
         if: cancelled()
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
             --status cancelled --failure-stage "${STAGE:-unknown}" || true
 
       - name: Scrub kubeconfig

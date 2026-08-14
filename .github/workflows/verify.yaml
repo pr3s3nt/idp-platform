@@ -9,6 +9,9 @@ on:
 
 env:
   ENV_CONFIG: platform/platform.env.yaml
+  # Runner mặc định python3=3.10 (một số chỗ trong code lỗi ở 3.10); runner build sẵn
+  # python3.12. Công ty khác đổi interpreter qua repo variable PYTHON_BIN, giống RUNNER_LABEL.
+  PYTHON: ${{ vars.PYTHON_BIN || 'python3.12' }}
 
 jobs:
   verify:
@@ -66,12 +69,12 @@ jobs:
       - name: Load environment config
         run: |
           set -euo pipefail
-          python3 platform/idpctl --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
-          echo "ORG=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
-          PATTERN=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
+          echo "ORG=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
+          PATTERN=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
           echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
-          BR=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$DEPLOY_ENV.config_branch" 2>/dev/null \
-               || python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.default_branch)
+          BR=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$DEPLOY_ENV.config_branch" 2>/dev/null \
+               || $PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get git.default_branch)
           echo "CONFIG_BRANCH=$BR" >> "$GITHUB_ENV"
           echo "==> kiểm $APP ở môi trường $DEPLOY_ENV (nhánh cấu hình $BR)"
 
@@ -82,8 +85,8 @@ jobs:
           echo "AUDIT_ID=--app $APP --env $DEPLOY_ENV --workflow verify" >> "$GITHUB_ENV"
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           echo "RUN_URL=$RUN_URL" >> "$GITHUB_ENV"
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-migrate || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-start \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-migrate || true
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-start \
             --app "$APP" --env "$DEPLOY_ENV" --workflow verify \
             --trigger "$GITHUB_EVENT_NAME" --actor "$GITHUB_ACTOR" --run-url "$RUN_URL" \
             --platform-sha "$GITHUB_SHA" --runner-name "$RUNNER_NAME" || true
@@ -105,7 +108,7 @@ jobs:
       # --require-cluster là cờ bật/tắt, không nhận tên tệp: nó đọc biến môi trường
       # KUBECONFIG. Truyền tên tệp như một tham số thì argparse báo lỗi ngay.
       - name: Preflight
-        run: python3 platform/idpctl --env-config "$ENV_CONFIG" preflight --require-cluster
+        run: $PYTHON platform/idpctl --env-config "$ENV_CONFIG" preflight --require-cluster
         env:
           KUBECONFIG: ${{ github.workspace }}/cluster-config-${{ github.event.client_payload.env || 'prod' }}
 
@@ -120,7 +123,7 @@ jobs:
 
       - name: Kiểm cụm thực sự chạy đúng thứ đang nằm trên nhánh
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" verify \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" verify \
             --app "$APP" --env "$DEPLOY_ENV" \
             --manifests "config/$DEPLOY_ENV/manifests.yaml" \
             --kubeconfig "cluster-config-$DEPLOY_ENV" --timeout 420
@@ -128,9 +131,9 @@ jobs:
       - name: Audit — rollout_verify ok + snapshot
         run: |
           DUR=$(( ( $(date +%s%N) - ${STAGE_T0:-$(date +%s%N)} ) / 1000000 ))
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage rollout_verify --status success --duration-ms "$DUR" || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-snapshot $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-snapshot $AUDIT_ID \
             --manifests "config/$DEPLOY_ENV/manifests.yaml" \
             --kubeconfig "cluster-config-$DEPLOY_ENV" \
             --config-repo "$ORG/$CONFIG_REPO_NAME" --platform-sha "$GITHUB_SHA" || true
@@ -138,7 +141,7 @@ jobs:
       - name: Audit — đóng sổ thành công
         if: success()
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
             --status success || true
 
       - name: Audit — ghi thất bại + báo lỗi
@@ -146,15 +149,15 @@ jobs:
         run: |
           set -uo pipefail
           FAIL_STAGE="${STAGE:-rollout_verify}"
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage "$FAIL_STAGE" --status failure --message "verify dừng ở $FAIL_STAGE" || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
             --status failure --failure-stage "$FAIL_STAGE" || true
 
       - name: Audit — ghi bị hủy
         if: cancelled()
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
             --status cancelled --failure-stage "${STAGE:-rollout_verify}" || true
 
       - name: Scrub kubeconfigs

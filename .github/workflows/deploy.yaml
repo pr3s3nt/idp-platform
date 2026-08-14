@@ -29,6 +29,9 @@ on:
 
 env:
   ENV_CONFIG: platform/platform.env.yaml
+  # Runner mặc định python3=3.10 (một số chỗ trong code lỗi ở 3.10); runner build sẵn
+  # python3.12. Công ty khác đổi interpreter qua repo variable PYTHON_BIN, giống RUNNER_LABEL.
+  PYTHON: ${{ vars.PYTHON_BIN || 'python3.12' }}
 
 jobs:
   deploy:
@@ -106,20 +109,20 @@ jobs:
       - name: Load environment config
         run: |
           set -euo pipefail
-          python3 platform/idpctl --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
-          echo "REGISTRY=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get registry.path)" >> "$GITHUB_ENV"
-          echo "ORG=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --export >> "$GITHUB_ENV"
+          echo "REGISTRY=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get registry.path)" >> "$GITHUB_ENV"
+          echo "ORG=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get git.org)" >> "$GITHUB_ENV"
           # Tên repo cấu hình suy ra từ mẫu trong platform.env.yaml, không gắn cứng tiền tố.
-          PATTERN=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
+          PATTERN=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get git.config_repo_pattern)
           echo "CONFIG_REPO_NAME=${PATTERN//\{app\}/$APP}" >> "$GITHUB_ENV"
           # Nhánh của repo cấu hình mà môi trường này ghi vào, và có phải đi qua PR không.
           # Branch protection là chuyện của tổ chức, nên nó nằm trong cấu hình chứ không
           # phải trong workflow.
           ENVNAME="${DEPLOY_ENV:-prod}"
-          BR=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.config_branch" 2>/dev/null \
-               || python3 platform/idpctl --env-config "$ENV_CONFIG" config --get git.default_branch)
+          BR=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.config_branch" 2>/dev/null \
+               || $PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get git.default_branch)
           echo "CONFIG_BRANCH=$BR" >> "$GITHUB_ENV"
-          RP=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.require_pr" 2>/dev/null || echo False)
+          RP=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get "environments.$ENVNAME.require_pr" 2>/dev/null || echo False)
           echo "REQUIRE_PR=$RP" >> "$GITHUB_ENV"
           echo "==> $ENVNAME -> nhánh $BR, cần PR: $RP"
 
@@ -136,8 +139,8 @@ jobs:
           # Deployment id suy ra từ (repo, run id, run attempt, app, env, workflow) — các
           # trường GitHub tự đặt trong môi trường nên idpctl tự điền, retry cùng attempt
           # không tạo bản ghi trùng.
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-migrate || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-start \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-migrate || true
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-start \
             --app "$APP" --env "$DEPLOY_ENV" --workflow deploy \
             --trigger "$GITHUB_EVENT_NAME" --actor "$GITHUB_ACTOR" --run-url "$RUN_URL" \
             --app-sha "$SHA" --platform-sha "$GITHUB_SHA" --runner-name "$RUNNER_NAME" || true
@@ -158,7 +161,7 @@ jobs:
           echo "$PROD_B64"    | base64 -d > cluster-config-prod
 
       - name: Preflight
-        run: python3 platform/idpctl --env-config "$ENV_CONFIG" preflight --require-cluster
+        run: $PYTHON platform/idpctl --env-config "$ENV_CONFIG" preflight --require-cluster
         env:
           KUBECONFIG: ${{ github.workspace }}/cluster-config-staging
 
@@ -167,7 +170,7 @@ jobs:
       # đúng stage lỗi cho bước `if: failure()` phân loại — không cần sửa thân các bước cũ.
       - name: Audit — preflight ok
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage preflight --status success || true
           echo "STAGE=checkout" >> "$GITHUB_ENV"
 
@@ -216,13 +219,13 @@ jobs:
         run: |
           set -euo pipefail
           export GH_HOST="${GITHUB_SERVER_URL#https://}"
-          export NS_PATTERN="$(python3 platform/idpctl --env-config "$ENV_CONFIG" \
+          export NS_PATTERN="$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" \
             config --get kubernetes.namespace_pattern)"
           # Nhãn máy chạy cho workflow verify trong kho cấu hình — đọc từ cấu hình, không
           # phải từ nhãn của orchestrator. Job đó chỉ gọi API GitHub nên không cần chiếm
           # runner riêng của platform. Nhiều nhãn thì cấu hình khai danh sách, và
           # `config --get` in ra JSON (JSON là YAML hợp lệ nên dán thẳng vào runs-on được).
-          export VERIFY_RUNNER_LABEL="$(python3 platform/idpctl \
+          export VERIFY_RUNNER_LABEL="$($PYTHON platform/idpctl \
             --env-config "$ENV_CONFIG" config --get ci.verify_runner_label)"
           bash platform/tools/tao-app-moi.sh
 
@@ -236,13 +239,13 @@ jobs:
 
       - name: Audit — checkout ok
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage checkout --status success || true
           echo "STAGE=render" >> "$GITHUB_ENV"
 
       - name: Render ${{ env.DEPLOY_ENV }}
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" render \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" render \
             --app "$APP" --image "$IMAGE" --tag "$SHA" --env "$DEPLOY_ENV" \
             --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
             --catalog catalog --app-dir app --work work-staging \
@@ -256,7 +259,7 @@ jobs:
       # không thể ghi từ đây — prod đi qua một lần deploy env=prod riêng, có duyệt.
       - name: Bootstrap prod (first deploy only)
         run: |
-          PROD_BRANCH=$(python3 platform/idpctl --env-config "$ENV_CONFIG" config --get environments.prod.config_branch 2>/dev/null || echo "$CONFIG_BRANCH")
+          PROD_BRANCH=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" config --get environments.prod.config_branch 2>/dev/null || echo "$CONFIG_BRANCH")
           if [ "$PROD_BRANCH" != "$CONFIG_BRANCH" ]; then
             echo "==> prod nằm ở nhánh $PROD_BRANCH, không phải $CONFIG_BRANCH -> bỏ qua, prod deploy riêng"
             exit 0
@@ -269,7 +272,7 @@ jobs:
             echo "==> prod already bootstrapped, leaving it alone"
             exit 0
           fi
-          python3 platform/idpctl --env-config "$ENV_CONFIG" render \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" render \
             --app "$APP" --image "$IMAGE" --tag "$SHA" --env prod \
             --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
             --catalog catalog --app-dir app --work work-prod \
@@ -278,13 +281,13 @@ jobs:
 
       - name: Audit — render ok
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage render --status success || true
           echo "STAGE=apply_secrets" >> "$GITHUB_ENV"
 
       - name: Apply secrets (${{ env.DEPLOY_ENV }})
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \
             --app "$APP" --env "$DEPLOY_ENV" --secrets work-staging/secrets.yaml \
             --harbor-host "${{ secrets.REGISTRY_HOST }}" \
             --harbor-user "${{ secrets.REGISTRY_USER }}" \
@@ -294,7 +297,7 @@ jobs:
       - name: Apply secrets (prod, if bootstrapped this run)
         run: |
           [ -d work-prod ] || { echo "==> prod not rendered this run"; exit 0; }
-          python3 platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \
             --app "$APP" --env prod --secrets work-prod/secrets.yaml \
             --harbor-host "${{ secrets.REGISTRY_HOST }}" \
             --harbor-user "${{ secrets.REGISTRY_USER }}" \
@@ -303,7 +306,7 @@ jobs:
 
       - name: Audit — apply_secrets ok
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage apply_secrets --status success || true
           echo "STAGE=commit_config" >> "$GITHUB_ENV"
 
@@ -327,7 +330,7 @@ jobs:
           # Không đặt thì gh đoán từ git remote của thư mục đang đứng; đúng trong hầu hết
           # trường hợp, nhưng khai tường minh thì không phụ thuộc vào việc đứng ở đâu.
           export GH_HOST="${GITHUB_SERVER_URL#https://}"
-          OUT=$(python3 platform/idpctl --env-config "$ENV_CONFIG" commit \
+          OUT=$($PYTHON platform/idpctl --env-config "$ENV_CONFIG" commit \
             --config-dir config --app "$APP" --env "$DEPLOY_ENV" --sha "$SHA" \
             --app-dir app --catalog-ref "${{ steps.lock.outputs.ref }}")
           echo "$OUT"
@@ -344,7 +347,7 @@ jobs:
       # đồng bộ mà không báo gì.
       - name: Audit — commit_config ok
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage commit_config --status success || true
           echo "STAGE=fleet_register" >> "$GITHUB_ENV"
           echo "STAGE_T0=$(date +%s%N)" >> "$GITHUB_ENV"
@@ -357,7 +360,7 @@ jobs:
           GH_ENTERPRISE_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           export GH_HOST="${GITHUB_SERVER_URL#https://}"
-          python3 platform/idpctl --env-config "$ENV_CONFIG" ensure-gitrepo \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" ensure-gitrepo \
             --app "$APP" --env "$DEPLOY_ENV" --config-dir config \
             --kubeconfig "cluster-config-$DEPLOY_ENV" --work work-staging
 
@@ -369,7 +372,7 @@ jobs:
       - name: Audit — fleet_register ok
         run: |
           DUR=$(( ( $(date +%s%N) - ${STAGE_T0:-$(date +%s%N)} ) / 1000000 ))
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage fleet_converge --status success --duration-ms "$DUR" || true
           echo "STAGE=rollout_verify" >> "$GITHUB_ENV"
           echo "STAGE_T0=$(date +%s%N)" >> "$GITHUB_ENV"
@@ -377,7 +380,7 @@ jobs:
       - name: Kiểm cụm thực sự chạy đúng thứ vừa render
         if: steps.commit.outputs.pending_pr != 'true'
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" verify \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" verify \
             --app "$APP" --env "$DEPLOY_ENV" \
             --manifests "config/$DEPLOY_ENV/manifests.yaml" \
             --kubeconfig "cluster-config-$DEPLOY_ENV" --timeout 420
@@ -388,9 +391,9 @@ jobs:
         if: steps.commit.outputs.pending_pr != 'true'
         run: |
           DUR=$(( ( $(date +%s%N) - ${STAGE_T0:-$(date +%s%N)} ) / 1000000 ))
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage rollout_verify --status success --duration-ms "$DUR" || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-snapshot $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-snapshot $AUDIT_ID \
             --manifests "config/$DEPLOY_ENV/manifests.yaml" \
             --kubeconfig "cluster-config-$DEPLOY_ENV" \
             --app-sha "$SHA" --platform-sha "$GITHUB_SHA" \
@@ -448,9 +451,9 @@ jobs:
       - name: Audit — đóng sổ thành công
         if: success()
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage tip_guard --status success || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
             --status success || true
 
       - name: Audit — ghi thất bại + báo lỗi cho developer
@@ -458,14 +461,14 @@ jobs:
         run: |
           set -uo pipefail
           FAIL_STAGE="${STAGE:-unknown}"
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage "$FAIL_STAGE" --status failure \
             --message "deploy dừng ở stage $FAIL_STAGE" || true
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
             --status failure --failure-stage "$FAIL_STAGE" || true
           # Bình luận lỗi lên ĐÚNG commit app đã kích hoạt deploy (repo app, không phải repo
           # platform). Dùng token bot; server/API URL lấy runtime nên chạy cả github.com/GHES.
-          python3 platform/idpctl --env-config "$ENV_CONFIG" notify-failure \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" notify-failure \
             --app "$APP" --env "$DEPLOY_ENV" --workflow deploy \
             --stage "$FAIL_STAGE" --commit "$SHA" --commit-repo "$APP_REPO" \
             --run-url "$RUN_URL" --platform-sha "$GITHUB_SHA" \
@@ -474,7 +477,7 @@ jobs:
       - name: Audit — ghi bị hủy
         if: cancelled()
         run: |
-          python3 platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-finish $AUDIT_ID \
             --status cancelled --failure-stage "${STAGE:-unknown}" || true
 
       - name: Scrub kubeconfigs
