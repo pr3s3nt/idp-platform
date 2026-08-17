@@ -819,6 +819,8 @@ def cmd_vault_auto_setup(args) -> None:
         log("Vault policy/role đã sẵn sàng cho {}/{}".format(app, env))
 
     if getattr(args, "apply", False):
+        ns = app_namespace(app, env)
+        ensure_namespace(ns, args.kubeconfig)
         _emit(vault_auth_manifests(app, env), args)
 
 
