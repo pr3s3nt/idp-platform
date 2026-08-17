@@ -7,9 +7,8 @@ from . import resources as _resources
 from . import catalog as _catalog
 from . import render as _render
 from . import delivery as _delivery
-from . import onboarding as _onboarding
 from . import audit as _audit
-for _module in (_context, _resources, _catalog, _render, _delivery, _onboarding):
+for _module in (_context, _resources, _catalog, _render, _delivery):
     globals().update({n: getattr(_module, n) for n in dir(_module) if not n.startswith("__")})
 def cmd_config(args) -> None:
     """Expose platform.env.yaml to the workflow, so the YAML holds no infrastructure value.
@@ -304,6 +303,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--kubeconfig")
     p.set_defaults(func=cmd_vault_onboard)
 
+    p = sub.add_parser("vault-auto-setup",
+                       help="tự động tạo Vault policy/role cho app/env nếu có VAULT_TOKEN")
+    p.add_argument("--app", required=True)
+    p.add_argument("--env", required=True, choices=("staging", "prod"))
+    p.add_argument("--apply", action="store_true",
+                   help="kubectl apply ServiceAccount + VaultAuth vào namespace")
+    p.add_argument("--kubeconfig")
+    p.set_defaults(func=cmd_vault_auto_setup)
+
     # `idp-secret set` trong kế hoạch. Dành cho NGƯỜI, không cho CI: nó cần Vault token có
     # policy ghi. Giá trị chỉ vào qua nhập ẩn hoặc stdin — không có cờ --value, vì tham số
     # dòng lệnh nằm trong history và trong `ps` của mọi user khác trên máy.
@@ -321,23 +329,6 @@ def main(argv: list[str] | None = None) -> None:
                    help="ghi đè toàn bộ secret (mặc định chỉ vá đúng khoá này)")
     p.set_defaults(func=cmd_secret_set)
 
-    p = sub.add_parser("offboard",
-                       help="xoá một app: mặc định chỉ XEM TRƯỚC (mục 13.4)")
-    p.add_argument("--app", required=True)
-    p.add_argument("--env", required=True, choices=("staging", "prod"))
-    p.add_argument("--execute", action="store_true",
-                   help="thật sự xoá. Không có cờ này thì chỉ in kế hoạch.")
-    p.add_argument("--confirm", default="",
-                   help="gõ lại đúng tên app; bắt buộc khi có --execute")
-    p.add_argument("--approved-by", default="",
-                   help="ai duyệt việc xoá này; bắt buộc ở prod, ghi vào bản ghi state")
-    p.add_argument("--purge-secrets", action="store_true",
-                   help="xoá HẲN bí mật trong Vault thay vì xoá mềm (không lấy lại được)")
-    p.add_argument("--state-file",
-                   help="đọc/ghi bản ghi onboarding trong file thay vì ConfigMap")
-    p.add_argument("--kubeconfig")
-    p.set_defaults(func=cmd_offboard)
-
     p = sub.add_parser("rotate-db-credential",
                        help="xoay vòng mật khẩu database theo đúng thứ tự Vault -> VSO -> "
                             "CNPG -> pod, kiểm từng bước")
@@ -353,46 +344,6 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--apply", action="store_true")
     p.add_argument("--kubeconfig")
     p.set_defaults(func=cmd_verify_rbac)
-
-    # ---- onboarding (Phase 6). `--work` giữ nguyên giữa các lần chạy là CÓ Ý: bản
-    # checkout kho ứng dụng và kho cấu hình nằm ở đó, và lần retry dùng lại chúng.
-    def add_resume_flags(p):
-        p.add_argument("--stop-after", default="",
-                       help="dừng sau bước này (xem tên bước trong `onboard-status`)")
-        p.add_argument("--force-step", action="append", default=[],
-                       help="chạy lại một bước đã `done` (mọi bước đều kiểm-trước-khi-"
-                            "tạo, nên chạy lại là an toàn). Lặp cờ này cho nhiều bước.")
-
-    def add_onboard_state_flags(p):
-        p.add_argument("--state-file",
-                       help="giữ bản ghi onboarding trong file thay vì ConfigMap trong cụm")
-        p.add_argument("--kubeconfig")
-
-    p = sub.add_parser("onboard",
-                       help="chạy máy trạng thái onboarding cho một request (mục 13)")
-    p.add_argument("--request", required=True, help="file YAML theo mục 13.1")
-    p.add_argument("--work", help="thư mục làm việc, mặc định onboard-<app>")
-    p.add_argument("--images", choices=("local", "ci"), default="local",
-                   help="local: tự build và đẩy ảnh; ci: chờ CI của kho ứng dụng đẩy")
-    add_resume_flags(p)
-    add_catalog_flag(p)
-    add_onboard_state_flags(p)
-    p.set_defaults(func=cmd_onboard)
-
-    p = sub.add_parser("onboard-status", help="trạng thái và kết quả của một lần onboarding")
-    p.add_argument("--app", required=True)
-    p.add_argument("--json", action="store_true", help="in nguyên bản ghi")
-    add_onboard_state_flags(p)
-    p.set_defaults(func=cmd_onboard_status)
-
-    p = sub.add_parser("onboard-activate-prod",
-                       help="kích hoạt production: dùng ảnh đã verify ở staging, qua pull request")
-    p.add_argument("--app", required=True)
-    p.add_argument("--work", help="thư mục làm việc của lần onboarding trước")
-    add_resume_flags(p)
-    add_catalog_flag(p)
-    add_onboard_state_flags(p)
-    p.set_defaults(func=cmd_onboard_activate_prod)
 
     p = sub.add_parser("render")
     add_render_flags(p, paths_required=True)

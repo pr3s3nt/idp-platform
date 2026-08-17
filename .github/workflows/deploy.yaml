@@ -285,6 +285,25 @@ jobs:
             --stage render --status success || true
           echo "STAGE=apply_secrets" >> "$GITHUB_ENV"
 
+      - name: Vault auto-setup (${{ env.DEPLOY_ENV }})
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" vault-auto-setup \
+            --app "$APP" --env "$DEPLOY_ENV" --apply \
+            --kubeconfig "cluster-config-$DEPLOY_ENV"
+
+      - name: Vault auto-setup (prod, if bootstrapped this run)
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          [ -d work-prod ] || { echo "==> prod not rendered this run"; exit 0; }
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" vault-auto-setup \
+            --app "$APP" --env prod --apply \
+            --kubeconfig cluster-config-prod
+
       - name: Apply secrets (${{ env.DEPLOY_ENV }})
         run: |
           $PYTHON platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \

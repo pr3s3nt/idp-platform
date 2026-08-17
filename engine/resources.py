@@ -143,9 +143,10 @@ def vault_policy(app: str, env: str, *, write: bool = False) -> str:
             '  capabilities = ["read", "list"]\n'
             "}\n"
         )
+    caps_v1 = '["create", "update", "read", "list"]' if write else '["read", "list"]'
     return header + (
-        f'path "{prefix}*" {{\n'
-        f"  capabilities = {'[\"create\", \"update\", \"read\", \"list\"]' if write else '[\"read\", \"list\"]'}\n"
+        'path "{}*" {{\n'.format(prefix) +
+        '  capabilities = {}\n'.format(caps_v1) +
         "}\n"
     )
 
@@ -725,6 +726,100 @@ def _emit(docs: list[dict], args) -> None:
 def cmd_vault_foundation(args) -> None:
     """VaultConnection + VaultAuthGlobal — one set per cluster, applied by an operator."""
     _emit(vault_foundation_manifests(), args)
+
+
+# --------------------------------------------------------------------------------------
+# Vault API — gọi trực tiếp Vault để tự động tạo policy/role
+# --------------------------------------------------------------------------------------
+def vault_api(method: str, path: str, payload: dict | None = None,
+              *, tolerate: tuple[int, ...] = (),
+              content_type: str = "application/json") -> tuple[int, dict]:
+    """Một lần gọi Vault. Trả (mã HTTP, body). Không bao giờ log body — nó chứa bí mật."""
+    address = (os.environ.get("VAULT_ADDR") or "").rstrip("/")
+    token = os.environ.get("VAULT_TOKEN")
+    if not address or not token:
+        return -1, {}
+    headers = {"X-Vault-Token": token, "Content-Type": content_type}
+    if _vault_str("namespace"):
+        headers["X-Vault-Namespace"] = _vault_str("namespace")
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request("{}/v1/{}".format(address, path), data=data,
+                                     headers=headers, method=method)
+    log("vault {} {}".format(method, path))
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode() or "{}"
+            return response.status, json.loads(body)
+    except urllib.error.HTTPError as exc:
+        if exc.code in tolerate:
+            return exc.code, {}
+        detail = exc.read().decode(errors="replace")[:300]
+        raise SystemExit("Vault từ chối {} {} ({}): {}".format(method, path, exc.code, detail)) from None
+    except urllib.error.URLError as exc:
+        raise SystemExit("không tới được Vault: {}".format(exc.reason)) from None
+
+
+def ensure_vault_app_access(app: str, env: str) -> dict:
+    """Policy đọc + role kubernetes cho một app/env. Kiểm trước khi tạo.
+
+    Chỉ chạy được khi có VAULT_ADDR và VAULT_TOKEN trong môi trường.
+    Nếu không có, trả về dict rỗng mà không fail.
+    """
+    address = os.environ.get("VAULT_ADDR")
+    token = os.environ.get("VAULT_TOKEN")
+    if not address or not token:
+        log("VAULT_ADDR/VAULT_TOKEN không có -> bỏ qua tự động setup Vault")
+        return {}
+
+    mount = _vault_str("auth_mount") or "kubernetes"
+    role = vault_role_name(app, env)
+    read_policy = vault_policy_name(app, env)
+    created = []
+
+    status, _ = vault_api("GET", "sys/policies/acl/{}".format(read_policy), tolerate=(404,))
+    if status == 404:
+        vault_api("PUT", "sys/policies/acl/{}".format(read_policy),
+                  {"policy": vault_policy(app, env, write=False)})
+        created.append("policy {}".format(read_policy))
+    elif status == 200:
+        log("policy {} đã có -> giữ nguyên".format(read_policy))
+
+    status, _ = vault_api("GET", "auth/{}/role/{}".format(mount, role), tolerate=(404,))
+    if status == 404:
+        vault_api("POST", "auth/{}/role/{}".format(mount, role), {
+            "bound_service_account_names": [vault_service_account(app, env)],
+            "bound_service_account_namespaces": [app_namespace(app, env)],
+            "token_policies": [read_policy],
+            "token_ttl": _vault_str("token_ttl") or "1h",
+            "audience": _vault_str("auth_audience") or "vault",
+        })
+        created.append("role {}".format(role))
+    elif status == 200:
+        log("role {} đã có -> giữ nguyên".format(role))
+
+    return {"role": role, "readPolicy": read_policy, "created": created}
+
+
+def cmd_vault_auto_setup(args) -> None:
+    """Tự động tạo Vault policy và role cho một app/env nếu có VAULT_TOKEN.
+
+    Lệnh này idempotent: nếu policy/role đã có thì không làm gì.
+    Nếu không có VAULT_ADDR/VAULT_TOKEN thì bỏ qua (không fail).
+    """
+    app, env = validate_secret_name(args.app), validate_environment(args.env)
+
+    if not feature("vault_secrets"):
+        log("features.vault_secrets is off -> bỏ qua vault auto-setup")
+        return
+
+    result = ensure_vault_app_access(app, env)
+    if result.get("created"):
+        log("đã tạo: {}".format(", ".join(result["created"])))
+    elif result:
+        log("Vault policy/role đã sẵn sàng cho {}/{}".format(app, env))
+
+    if getattr(args, "apply", False):
+        _emit(vault_auth_manifests(app, env), args)
 
 
 def cmd_vault_onboard(args) -> None:

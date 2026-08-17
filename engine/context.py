@@ -140,23 +140,7 @@ DEFAULTS: dict = {
                    "first_backup_timeout_seconds": 600},
         "ready_timeout_seconds": 600,
     },
-    "onboarding": {
-        # Kill switch riêng cho máy trạng thái tạo app. Không dùng
-        # features.stack_onboarding cho việc này: cờ feature đó còn quyết định cách các
-        # app stack ĐÃ TỒN TẠI resolve tag strategy khi deploy.
-        "enabled": True,
-        # Bản ghi state của một lần onboarding. Tên ConfigMap là quy ước đặt tên, tức là
-        # thứ một công ty có thể đã có luật riêng.
-        "state_configmap_pattern": "idp-onboarding-{app}",
-        # Mức hiển thị routing được phép trong request. Catalog này chỉ phát hành một
-        # Gateway nội bộ; thêm mức mới nghĩa là thêm gateway, nên nó là cấu hình chứ
-        # không phải một nhánh if trong code.
-        "visibilities": ["internal"],
-        # Rỗng = ai cũng onboard được. Công ty nên liệt kê các đội được phép (mục 13.5).
-        "allowed_owners": [],
-        "verify_timeout_seconds": 420,
-    },
-    # Every capability added by the secret/onboarding programme is off until switched on
+    # Every capability added by the secret programme is off until switched on
     # per environment. The existing platform must render byte-identically with these unset.
     "features": {
         "application_values": False,
@@ -414,15 +398,6 @@ def feature(name: str) -> bool:
     radius of a bug is the apps that opted in, not every app at once.
     """
     return bool(CONFIG.get(f"features.{name}", False))
-
-
-def require_onboarding_enabled() -> None:
-    """Fail before onboarding can create or mutate any external resource."""
-    if not bool(CONFIG.get("onboarding.enabled", True)):
-        raise SystemExit(
-            "App onboarding is disabled by onboarding.enabled=false in the environment "
-            "config. Existing app deploys and `onboard-status` remain available."
-        )
 
 
 DATABASE_BACKENDS = ("cnpg", "statefulset")
