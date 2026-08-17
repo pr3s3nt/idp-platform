@@ -800,6 +800,13 @@ def ensure_vault_app_access(app: str, env: str) -> dict:
     return {"role": role, "readPolicy": read_policy, "created": created}
 
 
+def _has_vaultauth_crd(kubeconfig: str | None) -> bool:
+    """Kiểm tra cụm có CRD VaultAuth hay không (VSO đã được cài)."""
+    cp = kubectl(["api-resources", "--api-group=secrets.hashicorp.com", "-o", "name"],
+                 kubeconfig=kubeconfig, check=False, capture=True)
+    return cp.returncode == 0 and "vaultauths" in (cp.stdout or "")
+
+
 def cmd_vault_auto_setup(args) -> None:
     """Tự động tạo Vault policy và role cho một app/env nếu có VAULT_TOKEN.
 
@@ -821,7 +828,12 @@ def cmd_vault_auto_setup(args) -> None:
     if getattr(args, "apply", False):
         ns = app_namespace(app, env)
         ensure_namespace(ns, args.kubeconfig)
-        _emit(vault_auth_manifests(app, env), args)
+        docs = vault_auth_manifests(app, env)
+        if not _has_vaultauth_crd(args.kubeconfig):
+            # Cụm không có VSO -> chỉ apply ServiceAccount, bỏ qua VaultAuth
+            log("VaultAuth CRD không có trên cụm -> chỉ apply ServiceAccount")
+            docs = [d for d in docs if d.get("kind") != "VaultAuth"]
+        _emit(docs, args)
 
 
 def cmd_vault_onboard(args) -> None:
