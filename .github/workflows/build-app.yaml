@@ -15,7 +15,7 @@ on:
         default: main
 
 env:
-  REGISTRY: localhost:5001
+  # Registry host is a coordinate, so it comes from platform.env.yaml, never hardcoded here.
   PYTHON: ${{ vars.PYTHON_BIN || 'python3.12' }}
 
 jobs:
@@ -53,37 +53,41 @@ jobs:
             exit 1
           fi
 
-      - name: Detect and build services
+      # Build tags come from the PLATFORM, not from a rule reinvented here. `image-plan`
+      # (engine/render.py:plan_images) is "THE ONE PLACE that decides image names". Render
+      # will reference exactly these refs; if CI tagged by any other rule (e.g. the commit
+      # SHA) the mismatch is invisible until Fleet applies a manifest pointing at an image
+      # nobody pushed — which is precisely the ImagePullBackOff we hit before. `--with-build`
+      # also returns the build recipe (context + Dockerfile) from the catalog, so a monorepo
+      # with a shared workspace package builds with the right context on the first run.
+      - name: Build images from platform image-plan
         id: build
         run: |
-          cd app
+          set -euo pipefail
           SHA="${{ inputs.sha }}"
           REPO_NAME=$(echo "${{ inputs.app_repo }}" | cut -d'/' -f2)
+          REGISTRY=$($PYTHON platform/idpctl --env-config platform/platform.env.yaml \
+            config --get registry.path)
 
-          # Tìm tất cả thư mục có Dockerfile
-          SERVICES=""
-          for dir in */; do
-            if [ -f "${dir}Dockerfile" ]; then
-              SERVICE=$(basename "$dir")
-              IMAGE_NAME="${REPO_NAME}-${SERVICE}"
-              echo "==> Building $IMAGE_NAME from $dir"
-              docker build -t $REGISTRY/$IMAGE_NAME:$SHA "./$dir"
-              docker push $REGISTRY/$IMAGE_NAME:$SHA
-              SERVICES="${SERVICES}${SERVICE},"
-            fi
-          done
+          PLAN=$($PYTHON platform/idpctl --env-config platform/platform.env.yaml image-plan \
+            --app "$REPO_NAME" --tag "$SHA" --registry "$REGISTRY" \
+            --app-dir app --catalog platform --with-build)
+          echo "$PLAN"
 
-          # Nếu có Dockerfile ở root
-          if [ -f "Dockerfile" ]; then
-            echo "==> Building $REPO_NAME from root"
-            docker build -t $REGISTRY/$REPO_NAME:$SHA .
-            docker push $REGISTRY/$REPO_NAME:$SHA
-            SERVICES="${SERVICES}root,"
-          fi
+          echo "$PLAN" | $PYTHON - <<'PY'
+          import json, subprocess, sys
+          plan = json.load(sys.stdin)
+          for wl, spec in plan.items():
+              img = spec["image"]
+              ctx = "app/" + spec["context"]
+              df = "app/" + spec["dockerfile"]
+              print(f"==> build {wl}: {img}  (context={ctx})", flush=True)
+              subprocess.run(["docker", "build", "-f", df, "-t", img, ctx], check=True)
+              subprocess.run(["docker", "push", img], check=True)
+          PY
 
-          echo "services=$SERVICES" >> $GITHUB_OUTPUT
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Trigger deploy via repository_dispatch
         env:
