@@ -29,39 +29,7 @@ jobs:
           ref: ${{ inputs.sha }}
           path: app
 
-      - name: Detect and build services
-        id: build
-        run: |
-          cd app
-          SHA="${{ inputs.sha }}"
-          REPO_NAME=$(echo "${{ inputs.app_repo }}" | cut -d'/' -f2)
-          
-          # Tìm tất cả thư mục có Dockerfile
-          SERVICES=""
-          for dir in */; do
-            if [ -f "${dir}Dockerfile" ]; then
-              SERVICE=$(basename "$dir")
-              IMAGE_NAME="${REPO_NAME}-${SERVICE}"
-              echo "==> Building $IMAGE_NAME from $dir"
-              docker build -t $REGISTRY/$IMAGE_NAME:$SHA "./$dir"
-              docker push $REGISTRY/$IMAGE_NAME:$SHA
-              SERVICES="$SERVICES $SERVICE"
-            fi
-          done
-          
-          # Nếu có Dockerfile ở root
-          if [ -f "Dockerfile" ]; then
-            echo "==> Building $REPO_NAME from root"
-            docker build -t $REGISTRY/$REPO_NAME:$SHA .
-            docker push $REGISTRY/$REPO_NAME:$SHA
-            SERVICES="$SERVICES root"
-          fi
-          
-          echo "services=$SERVICES" >> $GITHUB_OUTPUT
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
-
-      - name: Checkout platform (for mint-app-token)
+      - name: Checkout platform
         uses: actions/checkout@v4
         with:
           path: platform
@@ -85,7 +53,41 @@ jobs:
             exit 1
           fi
 
-      - name: Trigger deploys
+      - name: Detect and build services
+        id: build
+        run: |
+          cd app
+          SHA="${{ inputs.sha }}"
+          REPO_NAME=$(echo "${{ inputs.app_repo }}" | cut -d'/' -f2)
+
+          # Tìm tất cả thư mục có Dockerfile
+          SERVICES=""
+          for dir in */; do
+            if [ -f "${dir}Dockerfile" ]; then
+              SERVICE=$(basename "$dir")
+              IMAGE_NAME="${REPO_NAME}-${SERVICE}"
+              echo "==> Building $IMAGE_NAME from $dir"
+              docker build -t $REGISTRY/$IMAGE_NAME:$SHA "./$dir"
+              docker push $REGISTRY/$IMAGE_NAME:$SHA
+              SERVICES="${SERVICES}${SERVICE},"
+            fi
+          done
+
+          # Nếu có Dockerfile ở root
+          if [ -f "Dockerfile" ]; then
+            echo "==> Building $REPO_NAME from root"
+            docker build -t $REGISTRY/$REPO_NAME:$SHA .
+            docker push $REGISTRY/$REPO_NAME:$SHA
+            SERVICES="${SERVICES}root,"
+          fi
+
+          echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+
+      - name: Trigger deploys via repository_dispatch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           SHA="${{ steps.build.outputs.sha }}"
           REPO_NAME="${{ steps.build.outputs.repo_name }}"
@@ -96,15 +98,14 @@ jobs:
               SERVICE=$(basename "$dir")
               APP_NAME="${REPO_NAME}-${SERVICE}"
               IMAGE_NAME="${REPO_NAME}-${SERVICE}"
-              echo "==> Triggering deploy for $APP_NAME"
-              gh workflow run deploy.yaml \
-                -R pr3s3nt/idp-platform \
-                -f app="$APP_NAME" \
-                -f repo="${{ inputs.app_repo }}" \
-                -f sha="$SHA" \
-                -f image="$IMAGE_NAME" \
-                -f env=staging
+              echo "==> Triggering deploy for $APP_NAME via repository_dispatch"
+
+              gh api repos/pr3s3nt/idp-platform/dispatches \
+                -f event_type=deploy-request \
+                -f client_payload[app]="$APP_NAME" \
+                -f client_payload[repo]="${{ inputs.app_repo }}" \
+                -f client_payload[sha]="$SHA" \
+                -f client_payload[image]="$IMAGE_NAME" \
+                -f client_payload[env]=staging
             fi
           done
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
