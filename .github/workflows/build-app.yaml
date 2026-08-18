@@ -74,9 +74,11 @@ jobs:
             --app-dir app --catalog platform --with-build)
           echo "$PLAN"
 
-          echo "$PLAN" | $PYTHON - <<'PY'
-          import json, subprocess, sys
-          plan = json.load(sys.stdin)
+          # PLAN qua env, KHÔNG qua pipe: heredoc đã chiếm stdin của python, nên
+          # json.load(sys.stdin) sẽ đọc nhầm chính mã script này.
+          PLAN="$PLAN" $PYTHON - <<'PY'
+          import json, os, subprocess
+          plan = json.loads(os.environ["PLAN"])
           for wl, spec in plan.items():
               img = spec["image"]
               ctx = "app/" + spec["context"]
