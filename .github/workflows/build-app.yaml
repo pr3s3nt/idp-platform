@@ -1,0 +1,86 @@
+name: build-app
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_repo:
+        description: "App repository (e.g. org/app)"
+        required: true
+      sha:
+        description: "Commit SHA to build"
+        required: true
+      ref:
+        description: "Branch name"
+        required: false
+        default: main
+
+env:
+  REGISTRY: localhost:5001
+  PYTHON: ${{ vars.PYTHON_BIN || 'python3.12' }}
+
+jobs:
+  build:
+    runs-on: [self-hosted, "${{ vars.RUNNER_LABEL || 'platform-orchestrator' }}"]
+    steps:
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo }}
+          ref: ${{ inputs.sha }}
+          path: app
+
+      - name: Detect and build services
+        id: build
+        run: |
+          cd app
+          SHA="${{ inputs.sha }}"
+          REPO_NAME=$(echo "${{ inputs.app_repo }}" | cut -d'/' -f2)
+          
+          # Tìm tất cả thư mục có Dockerfile
+          SERVICES=""
+          for dir in */; do
+            if [ -f "${dir}Dockerfile" ]; then
+              SERVICE=$(basename "$dir")
+              IMAGE_NAME="${REPO_NAME}-${SERVICE}"
+              echo "==> Building $IMAGE_NAME from $dir"
+              docker build -t $REGISTRY/$IMAGE_NAME:$SHA "./$dir"
+              docker push $REGISTRY/$IMAGE_NAME:$SHA
+              SERVICES="$SERVICES $SERVICE"
+            fi
+          done
+          
+          # Nếu có Dockerfile ở root
+          if [ -f "Dockerfile" ]; then
+            echo "==> Building $REPO_NAME from root"
+            docker build -t $REGISTRY/$REPO_NAME:$SHA .
+            docker push $REGISTRY/$REPO_NAME:$SHA
+            SERVICES="$SERVICES root"
+          fi
+          
+          echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+
+      - name: Trigger deploys
+        run: |
+          SHA="${{ steps.build.outputs.sha }}"
+          REPO_NAME="${{ steps.build.outputs.repo_name }}"
+          
+          cd app
+          for dir in */; do
+            if [ -f "${dir}score.yaml" ]; then
+              SERVICE=$(basename "$dir")
+              APP_NAME="${REPO_NAME}-${SERVICE}"
+              IMAGE_NAME="${REPO_NAME}-${SERVICE}"
+              echo "==> Triggering deploy for $APP_NAME"
+              gh workflow run deploy.yaml \
+                -R pr3s3nt/idp-platform \
+                -f app="$APP_NAME" \
+                -f repo="${{ inputs.app_repo }}" \
+                -f sha="$SHA" \
+                -f image="$IMAGE_NAME" \
+                -f env=staging
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
