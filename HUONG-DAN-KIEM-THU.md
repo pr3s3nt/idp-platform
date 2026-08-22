@@ -104,6 +104,7 @@ và state Secret của app (không còn lệnh `offboard`).
 | Lớp | AI làm gì | Bắt lỗi gì | Khi nào |
 |---|---|---|---|
 | 1. pytest | `pytest test_engine.py` | logic render/commit/verify | mỗi lần sửa |
+| 1b. `deploy-check` (local, KHÔNG qua GHA) | `idpctl deploy-check … --build` — chạy CÙNG `run_pre_gitops` rồi deploy thử vào ns tạm + tự dọn | render/Vault/DB/dry-run/rollout thật, **trước khi push** — không cần GitHub | mỗi lần sửa idpctl, trước khi push (xem mục riêng dưới) |
 | 2. `--ref` + ảnh thật | vòng dưới | render/deploy/state + tên ảnh, trên cụm thật | vài lần/ngày |
 | 3. CI dispatch → v2 | app test CI build+dispatch tới `idp-platform-v2` (main=feature) → `kind-v2` | khúc CI dựng payload `repository_dispatch` mà lớp 2 bỏ qua | trước khi merge |
 
@@ -131,6 +132,60 @@ chính là chỗ §6.14 (`TAI-LIEU-DU-AN.md`) từng hỏng vì hai bên tự t�
 (`git push -f v2 <nhánh>:main` — v2 là platform test dùng-một-lần nên force-push thoải mái), trỏ CI
 app test dispatch tới v2, chạy trên `kind-v2` (tách hẳn kind-staging). Runner/cụm v2: xem memory dự
 án + `HUONG-DAN-CAI-DAT.md`.
+
+## `deploy-check` — kiểm NGUYÊN luồng TRƯỚC-GitOps từ máy dev (KHÔNG qua GitHub Actions)
+
+`idpctl deploy-check` chạy ĐÚNG bộ mã điều phối TRƯỚC-GitOps mà `deploy.yaml` chạy
+(`engine/pipeline.py:run_pre_gitops`, phơi qua lệnh `pre-gitops`), rồi thử triển khai THẬT vào
+một namespace kiểm tra RIÊNG và tự dọn sạch. Nó lấp khoảng giữa "pytest (không cụm)" và "luồng
+thật qua GitHub Actions": bắt lỗi render/Vault/DB/dry-run/rollout **trước khi push**, không cần
+đợi CI, không cần GitHub. Vì đi qua CÙNG `run_pre_gitops`, một lỗi tầng render/Vault/secret/
+dry-run bắt được ở local là bắt được y hệt ở CI — không có hai bộ logic để lệch nhau.
+
+```bash
+python3 idpctl --env-config platform.env.yaml deploy-check \
+  --app <app> --app-dir <đường-dẫn-source> --sha <commit-sha> \
+  --env staging --kubeconfig /tmp/kc-staging \
+  [--build] [--registry localhost:5001] [--image <tên>] [--timeout 300]
+```
+
+- **Chỉ staging** — từ chối `--env prod` (cố ý: nó tạo/xoá tài nguyên thật).
+- **Xác nhận source+SHA:** app-dir là git, HEAD khớp `--sha`, SHA tồn tại, cây SẠCH — từ chối
+  thay đổi CHƯA commit (ảnh theo SHA không chứa chúng). `--build` cho phép cây bẩn: build+push
+  ảnh TẠM mang run-id từ source hiện tại, deploy đúng ảnh đó, xoá ảnh sau (nếu registry cho xoá).
+- **12 bước dùng chung:** công cụ → cụm → source → `platform.lock` → catalog → `platform.env.yaml`
+  → capability (doctor) → render → Vault → secret → **server-side dry-run** (bước MỚI, bắt lỗi
+  CRD/schema/admission mà render một mình không thấy).
+- **Luồng ephemeral:** namespace `<app>-check-<run-id>` (nhãn `idp.platform/check-run=<run-id>`,
+  `source-app`, `source-sha`), Vault THỬ (tiền tố `apps/<app>/_check-<run-id>/` + policy/role tạm
+  — KHÔNG chạm secret thật của app), DB/PVC thật → chờ VaultStaticSecret sync + DB Ready + rollout
+  đúng ảnh → kiểm Service/HTTPRoute.
+- **Cleanup BẮT BUỘC (finally, kể cả khi lỗi/timeout):** chỉ xoá tài nguyên mang đúng run-id +
+  xác minh sở hữu namespace trước khi xoá — không bao giờ đụng tài nguyên có sẵn. Cleanup lỗi ⇒
+  exit ≠ 0 + liệt kê tài nguyên còn sót. (Ảnh tạm chỉ CẢNH BÁO, không fail lệnh — spec ràng buộc
+  "nếu registry hỗ trợ xóa"; registry harness không bật delete nên tag `:<run-id>` còn sót, vô hại.)
+- **Chẩn đoán phân tầng khi lỗi:** `[FAIL] <bước>` · `Nguyên nhân` · `Tầng lỗi`
+  (`SOURCE|PLATFORM|GITHUB|VAULT|DATABASE|KUBERNETES|NETWORK`) · `Sửa tại` · `Kiểm tra tiếp` ·
+  `Run ID` · `Cleanup`. Rollout timeout in kèm events + log pod (cả `--previous`) để biết VÌ SAO.
+- **Kiểm GitHub từ local:** gh đã đăng nhập, app repo + config repo/nhánh tồn tại. Thứ chỉ CI
+  đọc được (giá trị Actions Secrets) được BÁO RÕ "chưa xác minh", không im lặng coi là hợp lệ.
+
+**Điều kiện chạy trên harness (đã đo 2026-08-22):**
+- `kind get kubeconfig --name staging > /tmp/kc-staging`.
+- App dùng Vault/DB ⇒ port-forward Vault + token trong CÙNG shell:
+  `kubectl -n vault port-forward vault-0 8200:8200 &` rồi
+  `export VAULT_ADDR=http://localhost:8200 VAULT_TOKEN=root` (dev root token).
+- Vault dev-mode reset xoá secret app ⇒ nếu app cần credential DB thật (không phải luồng
+  ephemeral tự dựng), seed lại trước: `idpctl secret-set --app <app> --env staging --name
+  database --key username --stdin --replace` (value = tên owner role, vd `app_backend`) +
+  `--key password --generate`. (Luồng deploy-check tự dựng secret THỬ riêng, không cần bước này.)
+- `--build` cần `docker`; ảnh đẩy vào `localhost:5001`.
+
+> **Đã verify E2E THẬT** (2026-08-22, xem memory `deploy-check-e2e`): `idp-helloworld` (`--build`,
+> không Vault/DB) và `student-manager` (Postgres `class:application` + HTTPRoute + secret Vault) —
+> tạo hạ tầng thật rồi dọn sạch, exit 0. Chạy thật lộ 4 lỗi mà mock không bắt (cleanup ảnh
+> best-effort; `_keys_for_vss` phải đọc `transformation.includes`; `username` secret thử = owner
+> role CNPG; dump log pod khi rollout timeout).
 
 ## Môi trường verify & hạ tầng (đọc trước khi làm phase cần cụm)
 
