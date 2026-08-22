@@ -7,8 +7,9 @@ from . import resources as _resources
 from . import catalog as _catalog
 from . import render as _render
 from . import delivery as _delivery
+from . import pipeline as _pipeline
 from . import audit as _audit
-for _module in (_context, _resources, _catalog, _render, _delivery):
+for _module in (_context, _resources, _catalog, _render, _delivery, _pipeline):
     globals().update({n: getattr(_module, n) for n in dir(_module) if not n.startswith("__")})
 def cmd_config(args) -> None:
     """Expose platform.env.yaml to the workflow, so the YAML holds no infrastructure value.
@@ -350,6 +351,44 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--env", required=True, choices=("staging", "prod"))
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_render)
+
+    # Bước gộp TRƯỚC-GitOps mà deploy.yaml gọi: preflight -> cluster -> source -> lock ->
+    # catalog -> config -> capability -> render -> Vault -> secret -> dry-run. MỘT bộ mã
+    # dùng chung với deploy-check (engine/pipeline.py).
+    p = sub.add_parser("pre-gitops",
+                       help="chạy toàn bộ điều phối trước GitOps (dùng chung với deploy-check)")
+    add_render_flags(p, paths_required=True)
+    p.add_argument("--env", required=True, choices=("staging", "prod"))
+    p.add_argument("--out", required=True)
+    p.add_argument("--harbor-host")
+    p.add_argument("--harbor-user")
+    p.add_argument("--harbor-pass")
+    p.add_argument("--backup-key-id")
+    p.add_argument("--backup-secret-key")
+    p.add_argument("--skip-dry-run", action="store_true",
+                   help="bỏ qua bước kubectl apply --dry-run=server (chỉ khi cụm không sẵn)")
+    p.add_argument("--workflow", default="",
+                   help="tên workflow cho audit identity (khớp audit-start)")
+    p.set_defaults(func=cmd_pre_gitops)
+
+    # Thử triển khai từ máy lập trình viên vào namespace kiểm tra riêng rồi dọn sạch.
+    # Chỉ staging. Đi qua CÙNG run_pre_gitops như deploy.yaml.
+    p = sub.add_parser("deploy-check",
+                       help="thử triển khai app vào namespace kiểm tra tạm (chỉ staging)")
+    p.add_argument("--app", required=True)
+    p.add_argument("--app-dir", required=True)
+    p.add_argument("--sha", required=True)
+    p.add_argument("--env", default="staging", choices=("staging", "prod"))
+    p.add_argument("--kubeconfig")
+    p.add_argument("--registry", help="mặc định registry.path trong platform.env.yaml")
+    p.add_argument("--image", help="tên ảnh; mặc định --app")
+    p.add_argument("--catalog", help="checkout kho platform; mặc định repo hiện tại")
+    p.add_argument("--tag-strategy", choices=("", "commit", "content"), default="")
+    p.add_argument("--build", action="store_true",
+                   help="build+push ảnh tạm mang run-id để kiểm cả source CHƯA commit")
+    p.add_argument("--timeout", type=int, default=300)
+    p.add_argument("--work", help="thư mục làm việc (mặc định: thư mục tạm, tự xoá)")
+    p.set_defaults(func=cmd_deploy_check)
 
     p = sub.add_parser("apply-secrets")
     p.add_argument("--app", required=True)

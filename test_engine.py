@@ -4736,3 +4736,445 @@ def test_user_facing_github_host_is_not_hardcoded():
             continue  # git_server_url docstring
         offenders.append((i, stripped))
     assert not offenders, f"hardcoded github.com outside allowlist: {offenders}"
+
+
+# ============================================================================
+# deploy-check / pre-gitops — đường điều phối TRƯỚC-GitOps dùng chung
+# (engine/pipeline.py). Không cần cụm: mọi lệnh cụm/Vault đều được mock.
+# ============================================================================
+def _score_git_app(tmp_path: Path):
+    """Một app một-workload là kho git sạch. Trả (repo, sha đầy đủ của HEAD)."""
+    repo = tmp_path / "app"
+    write(repo / "score.yaml", score_spec("web", "main"))
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "t@t")
+    git(repo, "config", "user.name", "t")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "one")
+    return repo, git(repo, "rev-parse", "HEAD")
+
+
+def _cp(rc=0, out="ok", err=""):
+    return subprocess.CompletedProcess([], rc, stdout=out, stderr=err)
+
+
+# ---- chẩn đoán phân tầng ----------------------------------------------------
+def test_diagnostic_has_the_contract_shape():
+    err = orc.DeployCheckError("render manifest", "score.yaml sai",
+                               orc.LAYER_SOURCE, "score.yaml", "idpctl render")
+    out = orc.format_diagnostic(err, run_id="r1", cleanup="thành công")
+    assert "[FAIL] render manifest" in out
+    assert "Nguyên nhân: score.yaml sai" in out
+    assert "Tầng lỗi: SOURCE" in out
+    assert "Sửa tại: score.yaml" in out
+    assert "Kiểm tra tiếp: idpctl render" in out
+    assert "Run ID: r1" in out
+    assert "Cleanup: thành công" in out
+
+
+def test_diagnostic_layer_must_be_a_known_layer():
+    with pytest.raises(ValueError):
+        orc.DeployCheckError("x", "y", "BOGUS", "z")
+
+
+def test_diagnostic_omits_runid_and_cleanup_for_pre_gitops():
+    """pre-gitops trong CI không tạo namespace kiểm tra, nên không có hai dòng đó."""
+    err = orc.DeployCheckError("dry-run", "boom", orc.LAYER_KUBERNETES, "manifest")
+    out = orc.format_diagnostic(err)
+    assert "Run ID" not in out and "Cleanup" not in out
+
+
+# ---- platform.lock ----------------------------------------------------------
+def test_read_platform_lock_skips_comments(tmp_path):
+    (tmp_path / "platform.lock").write_text("# ghi chú\n\ncatalog/v1\n")
+    assert orc.read_platform_lock(tmp_path) == "catalog/v1"
+
+
+def test_read_platform_lock_defaults_to_main(tmp_path):
+    assert orc.read_platform_lock(tmp_path) == "main"
+
+
+# ---- bước 4: xác nhận source + SHA -----------------------------------------
+def test_deploy_check_rejects_non_git_source(tmp_path):
+    d = tmp_path / "nogit"
+    d.mkdir()
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc._resolve_and_validate_sha(d, "abc", build=False)
+    assert e.value.layer == orc.LAYER_SOURCE
+    assert "không phải kho Git" in e.value.cause
+
+
+def test_deploy_check_rejects_unknown_sha(tmp_path):
+    repo, sha = _score_git_app(tmp_path)
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc._resolve_and_validate_sha(repo, "0" * 40, build=False)
+    assert e.value.layer == orc.LAYER_SOURCE
+    assert "không có trong kho" in e.value.cause
+
+
+def test_deploy_check_rejects_head_mismatch(tmp_path, repo_with_two_commits):
+    repo, old, new = repo_with_two_commits
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc._resolve_and_validate_sha(repo, old, build=False)  # old != HEAD(new)
+    assert "khác --sha" in e.value.cause
+
+
+def test_deploy_check_rejects_uncommitted_changes(tmp_path):
+    """Ảnh theo SHA KHÔNG chứa thay đổi chưa commit — báo xanh trên nó là nói dối."""
+    repo, sha = _score_git_app(tmp_path)
+    (repo / "score.yaml").write_text("dirty: true\n")  # sửa file đã track
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc._resolve_and_validate_sha(repo, sha, build=False)
+    assert e.value.layer == orc.LAYER_SOURCE
+    assert "CHƯA COMMIT" in e.value.cause
+
+
+def test_deploy_check_build_allows_uncommitted(tmp_path):
+    repo, sha = _score_git_app(tmp_path)
+    (repo / "extra.txt").write_text("x")  # cây bẩn
+    assert orc._resolve_and_validate_sha(repo, sha, build=True) == sha
+
+
+def test_source_and_image_correspond_to_the_same_sha(tmp_path):
+    """Ảnh (commit strategy) mang ĐÚNG SHA vừa xác nhận từ source — không lệch phiên bản."""
+    repo, sha = _score_git_app(tmp_path)
+    resolved = orc._resolve_and_validate_sha(repo, sha, build=False)
+    services = orc.discover(repo)
+    plan = orc.plan_images(services, "r.io/p", "web", resolved, repo, "commit")
+    assert plan["web"] == f"r.io/p/web:{resolved}"
+
+
+# ---- kiểm GitHub (chỉ thứ local xác minh được) -----------------------------
+def test_github_checks_requires_login(monkeypatch):
+    def fake_run(argv, **kw):
+        if argv[:3] == ["gh", "auth", "status"]:
+            return _cp(rc=1, out="", err="not logged in")
+        return _cp()
+    monkeypatch.setattr(orc, "run", fake_run)
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc.github_checks("web", "staging", "s")
+    assert e.value.layer == orc.LAYER_GITHUB
+    assert "chưa đăng nhập" in e.value.cause
+
+
+def test_github_checks_fails_when_app_repo_missing(monkeypatch):
+    def fake_run(argv, **kw):
+        if argv[:3] == ["gh", "auth", "status"]:
+            return _cp()
+        if argv[:2] == ["gh", "api"] and "repos/" in argv[2]:
+            return _cp(rc=1, out="", err="gh: Not Found (HTTP 404)")
+        return _cp()
+    monkeypatch.setattr(orc, "run", fake_run)
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc.github_checks("web", "staging", "s")
+    assert e.value.layer == orc.LAYER_GITHUB
+    assert "kho ứng dụng" in e.value.stage
+
+
+def test_github_checks_fails_when_commit_not_pushed(monkeypatch):
+    def fake_run(argv, **kw):
+        if argv[:3] == ["gh", "auth", "status"]:
+            return _cp()
+        if argv[:2] == ["gh", "api"]:
+            path = argv[2]
+            if "/commits/" in path:
+                return _cp(rc=1, out="", err="404 Not Found")
+            return _cp(rc=0, out="pr3s3nt/web")  # repos tồn tại
+        return _cp()
+    monkeypatch.setattr(orc, "run", fake_run)
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc.github_checks("web", "staging", "deadbeef", check_pushed=True)
+    assert "commit trên GitHub" in e.value.stage
+
+
+def test_github_checks_does_not_assert_actions_secrets(monkeypatch, capsys):
+    """Giá trị Actions Secrets chỉ CI đọc được — phải BÁO 'chưa xác minh', không im lặng OK."""
+    def fake_run(argv, **kw):
+        return _cp()  # mọi gh đều OK
+    monkeypatch.setattr(orc, "run", fake_run)
+    orc.github_checks("web", "staging", "s", check_pushed=False)
+    err = capsys.readouterr().err
+    assert "Actions Secrets" in err and "chưa xác minh" in err
+
+
+# ---- run_pre_gitops: chạy đủ 12 bước, mock cụm/render/Vault/secret ----------
+def _happy_pipeline(monkeypatch):
+    import shutil as _sh
+    monkeypatch.setattr(_sh, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(orc, "check_tool_versions", lambda *a, **k: None)
+    monkeypatch.setattr(orc, "kubectl",
+                        lambda args, **kw: _cp(rc=0, out="ok"))
+    monkeypatch.setattr(orc, "cmd_vault_auto_setup", lambda a: None)
+    monkeypatch.setattr(orc, "cmd_apply_secrets", lambda a: None)
+
+
+def _render_writing(out_text="", secrets_text=""):
+    def fake_render(args):
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(out_text or "kind: Deployment\n")
+        (Path(args.work) / "secrets.yaml").parent.mkdir(parents=True, exist_ok=True)
+        (Path(args.work) / "secrets.yaml").write_text(secrets_text)
+    return fake_render
+
+
+def test_run_pre_gitops_success_records_every_stage(tmp_path, monkeypatch):
+    repo, sha = _score_git_app(tmp_path)
+    _happy_pipeline(monkeypatch)
+    monkeypatch.setattr(orc, "cmd_render", _render_writing())
+    stages = []
+    params = orc.PipelineParams(
+        app="web", env="staging", app_dir=repo, sha=sha, registry="r.io/p",
+        work=tmp_path / "w", out=tmp_path / "w" / "manifests.yaml", catalog=CATALOG)
+    result = orc.run_pre_gitops(
+        params, record=lambda s, st, **k: stages.append((s, st)))
+    assert result.catalog_ref == "main"
+    assert result.image_plan["web"].startswith("r.io/p/")
+    assert result.target_namespace == "web-staging"
+    assert ("render", "success") in stages
+    assert ("apply_secrets", "success") in stages
+    assert ("dry_run", "success") in stages
+
+
+def test_run_pre_gitops_translates_render_error_to_source(tmp_path, monkeypatch):
+    repo, sha = _score_git_app(tmp_path)
+    _happy_pipeline(monkeypatch)
+    def boom(args):
+        raise SystemExit("score.yaml: no containers defined")
+    monkeypatch.setattr(orc, "cmd_render", boom)
+    params = orc.PipelineParams(
+        app="web", env="staging", app_dir=repo, sha=sha, registry="r.io/p",
+        work=tmp_path / "w", out=tmp_path / "w" / "m.yaml", catalog=CATALOG)
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc.run_pre_gitops(params)
+    assert e.value.layer == orc.LAYER_SOURCE
+    assert e.value.stage == "render manifest"
+
+
+def test_run_pre_gitops_translates_vault_error(tmp_path, monkeypatch):
+    repo, sha = _score_git_app(tmp_path)
+    _happy_pipeline(monkeypatch)
+    monkeypatch.setattr(orc, "cmd_render", _render_writing())
+    def boom(a):
+        raise SystemExit("Vault từ chối PUT policy")
+    monkeypatch.setattr(orc, "cmd_vault_auto_setup", boom)
+    params = orc.PipelineParams(
+        app="web", env="staging", app_dir=repo, sha=sha, registry="r.io/p",
+        work=tmp_path / "w", out=tmp_path / "w" / "m.yaml", catalog=CATALOG)
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc.run_pre_gitops(params)
+    assert e.value.layer == orc.LAYER_VAULT
+
+
+def test_dry_run_failure_is_a_kubernetes_layer_error(tmp_path, monkeypatch):
+    repo, sha = _score_git_app(tmp_path)
+    monkeypatch.setattr(orc, "cmd_render", _render_writing())
+    m = tmp_path / "m.yaml"
+    m.write_text("kind: Deployment\n")
+    def fake_kubectl(args, **kw):
+        if args[:1] == ["apply"] and "--dry-run=server" in args:
+            return _cp(rc=1, out="", err='no matches for kind "Cluster"')
+        return _cp()
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc.server_side_dry_run(m, "web-staging", None)
+    assert e.value.layer == orc.LAYER_KUBERNETES
+    assert "dry-run" in e.value.stage
+
+
+# ---- chờ rollout: timeout -> KUBERNETES ------------------------------------
+def test_ephemeral_rollout_timeout_is_layered(tmp_path, monkeypatch):
+    docs = [deploy_doc("web", "r.io/web:v2")]
+    # cụm chạy ảnh KHÁC -> không bao giờ khớp -> timeout
+    monkeypatch.setattr(orc, "kubectl",
+                        fake_kubectl_returning({"web": live("r.io/web:cu")}))
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc._wait_rollout(docs, "web-check-x", None, timeout=0)
+    assert e.value.layer == orc.LAYER_KUBERNETES
+    assert "Deployment" in e.value.stage
+
+
+def test_ephemeral_database_wait_failure_is_database_layer(tmp_path, monkeypatch):
+    """SystemExit của wait_for_databases phải thành DeployCheckError tầng DATABASE."""
+    def boom(docs, ns, args):
+        raise SystemExit("cơ sở dữ liệu chưa Ready sau 600s")
+    with pytest.raises(orc.DeployCheckError) as e:
+        orc._run_wait(boom, [], "ns", None, stage="chờ database sẵn sàng",
+                      layer=orc.LAYER_DATABASE, fix_at="CNPG")
+    assert e.value.layer == orc.LAYER_DATABASE
+
+
+# ---- cleanup: chỉ xoá của mình, không đụng tài nguyên có sẵn ----------------
+def test_cleanup_refuses_a_namespace_it_does_not_own(monkeypatch):
+    cr = orc.CheckRun(app="a", env="staging", sha="s", run_id="r1",
+                      kubeconfig=None, namespace="a-check-r1")
+    deleted = []
+    def fake_kubectl(args, **kw):
+        if args[:2] == ["get", "namespace"] and "json" in args:
+            return _cp(out=json.dumps(
+                {"metadata": {"labels": {orc.CHECK_RUN_LABEL: "SOMEONE-ELSE"}}}))
+        if args[:2] == ["get", "namespace"]:
+            return _cp(out="namespace/a-check-r1")
+        if args[:1] == ["delete"]:
+            deleted.append(args)
+            return _cp()
+        return _cp()
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    ok, leftovers = cr.cleanup()
+    assert ok is False
+    assert any("TỪ CHỐI" in l for l in leftovers)
+    assert deleted == []  # KHÔNG xoá tài nguyên có sẵn từ trước
+
+
+def test_cleanup_deletes_a_namespace_it_owns(monkeypatch):
+    cr = orc.CheckRun(app="a", env="staging", sha="s", run_id="r1",
+                      kubeconfig=None, namespace="a-check-r1")
+    deleted = []
+    def fake_kubectl(args, **kw):
+        if args[:2] == ["get", "namespace"] and "json" in args:
+            return _cp(out=json.dumps(
+                {"metadata": {"labels": {orc.CHECK_RUN_LABEL: "r1"}}}))
+        if args[:2] == ["get", "namespace"]:
+            return _cp(out="namespace/a-check-r1")
+        if args[:1] == ["delete"]:
+            deleted.append(args)
+            return _cp()
+        return _cp()
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    ok, leftovers = cr.cleanup()
+    assert ok is True and leftovers == []
+    assert any(a[:2] == ["delete", "namespace"] for a in deleted)
+
+
+def test_cleanup_reports_leftovers_when_delete_fails(monkeypatch):
+    cr = orc.CheckRun(app="a", env="staging", sha="s", run_id="r1",
+                      kubeconfig=None, namespace="a-check-r1")
+    def fake_kubectl(args, **kw):
+        if args[:2] == ["get", "namespace"] and "json" in args:
+            return _cp(out=json.dumps({"metadata": {"labels": {orc.CHECK_RUN_LABEL: "r1"}}}))
+        if args[:2] == ["get", "namespace"]:
+            return _cp(out="namespace/a-check-r1")
+        if args[:1] == ["delete"]:
+            return _cp(rc=1, err="Forbidden")
+        return _cp()
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    ok, leftovers = cr.cleanup()
+    assert ok is False and leftovers
+
+
+# ---- deploy-check chạy cleanup DÙ pipeline ném lỗi (finally) ----------------
+def test_deploy_check_cleans_up_even_on_failure(tmp_path, monkeypatch):
+    repo, sha = _score_git_app(tmp_path)
+    monkeypatch.setattr(orc, "github_checks", lambda *a, **k: None)
+    def boom(*a, **k):
+        raise orc.DeployCheckError("render manifest", "boom",
+                                   orc.LAYER_PLATFORM, "x")
+    monkeypatch.setattr(orc, "run_pre_gitops", boom)
+    monkeypatch.setattr(orc, "_create_labeled_namespace", lambda *a, **k: None)
+    called = {}
+    def fake_cleanup(self):
+        called["yes"] = True
+        return True, []
+    monkeypatch.setattr(orc.CheckRun, "cleanup", fake_cleanup)
+    args = argparse.Namespace(
+        app="web", app_dir=str(repo), sha=sha, env="staging", kubeconfig=None,
+        registry="r.io/p", image=None, catalog=str(CATALOG), tag_strategy="",
+        build=False, timeout=1, work=str(tmp_path / "w"))
+    with pytest.raises(SystemExit):
+        orc.cmd_deploy_check(args)
+    assert called.get("yes") is True
+
+
+def test_deploy_check_refuses_prod(tmp_path):
+    args = argparse.Namespace(
+        app="web", app_dir=str(tmp_path), sha="s", env="prod", kubeconfig=None,
+        registry="r.io/p", image=None, catalog=str(CATALOG), tag_strategy="",
+        build=False, timeout=1, work=None)
+    with pytest.raises(SystemExit, match="chỉ hỗ trợ staging"):
+        orc.cmd_deploy_check(args)
+
+
+# ---- deploy-check và deploy.yaml (pre-gitops) dùng CÙNG một logic -----------
+def test_deploy_check_and_deploy_yaml_share_the_pipeline(tmp_path, monkeypatch):
+    repo, sha = _score_git_app(tmp_path)
+    calls = []
+    def spy(params, record=None):
+        calls.append(params)
+        out = Path(params.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("kind: Deployment\n")
+        return orc.PipelineResult(manifests=out,
+                                  secrets=Path(params.work) / "secrets.yaml",
+                                  target_namespace=params.target_namespace or "x")
+    monkeypatch.setattr(orc, "run_pre_gitops", spy)
+    monkeypatch.setattr(orc, "github_checks", lambda *a, **k: None)
+    monkeypatch.setattr(orc, "_ephemeral_deploy", lambda *a, **k: None)
+    monkeypatch.setattr(orc, "_create_labeled_namespace", lambda *a, **k: None)
+    monkeypatch.setattr(orc, "kubectl", lambda args, **kw: _cp(rc=1, err="NotFound"))
+
+    # deploy.yaml -> idpctl pre-gitops
+    pg = argparse.Namespace(
+        app="web", image=None, tag=sha, registry="r.io/p", tag_strategy="",
+        accept_empty_database=False, catalog=str(CATALOG), app_dir=str(repo),
+        work=str(tmp_path / "w1"), kubeconfig=None, state_file=None, no_state=False,
+        env="staging", out=str(tmp_path / "w1" / "m.yaml"),
+        harbor_host=None, harbor_user=None, harbor_pass=None,
+        backup_key_id=None, backup_secret_key=None, skip_dry_run=False)
+    orc.cmd_pre_gitops(pg)
+
+    # deploy-check
+    dc = argparse.Namespace(
+        app="web", app_dir=str(repo), sha=sha, env="staging", kubeconfig=None,
+        registry="r.io/p", image=None, catalog=str(CATALOG), tag_strategy="",
+        build=False, timeout=1, work=str(tmp_path / "w2"))
+    orc.cmd_deploy_check(dc)
+
+    assert len(calls) == 2, "cả pre-gitops và deploy-check phải gọi run_pre_gitops"
+    # deploy-check nhắm namespace kiểm tra riêng, không phải namespace chính thức
+    assert "check" in calls[1].target_namespace
+    assert calls[1].do_vault is False and calls[1].do_secrets is False
+
+
+def test_keys_for_vss_gathers_referenced_keys():
+    """Secret thử phải đủ đúng các key mà Deployment tham chiếu, nếu không pod kẹt
+    CreateContainerConfigError — một lỗi GIẢ do bản kiểm tự gây ra."""
+    vss = {"kind": "VaultStaticSecret",
+           "metadata": {"name": "stripe"},
+           "spec": {"destination": {"name": "stripe-secret"}}}
+    dep = {"kind": "Deployment", "metadata": {"name": "web"},
+           "spec": {"template": {"spec": {"containers": [{
+               "name": "main",
+               "env": [
+                   {"name": "API_KEY", "valueFrom": {"secretKeyRef": {
+                       "name": "stripe-secret", "key": "api_key"}}},
+                   {"name": "WEBHOOK", "valueFrom": {"secretKeyRef": {
+                       "name": "stripe-secret", "key": "webhook"}}},
+                   {"name": "OTHER", "valueFrom": {"secretKeyRef": {
+                       "name": "some-other", "key": "nope"}}},
+               ]}]}}}}
+    assert orc._keys_for_vss(vss, [vss, dep]) == ["api_key", "webhook"]
+
+
+def test_keys_for_vss_reads_transformation_includes():
+    """Credential DB (CNPG) đọc THẲNG Secret basic-auth qua `includes: [^username$,^password$]`,
+    KHÔNG qua secretKeyRef của Deployment. Bỏ qua includes = secret thử thiếu key = initdb chết
+    (CreateContainerConfigError) — đúng lỗi thật gặp khi chạy student-manager trên cụm."""
+    vss = {"kind": "VaultStaticSecret",
+           "metadata": {"name": "pg-cred"},
+           "spec": {"destination": {"name": "pg-cred", "type": "kubernetes.io/basic-auth",
+                                    "transformation": {"excludeRaw": True,
+                                                       "includes": ["^username$", "^password$"]}}}}
+    assert orc._keys_for_vss(vss, [vss]) == ["password", "username"]
+
+
+def test_db_owner_for_secret_from_cnpg_cluster():
+    """username của secret thử phải = tên role CNPG (owner), nếu không CNPG initdb tạo role
+    sai tên và app auth thất bại (InvalidPasswordError) — lỗi thật gặp trên cụm."""
+    cluster = {"kind": "Cluster", "apiVersion": "postgresql.cnpg.io/v1",
+               "metadata": {"name": "pg-backend"},
+               "spec": {"bootstrap": {"initdb": {"owner": "app_backend",
+                                                 "secret": {"name": "pg-backend-cred"}}},
+                        "managed": {"roles": [{"name": "app_backend",
+                                               "passwordSecret": {"name": "pg-backend-cred"}}]}}}
+    assert orc._db_owner_for_secret("pg-backend-cred", [cluster]) == "app_backend"
+    assert orc._db_owner_for_secret("other-secret", [cluster]) is None

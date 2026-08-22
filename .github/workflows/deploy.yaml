@@ -160,19 +160,9 @@ jobs:
           echo "$STAGING_B64" | base64 -d > cluster-config-staging
           echo "$PROD_B64"    | base64 -d > cluster-config-prod
 
-      - name: Preflight
-        run: $PYTHON platform/idpctl --env-config "$ENV_CONFIG" preflight --require-cluster
-        env:
-          KUBECONFIG: ${{ github.workspace }}/cluster-config-staging
-
-      # Checkpoint audit: ghi stage vừa xong là success, rồi trỏ STAGE sang stage sắp tới.
-      # Nếu một bước thật hỏng, checkpoint SAU nó không chạy (job dừng), nên STAGE vẫn giữ
-      # đúng stage lỗi cho bước `if: failure()` phân loại — không cần sửa thân các bước cũ.
-      - name: Audit — preflight ok
-        run: |
-          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
-            --stage preflight --status success || true
-          echo "STAGE=checkout" >> "$GITHUB_ENV"
+      # Preflight KHÔNG còn là step riêng: nó là bước ĐẦU TIÊN của `pre-gitops` bên dưới,
+      # cùng một bộ mã mà `deploy-check` chạy trên máy lập trình viên. Kubeconfig đã ghi ở
+      # bước trên nên `pre-gitops --kubeconfig` kiểm được cụm.
 
       - name: Checkout app repo at the exact commit
         uses: actions/checkout@v4
@@ -241,16 +231,39 @@ jobs:
         run: |
           $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
             --stage checkout --status success || true
-          echo "STAGE=render" >> "$GITHUB_ENV"
+          echo "STAGE=pre_gitops" >> "$GITHUB_ENV"
 
-      - name: Render ${{ env.DEPLOY_ENV }}
+      # ---------------------------------------------------------------------------------
+      # PRE-GITOPS (mục dùng chung). MỘT lệnh chạy cả chuỗi TRƯỚC GitOps:
+      #   công cụ -> cụm -> source -> platform.lock -> catalog -> platform.env.yaml ->
+      #   capability cụm -> render -> cấu hình Vault -> chuẩn bị secret -> server-side
+      #   dry-run. Cùng bộ mã (engine/pipeline.py: run_pre_gitops) mà `idpctl deploy-check`
+      #   chạy trên máy lập trình viên, nên một lỗi ở tầng render/Vault/secret/dry-run được
+      #   bắt y hệt ở CI lẫn ở local — không có hai bộ logic để lệch nhau.
+      #
+      # Lệnh tự GHI AUDIT theo từng stage (render/apply_secrets/dry_run) qua audit identity
+      # khớp audit-start, nên gộp bốn step cũ thành một mà KHÔNG mất chi tiết audit.
+      - name: Pre-GitOps (shared) — preflight → render → Vault → secrets → dry-run
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
         run: |
-          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" render \
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" pre-gitops \
             --app "$APP" --image "$IMAGE" --tag "$SHA" --env "$DEPLOY_ENV" \
             --registry "$REGISTRY" --tag-strategy "$TAG_STRATEGY" \
             --catalog catalog --app-dir app --work work-staging \
             --out "config/$DEPLOY_ENV/manifests.yaml" \
-            --kubeconfig "cluster-config-$DEPLOY_ENV"
+            --kubeconfig "cluster-config-$DEPLOY_ENV" \
+            --workflow deploy \
+            --harbor-host "${{ secrets.REGISTRY_HOST }}" \
+            --harbor-user "${{ secrets.REGISTRY_USER }}" \
+            --harbor-pass "${{ secrets.REGISTRY_PASS }}"
+
+      - name: Audit — pre-gitops ok
+        run: |
+          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
+            --stage apply_secrets --status success || true
+          echo "STAGE=commit_config" >> "$GITHUB_ENV"
 
       # Bootstrap prod once so its Fleet bundle exists; afterwards prod only moves through an
       # explicit promote-request.
@@ -279,21 +292,9 @@ jobs:
             --out config/prod/manifests.yaml \
             --kubeconfig cluster-config-prod
 
-      - name: Audit — render ok
-        run: |
-          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
-            --stage render --status success || true
-          echo "STAGE=apply_secrets" >> "$GITHUB_ENV"
-
-      - name: Vault auto-setup (${{ env.DEPLOY_ENV }})
-        env:
-          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
-          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
-        run: |
-          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" vault-auto-setup \
-            --app "$APP" --env "$DEPLOY_ENV" --apply \
-            --kubeconfig "cluster-config-$DEPLOY_ENV"
-
+      # Render + Vault + apply-secrets cho môi trường ĐANG deploy đã nằm trong `pre-gitops`
+      # ở trên. Chỉ còn phần PROD của lần bootstrap đầu (khi prod dùng chung nhánh) là
+      # riêng, vì nó render ra một thư mục khác (work-prod / config/prod).
       - name: Vault auto-setup (prod, if bootstrapped this run)
         env:
           VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
@@ -304,15 +305,6 @@ jobs:
             --app "$APP" --env prod --apply \
             --kubeconfig cluster-config-prod
 
-      - name: Apply secrets (${{ env.DEPLOY_ENV }})
-        run: |
-          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" apply-secrets \
-            --app "$APP" --env "$DEPLOY_ENV" --secrets work-staging/secrets.yaml \
-            --harbor-host "${{ secrets.REGISTRY_HOST }}" \
-            --harbor-user "${{ secrets.REGISTRY_USER }}" \
-            --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
-            --kubeconfig "cluster-config-$DEPLOY_ENV"
-
       - name: Apply secrets (prod, if bootstrapped this run)
         run: |
           [ -d work-prod ] || { echo "==> prod not rendered this run"; exit 0; }
@@ -322,12 +314,6 @@ jobs:
             --harbor-user "${{ secrets.REGISTRY_USER }}" \
             --harbor-pass "${{ secrets.REGISTRY_PASS }}" \
             --kubeconfig cluster-config-prod
-
-      - name: Audit — apply_secrets ok
-        run: |
-          $PYTHON platform/idpctl --env-config "$ENV_CONFIG" audit-event $AUDIT_ID \
-            --stage apply_secrets --status success || true
-          echo "STAGE=commit_config" >> "$GITHUB_ENV"
 
       - name: Commit & push config repo
         id: commit
