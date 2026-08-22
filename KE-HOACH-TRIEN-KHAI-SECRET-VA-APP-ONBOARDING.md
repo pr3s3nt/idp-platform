@@ -3,6 +3,15 @@
 Ngày chốt kế hoạch: 2026-08-10
 Phạm vi: `idp-platform`, workflow GitHub, Fleet, Score, Vault, Vault Secrets Operator và golden path tạo ứng dụng mới.
 
+> ⚠️ **TÀI LIỆU LỊCH SỬ — một phần đã bị đảo.** Phase Environment Values + Vault Secret vẫn
+> đúng và đang chạy. Nhưng **App Onboarding (Phase 6) đã bị GỠ** ở commit `c5d28ac`: không
+> còn `engine/onboarding.py`, các lệnh `onboard`/`onboard-status`/`onboard-activate-prod`/
+> `offboard`, `OnboardingRequest`, hay các trạng thái `WAITING_FOR_USER_SECRETS`/
+> `PENDING_PROD_APPROVAL`/`FAILED_RETRYABLE`. Mọi phần bên dưới nói về máy trạng thái
+> onboarding chỉ còn giá trị lịch sử. **Luồng đưa app lên hiện tại**: `stack-new` → push →
+> CI build → `deploy.yaml` (render+commit+Fleet); prod qua deploy `env=prod`/`promote`; dọn
+> app theo `docs/runbook/xoa-app-va-giu-du-lieu.md`. Đường chuẩn: `HUONG-DAN-TRIEN-KHAI-APP-CHUAN.md`.
+
 ---
 
 ## 0. Chỉ thị thực thi dành cho AI

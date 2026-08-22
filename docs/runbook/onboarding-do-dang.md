@@ -1,81 +1,78 @@
-# 6. Onboarding dở dang và retry
+# 6. Deploy dở dang và retry
+
+> **Máy trạng thái onboarding đã bị GỠ** (commit `c5d28ac`: xoá `engine/onboarding.py` +
+> các lệnh `onboard`/`onboard-status`/`onboard-activate-prod`, và ConfigMap state
+> `idp-onboarding-<app>`). Không còn "trạng thái onboarding" để tra, không còn
+> `--force-step`/`--stop-after`. Runbook này thay phần đó bằng cách retry luồng deploy thật.
 
 ## Nguyên tắc
 
-Onboarding là **máy trạng thái có bản ghi nằm ngoài tiến trình** (ADR `0010`). "Đang chờ
-người" là một **trạng thái**, không phải lỗi. Mỗi bước kiểm-trước-khi-tạo, nên chạy lại
-đúng lệnh cũ là an toàn và không tạo bản sao thứ hai.
+Đưa app lên là **luồng deploy chuẩn**, và mọi bước của nó **idempotent** nên retry an toàn:
 
-**Không bao giờ** dọn dẹp bằng tay rồi chạy lại từ đầu. Đó chính là thứ máy trạng thái
-sinh ra để khỏi phải làm.
+- `render` giữ state, sort manifest → render lại ra **y hệt** (chống Fleet churn).
+- `ensure-gitrepo` **không bao giờ ghi đè** GitRepo đã có (`engine/cli.py`).
+- `apply-secrets`/commit coi `AlreadyExists` là thành công (create-if-missing).
+- `vault-onboard` + `vault-auto-setup` kiểm-trước-khi-tạo policy/role/SA.
 
-## Xác nhận đang ở đâu
+Nên "retry" = **chạy lại đúng luồng** (đẩy lại commit, hoặc `gh workflow run deploy.yaml`),
+không phải dọn tay rồi làm lại từ đầu.
+
+## Xác nhận đang ở đâu (không còn onboard-status — đọc tài nguyên thật)
 
 ```bash
-python3 idpctl --env-config platform.env.yaml onboard-status --app <app>
-kubectl -n cluster-state get configmap idp-onboarding-<app> -o jsonpath='{.data.record\.json}' \
-  | python3 -m json.tool | head -40
+APP=<app>; ENV=staging
+kubectl -n fleet-local get gitrepo | grep "$APP"                     # config repo đã vào Fleet chưa
+kubectl -n "$APP-$ENV" get pods,cluster.postgresql.cnpg.io,vaultstaticsecret
+kubectl get all,gitrepo -A -l idp.platform/application="$APP"        # mọi thứ platform tạo cho app
 ```
 
-## Trạng thái và việc phải làm
+Kiểm rollout thật (không nhìn `availableReplicas` — dễ xanh giả):
 
-| Trạng thái | Nghĩa | Việc |
+```bash
+kubectl -n "$APP-$ENV" rollout status deploy --timeout=120s
+```
+
+> `idpctl verify` là bước trong workflow (cần `--manifests` là thư mục vừa render), không
+> phải lệnh soi tay tiện dụng — vận hành cứ dùng `kubectl rollout status` ở trên.
+
+## Retry theo triệu chứng
+
+| Triệu chứng | Nguyên nhân thường gặp | Việc |
 |---|---|---|
-| `WAITING_FOR_USER_SECRETS` | Thiếu bí mật bên thứ ba. **Không phải lỗi** | Chạy đúng lệnh `secret-set` mà `onboard-status` in ra, rồi chạy lại `onboard` |
-| `PENDING_PROD_ACTIVATION` | Staging xong, prod chưa được yêu cầu | `onboard-activate-prod` khi đội ứng dụng sẵn sàng |
-| `PENDING_PROD_APPROVAL` | Pull request prod đang chờ duyệt | Người duyệt merge PR, rồi chạy lại `onboard-activate-prod` |
-| `FAILED_RETRYABLE` | Hỏng ở một bước cụ thể | Sửa nguyên nhân, chạy lại cùng lệnh |
-| `PARTIALLY_READY` | Một phần chạy được | Chạy lại; bước đã xong bị bỏ qua |
+| GitRepo có, pod chưa lên | ảnh chưa có trong registry, hoặc render trỏ tag sai | poll registry tới khi tag thật xuất hiện, rồi deploy lại đúng SHA đó |
+| `VaultStaticSecret` `SecretSynced=False` | Vault chưa có policy/role/secret cho app | chạy lại `vault-onboard` + `vault-auto-setup`, rồi `secret-set` các khoá còn thiếu |
+| pod `CreateContainerConfigError` chờ Secret | secret bên thứ ba chưa nạp | `secret-set` đúng khoá vào `apps/<app>/<env>/<name>`, VSO tự sync lại |
+| prod chưa có gì | prod KHÔNG tự chảy từ staging | kích hoạt prod bằng luồng riêng (xem dưới) |
 
-## Retry
+## Kích hoạt prod (thay onboard-activate-prod)
 
-```bash
-python3 idpctl --env-config platform.env.yaml onboard --request <file> ...   # đúng lệnh cũ
-```
-
-Bước đã `done` bị bỏ qua. Muốn chạy lại một bước cụ thể (mọi bước đều kiểm-trước-khi-tạo
-nên an toàn):
+Prod đi qua một lần deploy **env=prod** vào nhánh config prod, qua pull request có người
+duyệt (branch protection). Không có lệnh `onboard-activate-prod`.
 
 ```bash
-... onboard --force-step verify-staging
-... onboard-activate-prod --force-step <bước>     # cờ này có ở CẢ HAI lệnh
+gh workflow run deploy.yaml --ref main -f app=$APP -f repo=<org/app> -f sha=<sha> -f env=prod
 ```
 
-Muốn dừng sớm để xem xét: `--stop-after <bước>`.
+Cách khác: workflow `promote` (copy đúng bộ ảnh staging sang prod, `idpctl promote --mode
+from-staging`). Nó **chỉ nhận `repository_dispatch` type `promote-request`** (không có
+`workflow_dispatch`) — app CI phát khi merge sang nhánh production, hoặc phát tay bằng
+`gh api .../dispatches -f event_type=promote-request`.
 
-## Bẫy đã gặp
+## Bẫy đã gặp (vẫn đúng)
 
-- **Bản checkout của lần chạy trước không còn.** Retry trên máy khác vẫn chạy được: mỗi
-  bước tự dựng lại từ remote. Bước build lấy **đỉnh nhánh**, bước deploy/verify lấy **đúng
-  commit đã build** — render theo đỉnh nhánh sẽ trỏ tới một ảnh chưa ai đẩy lên.
-- **Thiếu `PLATFORM_DISPATCH_TOKEN`.** Lần push đầu tiên của đội ứng dụng đỏ ở
-  `actions/checkout` với thông báo không hề nhắc tới secret. Onboarding đặt token này khi
-  người chạy cung cấp `APP_DISPATCH_TOKEN`, và **báo là còn thiếu** khi không.
-- **CI sinh từ nhánh chưa merge thì đỏ.** Mẫu CI checkout platform ở `ref: main`. Onboard
-  từ nhánh phát triển giao cho đội ứng dụng một workflow gọi lệnh mà `main` chưa có. Thứ
-  tự bắt buộc: **merge trước, onboard sau**.
-- **Bí mật không tự chảy từ staging sang prod.** Đó là chủ ý. Prod sẽ dừng ở
-  `WAITING_FOR_USER_SECRETS` riêng của nó.
+- **Bí mật KHÔNG tự chảy từ staging sang prod** — có chủ ý. Prod phải `secret-set` riêng.
+- **CI sinh từ nhánh chưa merge thì đỏ.** Mẫu CI checkout platform ở `ref: main`; app CI gọi
+  `deploy.yaml` qua `repository_dispatch` cũng LUÔN chạy platform từ `main`. Thứ tự bắt buộc:
+  **merge trước, để app CI dispatch sau**. Muốn thử code platform nhánh chưa merge thì dùng
+  `gh workflow run deploy.yaml --ref <nhánh>` (xem `HUONG-DAN-KIEM-THU.md`).
+- **Render theo đỉnh nhánh trỏ tới ảnh chưa ai đẩy.** Deploy lấy **đúng commit đã build**;
+  đợi tag ảnh thật xuất hiện trong registry trước khi deploy.
 
-## Xác minh đã xong
+## Nếu tài nguyên còn nhưng "không rõ trạng thái"
 
-```bash
-python3 idpctl --env-config platform.env.yaml onboard-status --app <app>   # READY
-kubectl -n <app>-staging get pods,cluster.postgresql.cnpg.io
-kubectl -n fleet-local get gitrepo | grep <app>
-```
-
-Đếm để chắc không có bản sao: đúng **1** kho app, **1** kho cấu hình, **1** namespace mỗi
-môi trường, **1** GitRepo mỗi môi trường, **1** ConfigMap state.
-
-## Nếu vẫn hỏng
-
-Bản ghi state mất (ConfigMap bị xoá) nhưng tài nguyên còn: mọi tài nguyên onboarding tạo
-ra đều mang nhãn, nên vẫn tìm lại được:
+Không còn bản ghi state ngoài tiến trình để mất. Mọi tài nguyên platform tạo đều mang nhãn,
+nên luôn tìm lại được bằng nhãn rồi chạy lại luồng deploy — idempotent sẽ nhận ra cái đã có:
 
 ```bash
 kubectl get all,gitrepo -A -l idp.platform/application=<app>
 ```
-
-Dựng lại bản ghi bằng cách chạy lại `onboard` — các bước kiểm-trước-khi-tạo sẽ nhận ra
-những gì đã tồn tại và chỉ ghi lại state.

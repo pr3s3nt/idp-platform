@@ -23,77 +23,49 @@
 
 ---
 
-## Đường ngắn nhất: một request, một lệnh (Phase 6)
+## Đường ngắn nhất: stack-new → push → deploy
 
-Mọi thứ dưới đây — Phần A, Phần B, Phần C — gộp thành **một máy trạng thái chạy lại được**.
-Viết một file request (mục 13.1 của `KE-HOACH-TRIEN-KHAI-SECRET-VA-APP-ONBOARDING.md`):
+> **Máy trạng thái onboarding một-lệnh đã bị GỠ** (`c5d28ac`: không còn `idpctl onboard*`,
+> `OnboardingRequest`, ConfigMap `idp-onboarding-<app>`). Đưa app lên nay là ba nhịp; các
+> Phần A/B/C bên dưới mô tả chi tiết từng nhịp.
 
-```yaml
-apiVersion: idp.company/v1
-kind: OnboardingRequest
-
-application:
-  name: don-hang
-  owner: team-order
-  description: Quản lý đơn hàng
-
-stack:
-  id: node-fullstack
-  version: 1.0.0
-
-database:
-  enabled: true
-  profile: application
-
-routing:
-  visibility: internal
-
-environments:
-  staging: true
-  prod: true
-```
-
-Không hỏi namespace, đường dẫn Vault, tên Secret, StorageClass, địa chỉ registry hay
-resource database thô — **platform suy ra hết**. Rồi:
+**1. Dựng khung app từ stack, tạo kho, cấp token:**
 
 ```bash
-export VAULT_ADDR=... VAULT_TOKEN=...          # nửa Vault: token RIÊNG, không suy ra từ gh
-export REGISTRY_USER=... REGISTRY_PASS=...     # để tạo imagePullSecret
-python3 idpctl --env-config platform.env.yaml onboard \
-  --request request-don-hang.yaml --work /tmp/onboard-don-hang
+python3 idpctl --env-config platform.env.yaml stack-new \
+  --stack node-fullstack --app demo --owner team-demo --out ../idp-demo
+cd ../idp-demo && git init -b main && git add -A && git commit -m "scaffold demo"
+gh repo create <org>/idp-demo --private --source=. --push
+gh secret set PLATFORM_DISPATCH_TOKEN -R <org>/idp-demo    # để CI app dispatch sang platform
 ```
 
-Nó chạy tuần tự: kiểm request → tạo kho ứng dụng từ stack (kèm `.github/workflows/ci.yaml`
-đã điền sẵn) → tạo kho cấu hình + hai nhánh + Fleet skeleton → namespace, ServiceAccount,
-VaultAuth, policy/role Vault → sinh credential database ghi thẳng vào Vault → build và đẩy
-ảnh → render staging, ghi vào kho cấu hình, đăng ký GitRepo → chờ cụm chạy thật.
+Chọn stack = khai ý định (vd `node-fullstack` gói sẵn PostgreSQL, tương đương
+`database.enabled: true` của request cũ). Namespace, đường Vault, StorageClass — platform
+vẫn suy ra hết.
 
-**Chạy lại bao nhiêu lần cũng được.** Bước đã xong thì bỏ qua; không có kho, namespace hay
-mật khẩu database thứ hai nào được tạo ra.
-
-Hai lần dừng là bình thường, không phải lỗi:
-
-| Trạng thái | Nghĩa | Làm gì |
-|---|---|---|
-| `WAITING_FOR_USER_SECRETS` | app đã deploy, còn thiếu bí mật của bên thứ ba | chạy đúng lệnh `secret-set` nó in ra, rồi chạy lại `onboard` |
-| `PENDING_PROD_APPROVAL` | pull request prod đã mở | người duyệt merge, rồi chạy lại `onboard-activate-prod` |
-
-Production là một **lệnh riêng**, không phải bước tiếp theo:
+**2. Viết code + nạp secret, rồi push:**
 
 ```bash
-python3 idpctl --env-config platform.env.yaml onboard-activate-prod \
-  --app don-hang --work /tmp/onboard-don-hang
+python3 idpctl --env-config platform.env.yaml secret-set \
+  --app demo --env staging --name demo-credentials --key token --stdin --replace   # nếu app cần
+git push origin HEAD:dev          # CI của app build+push ảnh, rồi dispatch sang platform
 ```
 
-Nó dựng tài nguyên prod, render prod bằng **đúng bộ ảnh staging đã được verify**, và luôn
-mở pull request — kể cả khi nhánh prod chưa bật bảo vệ. Bí mật **không** được sao chép từ
-staging sang prod: prod sẽ dừng ở `WAITING_FOR_USER_SECRETS` cho tới khi có người nạp.
+**3. Deploy** chạy trên `deploy.yaml`: tự tạo kho cấu hình (`tools/tao-app-moi.sh`,
+idempotent), render, commit, đăng ký GitRepo, Fleet kéo về. Để CI app tự dispatch, hoặc
+trigger tay:
 
-Xem đang ở đâu: `idpctl onboard-status --app don-hang` (thêm `--json` để xem bản
-ghi đầy đủ). Trạng thái sống trong ConfigMap `idp-onboarding-<app>`.
+```bash
+gh workflow run deploy.yaml --ref main \
+  -f app=demo -f repo=<org>/idp-demo -f sha=<sha-CI-vừa-build> -f env=staging
+```
 
-Phần còn lại của tài liệu này mô tả **từng việc onboarding làm thay bạn** — đọc khi cần
-hiểu, khi phải làm tay, hoặc khi một bước hỏng.
+Prod là một lần deploy **`env=prod`** riêng (nhánh config prod, qua PR duyệt) — xem Phần C2.
+Bí mật **không** tự chảy staging→prod: nạp `secret-set --env prod` riêng. Deploy idempotent
+nên chạy lại an toàn; không còn "trạng thái onboarding" để tra — đọc tài nguyên thật bằng
+`kubectl ... -l idp.platform/application=demo`.
+
+Phần còn lại của tài liệu mô tả **từng bước chi tiết** — đọc khi cần hiểu, làm tay, hoặc gỡ lỗi.
 
 ---
 
@@ -255,7 +227,7 @@ Một dòng, là ref của repo platform mà app render theo.
 
 ### A4. `.github/workflows/ci.yaml`
 
-> `onboard` **sinh sẵn file này** (chọn đúng mẫu theo số workload, điền cả 4 dòng `env`).
+> `stack-new` **sinh sẵn file này** (chọn đúng mẫu theo số workload, điền cả 4 dòng `env`).
 > Phần dưới chỉ cần đọc khi bạn tự dựng repo bằng tay.
 
 Mẫu nằm ngay trong repo platform, thư mục `templates/`. **Chọn đúng mẫu theo số service

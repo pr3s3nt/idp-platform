@@ -17,8 +17,12 @@ python3 idpctl --env-config platform.env.yaml \
   preflight --require-cluster --require-vault
 ```
 
-Bốn biến môi trường mà onboarding cần. **Thiếu chúng thì hỏng ở nơi không nhắc tới chúng**,
-nên đặt trước:
+> **Cập nhật sau khi gỡ onboarding (`c5d28ac`):** không còn lệnh `idpctl onboard*` và file
+> `OnboardingRequest`. Đưa app lên nay là **`stack-new` → push → CI build → `deploy.yaml`**.
+> Guide này đã sửa theo luồng đó.
+
+Bốn biến môi trường mà luồng đưa app lên cần. **Thiếu chúng thì hỏng ở nơi không nhắc tới
+chúng**, nên đặt trước:
 
 | Biến | Dùng để | Thiếu thì |
 |---|---|---|
@@ -38,52 +42,39 @@ export REGISTRY_PASS="$GH_TOKEN"
 
 ---
 
-## 1. Viết file yêu cầu
+## 1. Chọn stack
 
-Bạn khai **ý định**, không khai toạ độ. Không có namespace, không có đường dẫn Vault, không
-có StorageClass, không có tài nguyên database thô — nền tảng suy ra hết từ
-`platform.env.yaml`.
+Bạn khai **ý định** qua việc chọn stack, không khai toạ độ. Không có namespace, không có đường
+dẫn Vault, không có StorageClass, không có tài nguyên database thô — nền tảng suy ra hết từ
+`platform.env.yaml`. Xem stack có gì:
 
-`sinhvien.request.yaml`:
-
-```yaml
-apiVersion: idp.company/v1
-kind: OnboardingRequest
-application:
-  name: sinhvien                 # quyết định tên kho, namespace <app>-<env>, tiền tố Vault
-  owner: team-daotao
-  description: Quản lý sinh viên — thêm, sửa, xoá
-stack:
-  id: node-fullstack             # frontend + backend + thư viện dùng chung
-  version: 1.0.0
-database:
-  enabled: true
-  profile: application           # CloudNativePG, profile theo môi trường
-routing:
-  visibility: internal
-environments:
-  staging: true
-  prod: true                     # CHUẨN BỊ contract cho prod, KHÔNG dựng gì ở prod ngay
+```bash
+python3 idpctl --env-config platform.env.yaml stack-list
 ```
 
-`prod: true` **không** tạo tài nguyên production. Nó chỉ nói "app này sẽ có prod"; việc dựng
-xảy ra khi bạn chạy `onboard-activate-prod`, và nó đi qua pull request có người duyệt.
+Cho `sinhvien` (CRUD + một secret + database), chọn **`node-fullstack`** — stack này gói sẵn
+frontend + backend + **PostgreSQL** (capability database), tương đương `database.enabled: true`
+của file request cũ. Tên app + owner truyền vào `stack-new` (mục 2). Prod **không** dựng gì tới
+khi bạn deploy `env=prod` (mục 8) — đi qua pull request có người duyệt.
 
 ---
 
-## 2. Dựng khung và dừng lại để sửa code
+## 2. Dựng khung, tạo kho, rồi dừng lại để sửa code
 
 ```bash
-python3 idpctl --env-config platform.env.yaml onboard \
-  --request sinhvien.request.yaml --work ./onboard-sinhvien \
-  --images ci --stop-after bootstrap-platform
+python3 idpctl --env-config platform.env.yaml stack-new \
+  --stack node-fullstack --app sinhvien --owner team-daotao --out ./sinhvien
+cd ./sinhvien && git init -b main && git add -A && git commit -m "scaffold sinhvien"
+gh repo create pr3s3nt/sinhvien --private --source=. --push
+gh secret set PLATFORM_DISPATCH_TOKEN --repo pr3s3nt/sinhvien   # để CI app dispatch sang platform
 ```
 
-Xong bước này bạn có: kho ứng dụng `pr3s3nt/sinhvien`, kho cấu hình
-`pr3s3nt/idp-sinhvien-config`, workflow CI, và secret `PLATFORM_DISPATCH_TOKEN` đã đặt.
+Xong bước này bạn có: kho ứng dụng `pr3s3nt/sinhvien` (score.yaml FE+API+PostgreSQL,
+`.idp/stack.yaml`, `.score-values/values.yaml`, `ci.yaml`) và secret `PLATFORM_DISPATCH_TOKEN`.
 
-`--images ci` nghĩa là **CI của kho ứng dụng build ảnh**, orchestrator chỉ chờ và dùng. Đây
-là đường đúng cho app thật (`--images local` chỉ hợp khi thử nhanh trên máy).
+> Kho cấu hình `pr3s3nt/idp-sinhvien-config` **không cần tạo tay** — lần deploy đầu, `deploy.yaml`
+> chạy `tools/tao-app-moi.sh` (idempotent) tự tạo nó. Bot thiếu quyền tạo repo thì chạy tay:
+> `ORG=pr3s3nt APP=sinhvien PLATFORM_REPO=pr3s3nt/idp-platform ./tools/tao-app-moi.sh`.
 
 ---
 
@@ -159,14 +150,14 @@ python3 idpctl --env-config platform.env.yaml secret-set \
   user khác trên máy. Giá trị chỉ vào qua stdin hoặc nhập ẩn.
 - Mật khẩu do platform sở hữu thì dùng `--generate` — giá trị không bao giờ được in ra.
 - **Bí mật không tự chảy từ staging sang prod.** Prod cần một lần `secret-set --env prod`
-  riêng, và nó sẽ dừng ở `WAITING_FOR_USER_SECRETS` cho tới khi có.
+  riêng; thiếu thì `VaultStaticSecret` của prod ở `SecretSynced=False` và pod chờ Secret.
 
 ---
 
 ## 5. Đẩy code, để CI build ảnh
 
 ```bash
-cd onboard-sinhvien/app
+cd ./sinhvien
 git add -A && git commit -m "feat: CRUD sinh viên"
 git push origin HEAD:dev
 gh run watch -R pr3s3nt/sinhvien
@@ -175,28 +166,31 @@ gh run watch -R pr3s3nt/sinhvien
 CI **hỏi** platform tên ảnh và cách build (`image-plan --with-build`) chứ không tự đoán —
 nếu hai bên tính khác nhau thì Fleet apply một ảnh chưa ai đẩy lên.
 
-> **Trước khi merge nhánh platform vào `main`:** mẫu CI checkout platform ở `ref: main`. Một
-> app onboard từ nhánh phát triển sẽ nhận workflow gọi lệnh mà `main` chưa có → CI đỏ với
-> `unrecognized arguments`. Bộ sinh cảnh báo cả hai trường hợp ngay lúc tạo file. **Thứ tự
-> đúng: merge trước, onboard sau.**
+> **Trước khi merge nhánh platform vào `main`:** mẫu CI checkout platform ở `ref: main`, và
+> `repository_dispatch` cũng luôn chạy platform từ `main`. App dùng capability platform chưa có
+> trên `main` sẽ nhận workflow gọi lệnh mà `main` chưa có → CI đỏ với `unrecognized arguments`.
+> **Thứ tự đúng: merge platform trước, để CI app dispatch sau.** Muốn thử code platform nhánh
+> chưa merge thì `gh workflow run deploy.yaml --ref <nhánh>` (xem `HUONG-DAN-KIEM-THU.md`).
 
 ---
 
 ## 6. Deploy staging
 
+Ảnh đã có trên registry (mục 5) rồi thì deploy đi một trong hai đường, cả hai chạy `deploy.yaml`:
+
 ```bash
-python3 idpctl --env-config platform.env.yaml onboard \
-  --request sinhvien.request.yaml --work ./onboard-sinhvien --images ci
+# A. Tự động: job dispatch của CI app đã bắn repository_dispatch (deploy-request) -> deploy chạy.
+# B. Chủ động (AI tự lái / code platform chưa merge): trigger tay với SHA CI vừa build.
+gh workflow run deploy.yaml --ref main \
+  -f app=sinhvien -f repo=pr3s3nt/sinhvien -f sha=<SHA-CI-vừa-build> -f env=staging
 ```
 
-Chạy lại đúng lệnh cũ là **an toàn**: mỗi bước kiểm-trước-khi-tạo, bước đã xong bị bỏ qua,
-không tạo bản sao thứ hai. Nếu thiếu bí mật, nó dừng ở `WAITING_FOR_USER_SECRETS` kèm đúng
-lệnh phải chạy — đó là **trạng thái**, không phải lỗi.
-
-Theo dõi:
+Deploy là idempotent (`render` giữ state, `ensure-gitrepo` không ghi đè, commit coi
+`AlreadyExists` là xong), nên chạy lại an toàn. Theo dõi bằng tài nguyên thật (không còn
+`onboard-status`):
 
 ```bash
-python3 idpctl --env-config platform.env.yaml onboard-status --app sinhvien
+gh run watch "$(gh run list -R pr3s3nt/idp-platform --workflow deploy.yaml --limit 1 --json databaseId --jq '.[0].databaseId')" -R pr3s3nt/idp-platform
 kubectl -n sinhvien-staging get pods,vaultstaticsecret,cluster.postgresql.cnpg.io
 kubectl -n fleet-local get gitrepo | grep sinhvien      # phải 1/1
 ```
@@ -225,8 +219,9 @@ curl -s -X POST -H "$H" -H 'X-API-Key: <khoá>' -H 'Content-Type: application/js
 Ba thứ đáng kiểm mà người ta hay quên:
 
 ```bash
-# 1. Bí mật KHÔNG nằm trong manifest đã commit
-grep -r "<giá trị bí mật>" onboard-sinhvien/config-staging/    # phải rỗng
+# 1. Bí mật KHÔNG nằm trong manifest đã commit (clone kho config rồi kiểm cả lịch sử)
+gh repo clone pr3s3nt/idp-sinhvien-config /tmp/sinhvien-config-check -- --quiet
+git -C /tmp/sinhvien-config-check log --all -p | grep -c "<giá trị bí mật>"    # phải 0
 
 # 2. Biến bí mật là secretKeyRef, không phải value
 kubectl -n sinhvien-staging get deploy backend -o json \
@@ -244,14 +239,14 @@ kubectl -n sinhvien-staging get cluster.postgresql.cnpg.io \
 ```bash
 python3 idpctl --env-config platform.env.yaml secret-set \
   --app sinhvien --env prod --name api-credentials --key api_key --stdin --replace
-python3 idpctl --env-config platform.env.yaml \
-  onboard-activate-prod --app sinhvien
+gh workflow run deploy.yaml --ref main \
+  -f app=sinhvien -f repo=pr3s3nt/sinhvien -f sha=<sha-đã-verify-ở-staging> -f env=prod
 ```
 
-Nó **mở pull request** vào nhánh prod của kho cấu hình và dừng ở `PENDING_PROD_APPROVAL`.
-Nền tảng không tự merge. Sau khi người duyệt merge, chạy lại lệnh trên để deploy và verify.
-
-Prod dùng **đúng ảnh đã verify ở staging** — không build lại, không tag khác.
+Deploy `env=prod` ghi vào nhánh prod của kho cấu hình và **mở pull request**; nền tảng không
+tự merge (branch protection do GitHub thực thi). Sau khi người duyệt merge, Fleet áp lên prod.
+Cách khác: workflow `promote` (`repository_dispatch` type `promote-request`) copy đúng bộ ảnh
+staging. Dù đường nào, prod dùng **đúng ảnh đã verify ở staging** — không build lại, không tag khác.
 
 ---
 
@@ -263,7 +258,7 @@ Prod dùng **đúng ảnh đã verify ở staging** — không build lại, khô
 | Xoay vòng mật khẩu database | `rotate-db-credential --app sinhvien --env staging` — **đừng** chỉ ghi vào Vault |
 | Kiểm sức khoẻ | `./tools/kiem-suc-khoe.sh --namespace sinhvien-staging` |
 | Sự cố | `docs/runbook/` |
-| Xoá app | `offboard --app sinhvien --env staging` (mặc định chỉ xem trước) |
+| Xoá app | dọn tay theo `docs/runbook/xoa-app-va-giu-du-lieu.md` (không còn lệnh `offboard`) |
 
 **Vì sao xoay vòng mật khẩu database phải dùng lệnh riêng:** ghi mật khẩu mới vào Vault chỉ
 làm VSO cập nhật Secret. CNPG chỉ đọc lại `passwordSecret` khi đối tượng Cluster được

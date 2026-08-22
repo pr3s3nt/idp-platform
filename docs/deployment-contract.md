@@ -61,8 +61,9 @@ chạy `main` làm bằng chứng cho nhánh phát triển.
 
 ### 2.1. Idempotent
 
-Gửi lại đúng một payload không tạo bản sao thứ hai. Mọi bước kiểm-trước-khi-tạo. Với
-onboarding, các bước đã `done` bị bỏ qua và chỉ bước lỗi chạy lại.
+Gửi lại đúng một payload không tạo bản sao thứ hai. Mọi bước kiểm-trước-khi-tạo: `render`
+giữ state ra kết quả y hệt, `ensure-gitrepo` không bao giờ ghi đè, commit/`apply-secrets`
+coi `AlreadyExists` là thành công. Nên deploy lại một app đang chạy là an toàn.
 
 ### 2.2. Không bao giờ deploy lùi
 
@@ -92,23 +93,32 @@ policy ghi — không phải bằng token của CI. CI không cầm Vault token.
 
 ### 2.5. Prod đi qua người duyệt
 
-`onboard-activate-prod` mở pull request và dừng ở `PENDING_PROD_APPROVAL`. Nền tảng không
-tự merge. Branch protection trên nhánh prod là thứ **GitHub** thực thi — một cờ trong file
-cấu hình không thay thế được nó.
+Prod là một lần **deploy `env=prod`** vào nhánh config prod, hoặc workflow **`promote`**
+(`repository_dispatch` type `promote-request`, copy đúng bộ ảnh staging). Cả hai mở pull
+request và dừng chờ; nền tảng **không tự merge**. Branch protection trên nhánh prod là thứ
+**GitHub** thực thi — một cờ trong file cấu hình không thay thế được nó.
+
+> Máy trạng thái onboarding (`onboard-activate-prod` + trạng thái `PENDING_PROD_APPROVAL`)
+> đã bị gỡ ở commit `c5d28ac`. "Chờ duyệt prod" giờ là **PR đang mở**, đọc bằng
+> `gh pr list` trên kho config prod, không phải một trạng thái trong ConfigMap.
 
 ### 2.6. Trạng thái đọc được từ ngoài
 
-```bash
-python3 idpctl --env-config platform.env.yaml onboard-status --app <app>
-```
+Không còn ConfigMap `idp-onboarding-<app>` hay lệnh `onboard-status`. Portal đọc trạng thái
+từ hai nguồn sự thật thật:
 
-Bản ghi nằm trong ConfigMap `idp-onboarding-<app>` ở namespace `kubernetes.state_namespace`
-— cố ý **không** phải Secret: nó không chứa giá trị bí mật, chỉ tên đường dẫn, tên kho,
-tên ảnh và trạng thái.
+- **Lịch sử/kết quả deploy** — audit store (fail-open). `idpctl audit-report` cho KPI vận
+  hành; timeline từng lần deploy nằm trong audit DB (xem `audit.database_url_env`).
+- **Trạng thái sống trên cụm** — tài nguyên platform tạo đều mang nhãn
+  `idp.platform/application`:
 
-Máy trạng thái: mục 13.2 của kế hoạch. Nhánh `WAITING_FOR_USER_SECRETS`,
-`PENDING_PROD_APPROVAL` là **trạng thái chờ người**, không phải lỗi — portal phải hiển thị
-chúng như việc-cần-làm, không như sự cố.
+  ```bash
+  kubectl get all,gitrepo,vaultstaticsecret -A -l idp.platform/application=<app>
+  ```
+
+"Chờ người" giờ hiện diện dưới dạng tài nguyên thật, không phải một enum trạng thái: secret
+thiếu = `VaultStaticSecret` `SecretSynced=False`; chờ duyệt prod = PR đang mở. Portal nên
+hiển thị chúng như việc-cần-làm, không như sự cố.
 
 ---
 
@@ -117,8 +127,9 @@ chúng như việc-cần-làm, không như sự cố.
 - **Không hứa rollback dữ liệu.** Rollback ảnh không rollback schema.
 - **Không hứa đổi `class` database là an toàn.** Xem
   [`chuyen-doi-postgres-sang-class-application.md`](chuyen-doi-postgres-sang-class-application.md).
-- **Không hứa xoá app là hoàn tác được.** `offboard` giữ backup, kho Git và (mặc định) bí
-  mật ở dạng xoá mềm — nhưng namespace thì đi thật.
+- **Không hứa xoá app là hoàn tác được.** Quy trình dọn tay (không còn lệnh `offboard`) giữ
+  backup, kho Git và bí mật ở dạng xoá mềm — nhưng namespace thì đi thật. Xem
+  [`runbook/xoa-app-va-giu-du-lieu.md`](runbook/xoa-app-va-giu-du-lieu.md).
 - **Không hứa app tự hồi phục sau khi xoay vòng credential database.** Dùng
   `rotate-db-credential`; nó làm đúng thứ tự và chờ từng bước.
 
@@ -190,5 +201,6 @@ Mọi thứ dựng lên để đo phải được dọn và **ghi lại đã d�
 ## 5. Liên quan
 
 - `HUONG-DAN-KIEM-THU.md` — harness test và môi trường verify.
-- `docs/adr/0010-may-trang-thai-onboarding.md` — vì sao onboarding là máy trạng thái.
+- `docs/adr/0010-may-trang-thai-onboarding.md` — **đã Superseded**: máy trạng thái onboarding
+  bị gỡ ở commit `c5d28ac`; đưa app lên nay là luồng deploy chuẩn (xem `HUONG-DAN-TRIEN-KHAI-APP-CHUAN.md`).
 - `docs/canh-bao.md`, `docs/runbook/` — vận hành sau khi đã chạy.

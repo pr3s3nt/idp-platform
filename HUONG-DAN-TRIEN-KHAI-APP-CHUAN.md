@@ -1,4 +1,10 @@
-# Triển khai một app từ onboarding tới staging — đường chuẩn
+# Triển khai một app từ khung stack tới staging — đường chuẩn
+
+> **Cập nhật sau khi gỡ onboarding (`c5d28ac`).** Không còn lệnh `idpctl onboard*` và không
+> còn file `OnboardingRequest`. Đưa app mới lên nay là: **`stack-new`** (dựng khung app từ
+> stack) → viết code + secret → **push** → CI build ảnh → **`deploy.yaml`** render+commit
+> config (tự tạo kho config qua `tao-app-moi.sh`) → Fleet. Guide này đã sửa theo luồng đó;
+> phần lớn hướng dẫn về PUBLIC_HOST/secret/verify vẫn nguyên vì không phụ thuộc onboarding.
 
 Viết lại sau một lần chạy thật (app `dangky`, 2026-08-11) trong đó người chạy đã đi vòng ở
 bước cuối và phải làm lại. Tài liệu này là đường thẳng, cộng với những chỗ dễ đi vòng và lý
@@ -108,11 +114,12 @@ dùng chung một bản renderer. Hệ quả: tính năng chưa ở `main` thì 
 gọi lệnh `main` chưa có.
 
 ```bash
-git show main:idpctl | grep -c "with-build"
-git show main:platform.env.yaml | grep stack_onboarding
+# Kiểm capability platform mà app cần đã có trên main chưa (đổi chuỗi theo feature bạn dùng).
+git show main:engine/cli.py | grep -c "vault-auto-setup"
+git show main:platform.env.yaml | grep -E "features:|vault_secrets|postgres_application"
 ```
 
-Có cả hai → bỏ qua mục này. Không → làm hai việc:
+Đã có trên `main` → bỏ qua mục này. Chưa → làm hai việc:
 
 **2.1.** Đẩy một nhánh platform mô phỏng sau-merge (bật cờ trong `platform.env.yaml`), rồi
 **quay lại nhánh làm việc**. Mục 4 sẽ ghim `ci.yaml` của kho app vào nhánh này.
@@ -134,31 +141,24 @@ code của `main`. Không tắt thì **mỗi lần push đều để lại một
 
 ---
 
-## 3. File yêu cầu — khai ý định, không khai toạ độ
+## 3. Chọn stack — khung quyết định ý định, không khai toạ độ
 
-```yaml
-apiVersion: idp.company/v1
-kind: OnboardingRequest
-application:
-  name: dangky
-  owner: team-dangky
-  description: ...
-stack:
-  id: node-fullstack          # 1 backend + 1 frontend + thư viện dùng chung
-  version: 1.0.0
-database:
-  enabled: true
-  profile: application        # CloudNativePG quản
-routing:
-  visibility: internal
-environments:
-  staging: true
-  prod: true                  # CHUẨN BỊ contract, KHÔNG dựng gì ở prod
+Không còn file `OnboardingRequest`. Ý định (loại app, có database không) chọn qua **stack**;
+toạ độ (namespace, đường Vault, StorageClass) platform vẫn suy ra hết. Xem stack có gì:
+
+```bash
+python3 idpctl --env-config "$CFG" stack-list
 ```
 
-Không namespace, không đường dẫn Vault, không StorageClass — platform suy ra hết.
+| Quyết định cũ (trong request) | Nay khai ở đâu |
+|---|---|
+| `stack.id` | tham số `--stack` của `stack-new` |
+| `application.owner` | tham số `--owner` của `stack-new` (ghi vào `.idp/stack.yaml`) |
+| `database.enabled` | **chọn stack có capability database** (vd `node-fullstack` = FE+API+**PostgreSQL**) |
+| `routing.visibility`, `PUBLIC_HOST` | `.score-values/values.yaml` của app (mục 3.1 + 5.1) |
+| `environments.prod` | không dựng gì ở prod tới khi deploy `env=prod` (mục 10) |
 
-Kiểm-trước-khi-tạo, cả ba chỗ:
+Kiểm-trước-khi-tạo, cả ba chỗ (kho app do bạn tạo; kho config do `deploy.yaml`/`tao-app-moi.sh` tạo):
 
 ```bash
 kubectl get ns | grep -w "$APP-staging"
@@ -209,21 +209,30 @@ Prod giữ nguyên hình dạng công ty là **cố ý**: prod không cần mở
 
 ---
 
-## 4. Sinh khung, rồi DỪNG để viết code
+## 4. Dựng khung app, tạo kho, rồi DỪNG để viết code
+
+`stack-new` dựng khung kho ứng dụng từ stack (không ghi đè file có sẵn; `--force` để ép):
 
 ```bash
-python3 idpctl --env-config "$CFG" onboard \
-  --request /tmp/$APP.request.yaml --work /tmp/onboard-$APP \
-  --images ci --stop-after bootstrap-platform
+python3 idpctl --env-config "$CFG" stack-new \
+  --stack node-fullstack --app $APP --owner team-$APP --out /tmp/$APP
 ```
 
-`--images ci` = CI của kho app build ảnh, orchestrator chỉ chờ rồi dùng.
+Sinh ra score.yaml (FE+API+PostgreSQL), `.idp/stack.yaml`, `.score-values/values.yaml`,
+`ci.yaml`. Đẩy lên GitHub và cấp token để CI của app gọi được `deploy.yaml`:
 
-Xong phải thấy `[OK] validate`, `[OK] scaffold-repository`, `[OK] bootstrap-platform`, hai
-kho GitHub, và secret `PLATFORM_DISPATCH_TOKEN` trên kho app.
+```bash
+cd /tmp/$APP && git init -b main && git add -A && git commit -m "scaffold $APP từ node-fullstack"
+gh repo create <org>/$APP --private --source=. --push
+gh secret set PLATFORM_DISPATCH_TOKEN --repo <org>/$APP    # token có quyền dispatch sang platform
+```
+
+> Kho **config** (`idp-$APP-config`) KHÔNG cần tạo tay — lần deploy đầu, `deploy.yaml` chạy
+> `tools/tao-app-moi.sh` (idempotent) tự tạo nó kèm hai nhánh + `fleet.yaml`. Nếu bot thiếu
+> quyền tạo repo trong tổ chức, chạy tay: `ORG=<org> APP=$APP PLATFORM_REPO=<org>/idp-platform ./tools/tao-app-moi.sh`.
 
 Nếu ở TRƯỚC MERGE, ghim `ci.yaml` **của kho app** vào nhánh tạm — **không sửa `templates/`
-của kho platform**:
+của kho platform** (template CI checkout platform ở `ref: main`):
 
 ```bash
 sed -i "s|^\(\s*\)ref: main$|\1ref: $PIN_BRANCH|" .github/workflows/ci.yaml
@@ -337,34 +346,35 @@ git diff --cached | grep -c "<giá-trị-bí-mật>"     # phải là 0
 
 ## 7. Deploy
 
+Ảnh đã có trên registry (mục 6) rồi thì deploy đi theo một trong hai đường — cả hai chạy
+**cùng `deploy.yaml`** trên runner platform, render+commit config, Fleet kéo về:
+
 ```bash
-python3 idpctl --env-config "$CFG" onboard \
-  --request /tmp/$APP.request.yaml --work /tmp/onboard-$APP --images ci
+# A. Tự động: job `dispatch` của CI app đã bắn repository_dispatch (deploy-request) -> deploy chạy.
+#    repository_dispatch LUÔN chạy platform từ main.
+
+# B. Chủ động (AI tự lái / code platform chưa merge): trigger tay với SHA CI vừa build.
+gh workflow run deploy.yaml --ref main \
+  -f app=$APP -f repo=<org>/$APP -f sha=<SHA-CI-vừa-build> -f env=staging
+gh run watch "$(gh run list -R <org>/idp-platform --workflow deploy.yaml --limit 1 --json databaseId --jq '.[0].databaseId')" -R <org>/idp-platform
 ```
 
-Chạy lại đúng lệnh cũ **luôn an toàn**: mỗi bước kiểm-trước-khi-tạo, bước xong bị bỏ qua.
-
-Trong log phải có, và đây là bằng chứng ảnh tới từ CI:
-
-```text
-tag_strategy=commit (from .idp/stack.yaml)
-mọi ảnh đã có trên registry -> không build lại
-```
-
-Thấy `docker build` = `--images ci` không có hiệu lực.
+Bước `Render` của deploy phải log ảnh **đúng SHA đã build** (chống §6.14: hai bên tự tính tên
+ảnh rồi lệch). Truyền `-f sha=` đúng commit CI đã build — KHÔNG dùng đỉnh nhánh, vì render theo
+đỉnh nhánh sẽ trỏ tới một ảnh chưa ai đẩy lên.
 
 ### 7.1. Sửa code sau khi đã deploy một lần
 
-`build-images` đã ghi commit cũ vào state, và `deploy-staging` **cố ý** render đúng commit đã
-build (render theo đỉnh nhánh sẽ trỏ tới ảnh chưa ai đẩy). Phải ép lại:
+Không còn state bước hay `--force-step`. Sửa code → **push commit mới** → CI build ảnh mới →
+deploy lại. Nếu để CI tự dispatch thì xong; nếu trigger tay, chạy lại đường B với **SHA mới**:
 
 ```bash
---force-step build-images --force-step deploy-staging --force-step verify-staging
+git commit -am "..." && git push origin HEAD:dev     # CI build ảnh cho SHA mới
+gh workflow run deploy.yaml --ref main -f app=$APP -f repo=<org>/$APP -f sha=<SHA-mới> -f env=staging
 ```
 
-> **Ép một bước là không đủ.** Ép mỗi `build-images` thì orchestrator chạy xong bước đó rồi
-> dừng, vì các bước sau vẫn `done`. Triệu chứng: lệnh `EXIT=0`, log trông sạch, mà cụm không
-> đổi gì. Liệt kê hết các bước cần chạy lại.
+Vì render lấy đúng SHA truyền vào (`guard_ordering` chặn deploy commit cũ đè commit mới hơn),
+không có bẫy "cụm không đổi" như máy trạng thái cũ — miễn là truyền đúng SHA của ảnh đã build.
 
 ---
 
@@ -372,7 +382,7 @@ build (render theo đỉnh nhánh sẽ trỏ tới ảnh chưa ai đẩy). Phả
 
 ```bash
 export NS=$APP-staging
-python3 idpctl --env-config "$CFG" onboard-status --app $APP
+kubectl -n $NS rollout status deploy --timeout=120s   # rollout thật, không nhìn availableReplicas
 kubectl -n $NS get pods
 kubectl -n $NS get vaultstaticsecret -o custom-columns=NAME:.metadata.name,SYNCED:.status.conditions[0].status
 kubectl -n $NS get cluster.postgresql.cnpg.io -o jsonpath='{.items[*].status.firstRecoverabilityPoint}{"\n"}'
@@ -400,7 +410,8 @@ curl -s -w " %{http_code}\n" -X POST -H 'X-API-Key: ...' -H 'Content-Type: appli
 Và bí mật không được nằm trong git — kiểm cả **lịch sử**, không chỉ cây làm việc:
 
 ```bash
-git -C /tmp/onboard-$APP/config-staging log --all -p | grep -c "<giá-trị>"   # 0
+gh repo clone <org>/idp-$APP-config /tmp/$APP-config-check -- --quiet
+git -C /tmp/$APP-config-check log --all -p | grep -c "<giá-trị>"   # 0
 ```
 
 Cuối cùng, kiểm không có tài nguyên thủ công (script ở đầu tài liệu này), và **bật lại
@@ -424,9 +435,9 @@ workflow deploy** nếu đã tắt ở mục 2.2.
 | B10 | Fleet `Modified` vĩnh viễn | quantity ghi bằng SỐ, Kubernetes lưu CHUỖI | nháy kép mọi quantity |
 | B11 | `render` dừng: "đổi class … KHÔNG di chuyển dữ liệu" | đang đổi `class` postgres trên database đã có dữ liệu | `docs/chuyen-doi-postgres-sang-class-application.md` |
 | B12 | Mọi `/api/...` trả HTML của frontend | router mount tại `/` thay vì `/api` | route chuyển tiếp nguyên đường dẫn |
-| B13 | Sửa code, chạy lại `onboard`, lỗi cũ quay lại | `build-images` đã ghi commit cũ vào state | `--force-step` cho **cả chuỗi** (mục 7.1) |
+| B13 | Sửa code, deploy lại, vẫn ảnh cũ | truyền SHA cũ (hoặc đỉnh nhánh) vào deploy | push commit mới, đợi ảnh, deploy với **SHA mới** (mục 7.1) |
 | **B14** | Không mở được app bằng trình duyệt | không có DNS cho `*.staging.internal.dev` trên harness | **sửa `PUBLIC_HOST` (mục 3.1)** — đừng `kubectl apply` HTTPRoute tay |
-| **B15** | `--force-step X`, `EXIT=0`, cụm không đổi | các bước sau X vẫn `done` nên bị bỏ qua | liệt kê hết các bước cần chạy lại |
+| **B15** | `gh workflow run` xanh nhưng cụm không đổi | trigger nhầm kho/nhánh, hoặc SHA chưa có ảnh | dùng đúng `-f repo=`/`--ref`, đợi tag ảnh xuất hiện trong registry trước khi deploy |
 | **B16** | Run `repository_dispatch` đỏ trên kho platform | orchestrator bật lại quá sớm, chạy bằng code `main` | bật lại **sau** khi push code app xong hẳn |
 
 **Không bao giờ làm:** sửa `templates/` của kho platform để CI chạy được; `kubectl apply` một
@@ -439,7 +450,7 @@ mật vào git hoặc vào log.
 
 | Việc | Lệnh |
 |---|---|
-| Kích hoạt prod | nạp secret `--env prod`, rồi `onboard-activate-prod --app $APP` → PR, chờ duyệt |
+| Kích hoạt prod | nạp secret `--env prod`, rồi deploy `env=prod`: `gh workflow run deploy.yaml --ref main -f app=$APP -f repo=<org>/$APP -f sha=<sha> -f env=prod` → PR nhánh prod, chờ duyệt (hoặc `promote`) |
 | Xoay vòng bí mật app | `secret-set …` — VSO restart workload đúng một lần |
 | Xoay vòng mật khẩu DB | `rotate-db-credential --app $APP --env staging` — **đừng** chỉ ghi vào Vault |
 | Trả nợ trước-merge | `ci.yaml` về `ref: main`; xoá nhánh tạm |

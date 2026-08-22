@@ -191,27 +191,19 @@ số. Nguy hiểm không phải vì cụm sai, mà vì **một bundle luôn đ�
 
 ---
 
-## D. Onboarding
+## D. Onboarding — ĐÃ GỠ
 
-### D1. Onboarding dừng ở trạng thái chờ người — `thông tin`, không đánh thức ai
-
-`WAITING_FOR_USER_SECRETS` và `PENDING_PROD_APPROVAL` là **trạng thái**, không phải lỗi.
-Biến chúng thành cảnh báo cấp cao là cách nhanh nhất dạy người trực bỏ qua cảnh báo.
-
-| | |
-|---|---|
-| **Điều kiện** | `record.state` thuộc `WAITING_FOR_USER_SECRETS`, `PENDING_PROD_ACTIVATION`, `PENDING_PROD_APPROVAL` |
-| **Ngưỡng** | **3 ngày** → nhắc đội ứng dụng, không gọi Ops |
-
-### D2. Onboarding hỏng có thể retry — `cảnh báo`
-
-| **Điều kiện** | `record.state == "FAILED_RETRYABLE"` | **Ngưỡng** | 1 giờ | **Runbook** | [6](runbook/onboarding-do-dang.md) |
-|---|---|---|---|---|---|
-
-### D3. Thời gian onboarding theo bước — `thông tin`
-
-Ghi `history[]` trong bản ghi state (mỗi mục có `at` + `state`) thành histogram. Không đặt
-ngưỡng cho tới khi có đủ số liệu thật — một ngưỡng đoán mò sẽ bị tắt sau tuần đầu.
+> Máy trạng thái onboarding (và `record.state` mà các luật D1–D3 dựa vào) bị gỡ ở commit
+> `c5d28ac`. **Không còn cảnh báo onboarding.** "Chờ người" giờ hiện diện dưới dạng tài
+> nguyên thật, không phải enum trạng thái, nên nó thuộc các mục khác chứ không phải một
+> cảnh báo riêng:
+>
+> - Thiếu bí mật bên thứ ba → `VaultStaticSecret` `SecretSynced=False` (mục A / runbook
+>   `thieu-bi-mat-vault.md`), không phải `WAITING_FOR_USER_SECRETS`.
+> - Chờ duyệt prod → pull request đang mở trên kho config prod (`gh pr list`), không phải
+>   `PENDING_PROD_APPROVAL`.
+> - Deploy hỏng → theo dõi qua audit store (`idpctl audit-report`) và trạng thái workflow,
+>   không phải `FAILED_RETRYABLE`.
 
 ---
 

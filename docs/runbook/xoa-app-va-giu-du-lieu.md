@@ -1,115 +1,109 @@
 # 8. Xoá app và giữ dữ liệu
 
-Workflow: `offboard` (mục 13.4). Mặc định nó **không xoá gì** — nó in kế hoạch.
+> **Lệnh `offboard` đã bị GỠ** (commit `c5d28ac`). Không còn `idpctl offboard`, không còn
+> `--execute/--confirm/--approved-by/--purge-secrets`. Việc dọn app giờ làm **thủ công** —
+> runbook này giữ nguyên các rào an toàn mà `offboard` từng ép, bạn phải tự kiểm.
 
-## Bước 1 — xem trước, luôn luôn
-
-```bash
-python3 idpctl --env-config platform.env.yaml offboard --app <app> --env <env>
-```
-
-In ra hai danh sách: **SẼ XOÁ** và **SẼ GIỮ**, mỗi mục kèm lý do. Đọc cả hai. Danh sách
-"sẽ giữ" quan trọng ngang danh sách kia — nó cho biết cái gì còn lại để dọn sau, và cái gì
-cố ý không bao giờ bị đụng tới.
-
-## Bước 2 — kiểm hai điều trước khi cho phép
-
-1. **Backup của database còn trong hạn không, và đã từng phục hồi thử chưa?**
-
-   ```bash
-   kubectl -n <app>-<env> get cluster.postgresql.cnpg.io <tên> \
-     -o jsonpath='{.status.firstRecoverabilityPoint}{" .. "}{.status.lastSuccessfulBackup}{"\n"}'
-   ```
-
-   `firstRecoverabilityPoint` rỗng nghĩa là **không có gì để phục hồi** — xoá app lúc này
-   là mất dữ liệu vĩnh viễn dù kho object đầy WAL. Xem [runbook 4](database-provisioning-backup-that-bai.md).
-
-2. **Có ai còn dùng database này không?** Một app khác trỏ vào cùng Service là chuyện có
-   thật trong brownfield.
-
-## Bước 3 — xoá
-
-```bash
-python3 idpctl --env-config platform.env.yaml offboard \
-  --app <app> --env <env> --execute --confirm <app>
-# prod:
-  ... --execute --confirm <app> --approved-by <tên người duyệt>
-```
-
-- `--confirm` phải là **đúng tên app**. Gõ lại tên là rào chắn cuối trước một thao tác
-  không hoàn tác được.
-- `prod` bắt buộc `--approved-by`; tên đó vào bản ghi state để sau còn tra được.
-- `--purge-secrets` xoá **hẳn** bí mật trong Vault. Mặc định là xoá mềm — đừng dùng cờ này
-  trừ khi có yêu cầu tuân thủ bắt buộc.
-
-## Cái gì bị xoá, cái gì không
+## Nguyên tắc: cái gì xoá, cái gì GIỮ
 
 | | Số phận | Vì sao |
 |---|---|---|
 | Namespace `<app>-<env>` | **xoá** | chứa workload, Cluster, Secret của app |
-| `GitRepo` của Fleet | **xoá trước namespace** | ngược lại thì Fleet dựng lại thứ ta đang xoá, và Fleet thắng |
+| `GitRepo` của Fleet | **xoá TRƯỚC namespace** | ngược lại Fleet dựng lại thứ ta đang xoá, và Fleet thắng |
 | Bí mật Vault `apps/<app>/<env>/*` | **xoá mềm** | phục hồi được bằng `vault kv undelete` |
-| **Backup database** | **giữ** | xoá app không được xoá đường phục hồi; retention của kho object quyết định |
+| **Backup database** | **giữ** | xoá app không được xoá đường phục hồi; retention kho object quyết định |
 | **Kho Git** (app + cấu hình) | **giữ** | giữ lịch sử triển khai — hãy *archive*, đừng xoá |
 | **Policy/role Vault** | **giữ** | Vault Ops sở hữu; gỡ bằng quy trình của họ |
-| PVC của database cũ (nếu từng đổi class) | **giữ** | không nằm trong namespace bị xoá nếu đã orphan; xem bên dưới |
+| PVC database cũ (nếu từng đổi class) | **giữ** | có thể đã orphan ngoài namespace; xem bước 4 |
 
-## Rào chắn: không xoá nhầm của đội khác
+## Bước 1 — xem trước sẽ xoá gì (thay `offboard` in kế hoạch)
 
-Trước khi xoá namespace, `offboard` quét bên trong và **từ chối** nếu thấy bất kỳ tài
-nguyên nào mang nhãn `idp.platform/application` của một app khác:
-
-```text
-namespace <app>-<env> có tài nguyên của application khác (doi-thanh-toan).
-Từ chối xoá: xoá app này sẽ kéo theo của đội khác.
-```
-
-Tên namespace đúng quy ước **không phải** bằng chứng sở hữu — `{app}-{env}` là quy ước.
-Nếu gặp thông báo này, đừng ép: tách tài nguyên của đội kia ra trước.
-
-Tương tự, `GitRepo` được khớp theo `spec.repo`, không theo tên.
-
-## Bước 4 — dọn phần còn lại, sau một chu kỳ backup
-
-Chỉ làm khi đã chắc chắn không cần quay lại:
+Mọi tài nguyên platform tạo đều mang nhãn `idp.platform/application`. Liệt kê để biết phạm vi:
 
 ```bash
-# PVC mồ côi (nếu app từng đổi class database)
-kubectl -n <app>-<env> get pvc
-# archive kho Git thay vì xoá
-gh repo archive <org>/<app>
+APP=<app>; ENV=<env>
+kubectl get all,gitrepo,cluster.postgresql.cnpg.io,vaultstaticsecret -A \
+  -l idp.platform/application="$APP"
+kubectl -n fleet-local get gitrepo -o custom-columns=NAME:.metadata.name,REPO:.spec.repo | grep "$APP"
+```
+
+## Bước 2 — kiểm hai điều trước khi xoá
+
+1. **Backup database còn trong hạn và đã thử phục hồi chưa?**
+
+   ```bash
+   kubectl -n "$APP-$ENV" get cluster.postgresql.cnpg.io <tên> \
+     -o jsonpath='{.status.firstRecoverabilityPoint}{" .. "}{.status.lastSuccessfulBackup}{"\n"}'
+   ```
+
+   `firstRecoverabilityPoint` rỗng = **không có gì để phục hồi** — xoá lúc này là mất dữ liệu
+   vĩnh viễn dù kho object đầy WAL. Xem [runbook 4](database-provisioning-backup-that-bai.md).
+
+2. **RÀO CHẮN: không xoá nhầm của đội khác.** `offboard` từng tự từ chối khi namespace chứa
+   tài nguyên mang nhãn `idp.platform/application` của app khác. Giờ **bạn phải tự kiểm** —
+   tên namespace đúng quy ước `{app}-{env}` KHÔNG phải bằng chứng sở hữu:
+
+   ```bash
+   kubectl -n "$APP-$ENV" get all -L idp.platform/application \
+     | grep -v "$APP" | grep -v '^NAME'      # phải RỖNG; có dòng lạ = dừng lại, tách ra trước
+   ```
+
+   `GitRepo` khớp theo `spec.repo`, không theo tên — đối chiếu `spec.repo` đúng `idp-<app>-config`.
+
+## Bước 3 — xoá (đúng thứ tự: GitRepo trước, namespace sau)
+
+```bash
+# 3a. Xoá GitRepo TRƯỚC để Fleet ngừng đồng bộ (nếu không nó dựng lại ngay).
+kubectl -n fleet-local delete gitrepo <tên-gitrepo-của-app>
+
+# 3b. Xoá namespace (kéo theo workload, Cluster CNPG, Secret trong ns).
+kubectl delete ns "$APP-$ENV"
+
+# 3c. Xoá MỀM bí mật Vault (phục hồi được). KHÔNG destroy trừ khi tuân thủ bắt buộc.
+#     Đường dẫn theo vault.path_template = apps/<app>/<env>/<name>.
+kubectl -n vault exec -i vault-0 -- env VAULT_TOKEN=$VAULT_DEV_ROOT_TOKEN \
+  VAULT_ADDR=http://127.0.0.1:8200 vault kv delete kv/apps/$APP/$ENV/<name>
+```
+
+> prod: đây là thao tác không hoàn tác. Trước khi chạy, xác nhận có người duyệt và ghi lại
+> **ai duyệt** (offboard cũ ép `--approved-by`; giờ tự ghi vào PR/ticket dọn dẹp).
+
+## Bước 4 — dọn phần còn lại, SAU một chu kỳ backup
+
+Chỉ làm khi chắc chắn không quay lại:
+
+```bash
+kubectl -n "$APP-$ENV" get pvc                    # PVC mồ côi (nếu từng đổi class database)
+gh repo archive <org>/<app>                       # ARCHIVE kho Git, đừng xoá
 gh repo archive <org>/idp-<app>-config
-# xoá hẳn bí mật nếu chính sách tuân thủ đòi
-... offboard --app <app> --env <env> --execute --confirm <app> --purge-secrets
-# gỡ policy/role Vault — việc của Vault Ops
-vault delete auth/kubernetes/role/idp-<app>-<env>
-vault policy delete idp-<app>-<env>-read
-vault policy delete idp-<app>-<env>-write
+# xoá HẲN bí mật nếu chính sách tuân thủ đòi (không hoàn tác):
+kubectl -n vault exec -i vault-0 -- env VAULT_TOKEN=$VAULT_DEV_ROOT_TOKEN \
+  VAULT_ADDR=http://127.0.0.1:8200 vault kv metadata delete kv/apps/$APP/$ENV/<name>
+# gỡ policy/role Vault — việc của Vault Ops:
+vault delete auth/kubernetes/role/idp-$APP-$ENV
+vault policy delete idp-$APP-$ENV-read
+vault policy delete idp-$APP-$ENV-write
 ```
 
 ## Xác minh đã xong
 
 ```bash
-kubectl get ns | grep <app>                       # không còn (hoặc Terminating)
-kubectl -n fleet-local get gitrepo | grep <app>   # không còn
-kubectl get all -A -l idp.platform/application=<app>
-python3 idpctl --env-config platform.env.yaml onboard-status --app <app>   # DELETED
+kubectl get ns | grep "$APP"                       # không còn (hoặc Terminating)
+kubectl -n fleet-local get gitrepo | grep "$APP"   # không còn
+kubectl get all -A -l idp.platform/application="$APP"   # rỗng
 ```
 
-Và kiểm rằng thứ **phải còn** thì vẫn còn:
-
-```bash
-# thư mục backup của app vẫn nằm trong kho object
-```
+Và kiểm thứ **phải còn** thì vẫn còn: thư mục backup của app trong kho object, kho Git đã archive.
 
 ## Phục hồi khi xoá nhầm
 
-Trong vòng thời gian bí mật còn xoá mềm:
+Trong hạn xoá mềm của bí mật:
 
 ```bash
-vault kv undelete -mount=kv -versions=<n> apps/<app>/<env>/<tên>
+kubectl -n vault exec -i vault-0 -- env VAULT_TOKEN=$VAULT_DEV_ROOT_TOKEN \
+  VAULT_ADDR=http://127.0.0.1:8200 vault kv undelete -versions=<n> kv/apps/$APP/$ENV/<name>
 ```
 
-Namespace, workload và manifest dựng lại được từ kho cấu hình (đó là lý do không xoá kho).
-Dữ liệu database dựng lại từ kho object theo [runbook 4](database-provisioning-backup-that-bai.md)
-mục 4C. Đây chính là lý do ba thứ đó cố ý không nằm trong danh sách xoá.
+Namespace/workload/manifest dựng lại từ kho cấu hình (lý do không xoá kho). Dữ liệu database
+dựng lại từ kho object theo [runbook 4](database-provisioning-backup-that-bai.md) mục 4C. Đây
+chính là lý do ba thứ đó cố ý nằm ngoài danh sách xoá.

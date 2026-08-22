@@ -4,7 +4,7 @@
 
 - Pod đứng ở `CreateContainerConfigError`.
 - `verify` fail với `bí mật chưa được VSO đồng bộ sau …s`.
-- Onboarding dừng ở trạng thái `WAITING_FOR_USER_SECRETS`.
+- `VaultStaticSecret` của app ở `SecretSynced=False` (bí mật bên thứ ba chưa được nạp).
 
 ## Xác nhận
 

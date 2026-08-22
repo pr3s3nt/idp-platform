@@ -1,6 +1,13 @@
 # ADR 0010 — Onboarding là một máy trạng thái có bản ghi ngoài tiến trình
 
-Trạng thái: Accepted — 2026-08-11
+Trạng thái: **Superseded** — 2026-08-11 (Accepted) → gỡ ở commit `c5d28ac`.
+
+> **Không còn hiệu lực.** Máy trạng thái onboarding (`engine/onboarding.py` + các lệnh
+> `onboard`/`onboard-status`/`onboard-activate-prod`/`offboard`) đã bị gỡ. Đưa app lên nay là
+> **luồng deploy chuẩn** (push → CI build → `deploy.yaml` render+commit → Fleet); Vault làm
+> bằng `vault-onboard` + `vault-auto-setup`; prod qua deploy `env=prod`/`promote`; dọn app làm
+> tay theo `runbook/xoa-app-va-giu-du-lieu.md`. Giữ ADR này làm lịch sử quyết định.
+> Bối cảnh bên dưới mô tả trạng thái *khi được chấp nhận*, không phải code hiện tại.
 
 ## Bối cảnh
 

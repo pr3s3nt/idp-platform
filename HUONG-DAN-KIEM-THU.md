@@ -22,13 +22,14 @@ python3 -m pytest test_engine.py -v
 - Test **nạp `platform.env.yaml` của chính repo** để resolve `%%placeholder%%` ⇒ nó kiểm cả
   catalog + config thật, không phải mô hình giả.
 - Cần trên PATH: `score-k8s`, `kubectl`, `git`, `gh`, và `pyyaml` (import `yaml`).
-  - **26 test có `@needs_score_k8s` sẽ TỰ SKIP nếu thiếu `score-k8s`** (biến `HAS_SCORE_K8S`).
-    Thiếu score-k8s ⇒ vẫn chạy được phần còn lại, nhưng **các test idempotency/render quan
-    trọng nhất bị bỏ qua** — muốn verify thật thì phải có score-k8s.
+  - **Các test có `@needs_score_k8s` sẽ TỰ SKIP nếu thiếu `score-k8s`** (biến `HAS_SCORE_K8S`;
+    đếm số: `grep -c @needs_score_k8s test_engine.py`). Thiếu score-k8s ⇒ vẫn chạy được phần
+    còn lại, nhưng **các test idempotency/render quan trọng nhất bị bỏ qua** — muốn verify thật
+    thì phải có score-k8s.
   - Các test khác chỉ cần `git` (chúng dựng repo git tạm trong `tmp_path`, không đụng repo thật).
-- Tổng hiện tại: khoảng **180 case** (từ ~150 hàm test, parametrize nở thêm; ~26 hàm cần
-  score-k8s). Trên máy có đủ công cụ, cả bộ **xanh sạch, 0 skip** (~73s). Muốn biết pass/skip
-  lúc này thì chạy lệnh trên — đừng tin một con số chép cứng trong tài liệu.
+- Trên máy có đủ công cụ, cả bộ **xanh sạch, 0 skip**. Muốn biết chính xác tổng số case/pass/skip
+  lúc này thì chạy lệnh trên (hoặc `grep -c '^\s*def test_' test_engine.py`) — **đừng tin một
+  con số chép cứng trong tài liệu** (bộ test nở liên tục; ví dụ 2026-08-22: 326 hàm test).
 
 ## Nó bảo vệ bất biến nào (map test → luật)
 
@@ -50,7 +51,7 @@ Mỗi "mảng" test canh một bất biến. Test đỏ ở mảng nào = bạn 
 | `kiểm cụm sau khi triển khai` | Logic `verify`: chờ rollout thật, không nhìn `availableReplicas`. |
 | `PHASE 5 — stack catalog` | Catalog `templates/stacks/` tự nhất quán; sinh app không để sót `__TOKEN__`; `.env.example` không lệch khỏi values. |
 | `PHASE 5 — tích hợp score-compose` | Chạy **chính `make generate`** của app sinh ra: routing `/api` phải đứng trước `/` bất kể tên workload, và nginx phải re-resolve DNS. |
-| `PHASE 6 — onboarding` | Request bị kiểm chặt (khoá lạ, `"false"` dạng chuỗi, stack version không phát hành); máy trạng thái **bỏ qua bước đã xong** khi retry; chờ-người không bao giờ thành `READY`; prod luôn đi qua pull request và mang đúng bộ ảnh staging; CI sinh ra không còn chỗ phải sửa tay. |
+| `PHASE 2 — the onboarding tool` (`vault-onboard`) | Onboard Vault in đúng policy/role, KHÔNG cầm `VAULT_TOKEN`; hai chủ sở hữu (tool ghi K8s, admin ghi Vault). |
 
 ## Render/verify cục bộ — KHÔNG cần cụm
 
@@ -94,7 +95,9 @@ Mỗi "mảng" test canh một bất biến. Test đỏ ở mảng nào = bạn 
 (`<app>-staging`, `idp-<app>-config`, state Secret theo app, đường Vault theo app). Nên luôn test
 bằng **một app tên-mới throwaway**; **không** trỏ run nhánh feature vào một app đang chạy — nó commit
 vào config repo của app đó → Fleet áp lên cụm → đổi app thật, và state dùng chung có thể làm run
-`main` sau đó đọc sai (vỡ bất biến tương thích ngược). Xong thì `offboard` app throwaway.
+`main` sau đó đọc sai (vỡ bất biến tương thích ngược). Xong thì dọn app throwaway bằng tay:
+xoá namespace `<app>-staging`/`<app>-prod`, GitRepo Fleet, config repo `idp-<app>-config`,
+và state Secret của app (không còn lệnh `offboard`).
 
 ### Vòng lặp phát triển (rẻ → đắt, mỗi lớp bắt một loại lỗi)
 
@@ -135,6 +138,28 @@ Một số phase (Vault/VSO, DB provider, score-compose…) cần hạ tầng th
 **Đừng tin bất kỳ ảnh chụp trạng thái nào chép trong tài liệu — nó lỗi thời ngay.** Luôn tự
 lấy trạng thái SỐNG:
 
+### Harness "chết" sau khi máy/WSL khởi động lại — hồi sinh trước khi làm gì khác
+
+Triệu chứng: `kubectl` mọi context `kind-*` trả **`connection refused`** trên
+`127.0.0.1:<port>`; `docker ps -a` thấy các `*-control-plane` ở trạng thái **`Exited (128)`**.
+Đây **KHÔNG phải cụm hỏng** — cụm kind là container Docker chạy Kubernetes bên trong; khi WSL
+boot, Docker cố tự khởi động container kind *quá sớm* (systemd/cgroup của WSL chưa sẵn sàng cấp
+"cgroup scope") nên `runc` chết ngay. Dữ liệu (etcd/PV) vẫn còn nguyên trong filesystem
+container, chỉ *dừng*. Khi máy đã up một lúc, khởi động lại là chạy. Một lệnh, idempotent:
+
+```bash
+./tools/hoi-sinh-harness.sh            # start 3 cụm + chờ /readyz + dựng lại Vault foundation
+./tools/hoi-sinh-harness.sh --no-vault # chỉ start cụm (khi không cần luồng secret)
+```
+
+**Cạm bẫy Vault đi kèm:** Vault harness chạy **dev mode = giữ mọi thứ TRONG RAM**. Container
+kind restart là Vault mất **sạch** KV mount + policy + role + secret → mọi `VaultStaticSecret`
+rơi `SecretSynced=False` → app dùng secret đứng NotReady. `hoi-sinh-harness.sh` tự dựng lại
+Vault *foundation* (mount + k8s-auth + VaultConnection/Auth), nhưng **policy/role/secret TỪNG
+app phải seed lại riêng** (`vault-onboard` + `secret-set`) — app cũ nào cần sống thì làm cho
+app đó, còn luồng deploy MỚI thì tự onboard Vault trong lúc chạy. Kiểm nhanh "còn sống không":
+`kubectl get nodes && python3 idpctl --env-config platform.env.yaml preflight --require-cluster --require-vault`.
+
 - **Cụm verify** trên máy này: `kind-staging`, `kind-prod` (và `kind-v2`) — context `kind-*`.
   Xem có gì: `kubectl config get-contexts` / `kind get clusters`.
 - **Probe hạ tầng (nguồn sự thật LIVE, CHỈ ĐỌC, an toàn cả trên prod):**
@@ -155,8 +180,8 @@ lấy trạng thái SỐNG:
 | 3 — App secret | Phase 2 chạy được (VSO sync ra Secret trong ns) | `kubectl get vaultstaticsecret,secretstore -A` |
 | 4 — Postgres capability | DB provider/operator production-grade | probe: tìm operator postgres; `kubectl get crd \| grep -iE 'postgres\|cnpg\|zalando'` |
 | 5 — Stack + score-compose | `score-compose` bản đã ghim + `docker` + `make` | `score-compose --version`; `docker info` |
-| 6 — Onboarding | Phase 2-5 chạy được + `gh` đã đăng nhập + kho object cho backup (nếu bật prod) | `gh auth status`; `kubectl -n object-store get deploy minio` |
-| 6 — CI của app trên runner tự dựng | `python3`, `jq`, `docker`, `git` trên máy chạy | `for t in python3 jq docker git; do command -v $t; done` |
+| deploy app mới (kèm prod) | Vault/DB/stack chạy được + `gh` đã đăng nhập + kho object cho backup (nếu bật prod) | `gh auth status`; `kubectl -n object-store get deploy minio` |
+| CI của app trên runner tự dựng | `python3`, `jq`, `docker`, `git` trên máy chạy | `for t in python3 jq docker git; do command -v $t; done` |
 | chung — deploy tới cụm | Fleet + gateway (traefik) + storageClass | có trong output `thu-thap-ha-tang.sh` |
 
 **Dựng lại Vault/VSO trên harness (Phase 2) — một lệnh, chạy lại được nhiều lần:**
@@ -210,47 +235,28 @@ và chỉ ghi khi có `--write`.
 > `make` và `score-compose` trên PATH. Gate `make dev` đầy đủ (dựng container thật) không
 > nằm trong pytest — chạy tay theo lệnh trên rồi kiểm `/` và `/api/health`.
 
-**Onboarding một app mới từ đầu (Phase 6):**
+**Đưa một app MỚI lên harness:**
 
-Onboarding hiện bị tắt bằng `onboarding.enabled: false`. Khi cần mở lại có chủ ý, đổi key
-đó thành `true`; `features.stack_onboarding` là capability của stack/deploy và không phải
-kill switch vận hành. Khi tắt, `onboard` (kể cả resume) và `onboard-activate-prod` dừng trước
-mọi thao tác ghi, còn `onboard-status` và deploy app hiện hữu vẫn hoạt động.
+> **KHÔNG còn lệnh `idpctl onboard*`.** Máy trạng thái onboarding (`engine/onboarding.py`
+> + các lệnh `onboard`/`onboard-status`/`onboard-activate-prod` + `offboard` + config key
+> `onboarding.enabled`) đã bị **gỡ ở commit `c5d28ac`**. Đừng đi tìm chúng.
+
+Đường đưa app mới lên bây giờ là **luồng deploy chuẩn**: push app → CI build+push ảnh →
+`deploy.yaml` render+commit config → Fleet kéo về cụm. Chi tiết từng bước + "Bẫy đã biết"
+ở `HUONG-DAN-TRIEN-KHAI-APP-CHUAN.md`. Phần Vault của app làm bằng `vault-onboard` +
+`vault-auto-setup` (mục "Onboard một app vào Vault" ở trên).
+
+Điều kiện hạ tầng vẫn đúng khi app xin database **và** bật prod (fail-closed có chủ ý):
 
 ```bash
-# 1. Kho object cho backup — BẮT BUỘC nếu app xin database và có bật prod.
-#    Render prod bị CHẶN khi database.backup.object_store_url rỗng (fail-closed có chủ ý).
-./tools/dung-object-store-harness.sh --context kind-staging      # chỉ harness, không chạy ở công ty
-
-# 2. Vault nhìn thấy được từ máy đang chạy lệnh (vault.address là địa chỉ CỤM nhìn thấy).
-kubectl -n vault port-forward svc/vault 8200:8200 &
-export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=<token có quyền quản trị>
-
-# 3. Thông tin đăng nhập registry cho imagePullSecret, và (tuỳ chọn) token cho CI của app.
-export REGISTRY_USER=... REGISTRY_PASS=...     # KHÔNG bao giờ là tham số dòng lệnh
-export APP_DISPATCH_TOKEN=...                  # bỏ trống -> onboarding chỉ BÁO là còn thiếu
-
-# 4. Chạy. Cùng một file request chạy lại bao nhiêu lần cũng được.
-python3 idpctl --env-config platform.env.yaml onboard \
-  --request request-<app>.yaml --work /duong/dan/tam/onboard-<app>
-python3 idpctl --env-config platform.env.yaml onboard-status --app <app>
-python3 idpctl --env-config platform.env.yaml onboard-activate-prod \
-  --app <app> --work /duong/dan/tam/onboard-<app>
+# Kho object cho backup — render prod bị CHẶN khi database.backup.object_store_url rỗng
+# (engine/values.py). Dựng kho object cho harness (KHÔNG chạy ở công ty):
+./tools/dung-object-store-harness.sh --context kind-staging
 ```
 
-Hình dạng file request nằm ở mục 13.1 của `KE-HOACH...`. Trạng thái sống trong ConfigMap
-`idp-onboarding-<app>` ở `kubernetes.state_namespace` — đọc bằng `onboard-status --json`.
-
-Ba trạng thái KHÔNG phải lỗi và cũng KHÔNG phải xong:
-
-| Trạng thái | Nghĩa | Làm gì tiếp |
-|---|---|---|
-| `WAITING_FOR_USER_SECRETS` | app deploy rồi nhưng thiếu bí mật bên thứ ba | chạy đúng lệnh `secret-set` mà nó in ra, rồi chạy lại `onboard` |
-| `PENDING_PROD_APPROVAL` | pull request prod đã mở, chờ người merge | merge rồi chạy lại `onboard-activate-prod` |
-| `FAILED_RETRYABLE` | một bước hỏng, lý do nằm trong bản ghi | sửa nguyên nhân rồi chạy lại — nó tiếp tục từ đúng bước đó |
-
-`--force-step <tên bước>` chạy lại một bước đã `done` (mọi bước đều kiểm-trước-khi-tạo).
-`--stop-after <tên bước>` dừng sớm để xem kết quả từng phần.
+`vault-auto-setup` tự tạo Vault policy/role cho app/env khi có `VAULT_TOKEN` (thay phần
+"tạo policy/role" mà máy onboarding cũ từng làm); `rotate-db-credential` xoay mật khẩu DB
+theo thứ tự Vault → VSO → CNPG → pod, kiểm từng bước.
 
 > Thứ chỉ tồn tại ở công ty (Vault addr thật, policy…) thì theo `KE-HOACH...` mục 0.6: tạo
 > config key + validation/preflight + checklist, **không** tự đánh dấu pass, và **không** để

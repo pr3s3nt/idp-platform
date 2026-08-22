@@ -18,8 +18,9 @@ Mục tiêu: mang nền tảng sang công ty khác chỉ bằng `platform.env.ya
 code. Nên giá trị hạ tầng/công ty (org, registry host, domain, context cụm, storage class,
 gateway, namespace…) đọc từ `platform.env.yaml` (`CONFIG.get(...)` / `--env-config`), không gán
 cứng vào `.py`/`.yaml`/`.sh`. Cần giá trị mới ⇒ thêm key vào `platform.env.yaml`. Code vốn đã
-giúp giữ điều này: `--registry`/`--image` không có default; `deploy.yaml` ghi "NO
-INFRASTRUCTURE VALUES HERE".
+giúp giữ điều này: `--registry` là `required=True` (không default), `--image` mặc định về
+`--app`; `.github/workflows/deploy.yaml` ghi "Infrastructure coordinates come from
+platform.env.yaml, never this workflow".
 
 ## Các bất biến khác — và vì sao (comment tại chỗ giải thích kỹ hơn)
 - **Secret không vào git/manifest công khai** — split-manifest + `encodeSecretRef`; manifest chỉ giữ tham chiếu.
