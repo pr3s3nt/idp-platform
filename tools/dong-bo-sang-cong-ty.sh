@@ -119,5 +119,5 @@ cat <<EOF
   4. python3 -m pytest test_engine.py -q   — lớp 1 phải xanh trước khi commit.
   5. git add -A && git commit && mở pull request.
 
-Chi tiết: HUONG-DAN-DONG-BO-CONG-TY.md
+Chi tiết: docs/configuration.md
 EOF

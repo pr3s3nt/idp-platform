@@ -62,8 +62,9 @@ Mặc định nên dùng: để trống `kubernetes.fleet_git_secret` — platfo
 ## 5C. Fleet dựng lại thứ bạn vừa xoá
 
 Nếu bạn xoá tài nguyên bằng tay trong khi `GitRepo` còn trỏ vào nó, Fleet sẽ dựng lại —
-hai bên đánh nhau và Fleet thắng. Xoá `GitRepo` **trước**, tài nguyên sau. Lệnh `offboard`
-của platform đã làm đúng thứ tự này.
+hai bên đánh nhau và Fleet thắng. Xoá `GitRepo` **trước**, tài nguyên sau (thứ tự này cũng
+là lý do quy trình gỡ app thủ công xoá `GitRepo` trước namespace — xem
+[runbook 8](xoa-app-va-giu-du-lieu.md)).
 
 ## Xác minh đã xong
 

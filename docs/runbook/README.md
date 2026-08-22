@@ -1,6 +1,6 @@
 # Runbook vận hành
 
-Tám tình huống ở mục 17 của kế hoạch. Mỗi runbook có cùng bố cục:
+Các tình huống vận hành thường gặp. Mỗi runbook có cùng bố cục:
 
 **Triệu chứng** → **Xác nhận** (lệnh cụ thể) → **Nguyên nhân thường gặp** → **Xử lý** →
 **Xác minh đã xong** → **Nếu vẫn hỏng**.
@@ -15,9 +15,8 @@ thượng nguồn. Chỗ nào là hành vi đã quan sát thấy thì có ghi r�
 | 3 | VSO xác thực hỏng | [vso-xac-thuc-hong.md](vso-xac-thuc-hong.md) |
 | 4 | Database dựng/backup thất bại | [database-provisioning-backup-that-bai.md](database-provisioning-backup-that-bai.md) |
 | 5 | Fleet drift / không reconcile | [fleet-drift.md](fleet-drift.md) |
-| 6 | Onboarding dở dang và retry | [onboarding-do-dang.md](onboarding-do-dang.md) |
 | 7 | Rollback nâng cấp stack | [rollback-nang-cap-stack.md](rollback-nang-cap-stack.md) |
-| 8 | Xoá app và giữ dữ liệu | [xoa-app-va-giu-du-lieu.md](xoa-app-va-giu-du-lieu.md) |
+| 8 | Xoá app và giữ dữ liệu (thủ công) | [xoa-app-va-giu-du-lieu.md](xoa-app-va-giu-du-lieu.md) |
 
 Ngưỡng cảnh báo và cách gắn vào hệ giám sát: [`../canh-bao.md`](../canh-bao.md).
 

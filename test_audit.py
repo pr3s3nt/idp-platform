@@ -6,7 +6,7 @@ contract WITHOUT a database. The DB-backed tests (migration idempotency, idempot
 event dedup, KPI maths, "no secret reaches a column") run against a REAL PostgreSQL — set
 AUDIT_TEST_DATABASE_URL and they execute; otherwise they skip, and the runtime harness runs
 them against Postgres-in-kind. Green here never means "the store works end to end" — that is
-what the runtime harness proves (see HUONG-DAN-KIEM-THU.md).
+what the runtime harness proves (see docs/testing.md).
 """
 from __future__ import annotations
 
