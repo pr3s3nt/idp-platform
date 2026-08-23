@@ -554,7 +554,7 @@ def cmd_verify(args) -> None:
             return
         if time.time() >= deadline:
             break
-        time.sleep(10)
+        time.sleep(poll_interval(10))
 
     # Hết giờ: in đúng thứ cần để hiểu vì sao, ngay tại chỗ.
     warn(f"sau {args.timeout}s vẫn chưa đạt trạng thái mong muốn trong {ns}")

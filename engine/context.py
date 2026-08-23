@@ -388,6 +388,22 @@ def config_int(key: str, default: int) -> int:
     return int(value)
 
 
+def poll_interval(default: int) -> int:
+    """Giây chờ GIỮA hai lần poll trong một vòng chờ (rollout, VSO sync, base backup…).
+
+    Tách khỏi `timeout` của vòng lặp một cách có chủ ý: `timeout` là tổng thời gian sẵn
+    sàng chờ thực tại hội tụ, còn interval chỉ là tần suất kiểm lại — trộn hai thứ làm một
+    hằng số là lý do bộ test "logic thuần" tốn ~70s ngồi `sleep` thật trong các vòng verify.
+    Vận hành có thể chỉnh `verify.poll_interval_seconds` trong platform.env.yaml; biến môi
+    trường IDP_POLL_INTERVAL_SECONDS đè lên cả hai — escape hatch phạm vi tiến trình để
+    conftest của test đặt về 0 mà không test riêng lẻ nào phải biết mình chạm vòng lặp nào.
+    """
+    override = os.environ.get("IDP_POLL_INTERVAL_SECONDS")
+    if override is not None and override != "":
+        return int(override)
+    return config_int("verify.poll_interval_seconds", default)
+
+
 def feature(name: str) -> bool:
     """Is an opt-in capability switched on for this platform install?
 

@@ -1162,7 +1162,7 @@ def _wait_rollout(docs: list[dict], ns: str, kube: str | None, timeout: int) -> 
             return
         if time.time() >= deadline:
             break
-        time.sleep(5)
+        time.sleep(poll_interval(5))
     _dump_rollout_diagnostics([n for n in want], ns, kube)
     raise DeployCheckError(
         "chờ Deployment", "; ".join(pending), LAYER_KUBERNETES,

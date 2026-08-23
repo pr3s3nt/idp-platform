@@ -505,7 +505,7 @@ def wait_for_vault_secrets(docs: list[dict], ns: str, args) -> None:
             return
         if time.time() >= deadline:
             break
-        time.sleep(5)
+        time.sleep(poll_interval(5))
     for line in pending:
         print(f"::error::{line}", file=sys.stderr, flush=True)
     raise SystemExit(
@@ -556,7 +556,7 @@ def wait_for_databases(docs: list[dict], ns: str, args) -> None:
             return
         if time.time() >= deadline:
             break
-        time.sleep(10)
+        time.sleep(poll_interval(10))
     for line in pending:
         print(f"::error::{line}", file=sys.stderr, flush=True)
     raise SystemExit(
@@ -612,7 +612,7 @@ def wait_for_recoverability(targets: list[dict], ns: str, args) -> None:
             return
         if time.time() >= deadline:
             break
-        time.sleep(10)
+        time.sleep(poll_interval(10))
     for line in pending:
         print(f"::error::{line}", file=sys.stderr, flush=True)
     raise SystemExit(
@@ -1062,7 +1062,7 @@ def cmd_rotate_db_credential(args) -> None:
                 raise SystemExit(
                     f"{secret}: VSO chưa đồng bộ giá trị mới sau khi ghi vào Vault. Kiểm "
                     f"`kubectl -n {ns} get vaultstaticsecret` — điều kiện SecretSynced.")
-            time.sleep(5)
+            time.sleep(poll_interval(5))
         after = rv()
         log(f"VSO đã đồng bộ {secret} (resourceVersion {before} -> {after})")
 
@@ -1084,7 +1084,7 @@ def cmd_rotate_db_credential(args) -> None:
                     f"{cluster}: CNPG chưa áp mật khẩu mới cho role {role}. Ở trạng thái "
                     "này Secret chứa mật khẩu mà database TỪ CHỐI; pod cũ vẫn chạy được "
                     "bằng mật khẩu cũ, nên không có gì đỏ. Kiểm log của operator.")
-            time.sleep(5)
+            time.sleep(poll_interval(5))
         log(f"CNPG đã áp mật khẩu mới cho role {role}")
 
         # 4. Pod. Đúng một lần restart cho mỗi workload đang dùng Secret này.
