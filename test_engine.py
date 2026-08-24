@@ -5030,10 +5030,10 @@ def test_cleanup_deletes_a_namespace_it_owns(monkeypatch):
     cr = orc.CheckRun(app="a", env="staging", sha="s", run_id="r1",
                       kubeconfig=None, namespace="a-check-r1")
     deleted = []
+    owned = {orc.CHECK_LABEL: "true", orc.CHECK_RUN_LABEL: "r1", orc.CHECK_APP_LABEL: "a"}
     def fake_kubectl(args, **kw):
         if args[:2] == ["get", "namespace"] and "json" in args:
-            return _cp(out=json.dumps(
-                {"metadata": {"labels": {orc.CHECK_RUN_LABEL: "r1"}}}))
+            return _cp(out=json.dumps({"metadata": {"labels": owned}}))
         if args[:2] == ["get", "namespace"]:
             return _cp(out="namespace/a-check-r1")
         if args[:1] == ["delete"]:
@@ -5049,9 +5049,10 @@ def test_cleanup_deletes_a_namespace_it_owns(monkeypatch):
 def test_cleanup_reports_leftovers_when_delete_fails(monkeypatch):
     cr = orc.CheckRun(app="a", env="staging", sha="s", run_id="r1",
                       kubeconfig=None, namespace="a-check-r1")
+    owned = {orc.CHECK_LABEL: "true", orc.CHECK_RUN_LABEL: "r1", orc.CHECK_APP_LABEL: "a"}
     def fake_kubectl(args, **kw):
         if args[:2] == ["get", "namespace"] and "json" in args:
-            return _cp(out=json.dumps({"metadata": {"labels": {orc.CHECK_RUN_LABEL: "r1"}}}))
+            return _cp(out=json.dumps({"metadata": {"labels": owned}}))
         if args[:2] == ["get", "namespace"]:
             return _cp(out="namespace/a-check-r1")
         if args[:1] == ["delete"]:
@@ -5133,6 +5134,169 @@ def test_deploy_check_and_deploy_yaml_share_the_pipeline(tmp_path, monkeypatch):
     # deploy-check nhắm namespace kiểm tra riêng, không phải namespace chính thức
     assert "check" in calls[1].target_namespace
     assert calls[1].do_vault is False and calls[1].do_secrets is False
+
+
+# ---- chế độ debug: --keep, deploy-check-cleanup, rewrite hostname ----------
+def _route_doc(name="route-web", host="web.staging.internal.dev", path="/"):
+    return {"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+            "metadata": {"name": name},
+            "spec": {"hostnames": [host], "parentRefs": [{"name": "gw"}],
+                     "rules": [{"matches": [{"path": {"type": "PathPrefix",
+                                                      "value": path}}]}]}}
+
+
+def _deploy_check_args(repo, sha, tmp_path, *, keep=False, work="w"):
+    return argparse.Namespace(
+        app="web", app_dir=str(repo), sha=sha, env="staging", kubeconfig=None,
+        registry="r.io/p", image=None, catalog=str(CATALOG), tag_strategy="",
+        build=False, timeout=1, work=str(tmp_path / work), keep=keep)
+
+
+def _spy_pre_gitops(monkeypatch, docs):
+    """run_pre_gitops giả: ghi `docs` ra params.out rồi trả PipelineResult trỏ vào đó."""
+    def spy(params, record=None):
+        out = Path(params.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        orc.dump_all(docs, out)
+        return orc.PipelineResult(manifests=out,
+                                  secrets=Path(params.work) / "secrets.yaml",
+                                  target_namespace=params.target_namespace or "x")
+    monkeypatch.setattr(orc, "run_pre_gitops", spy)
+    monkeypatch.setattr(orc, "github_checks", lambda *a, **k: None)
+    monkeypatch.setattr(orc, "_create_labeled_namespace", lambda *a, **k: None)
+
+
+def _spy_cleanup(monkeypatch, calls):
+    def cleanup(self):
+        calls.append(self.run_id)
+        return True, []
+    monkeypatch.setattr(orc.CheckRun, "cleanup", cleanup)
+
+
+def test_deploy_check_without_keep_runs_cleanup(tmp_path, monkeypatch):
+    """Không --keep: hành vi cũ giữ nguyên — cleanup() được gọi ở finally."""
+    repo, sha = _score_git_app(tmp_path)
+    _spy_pre_gitops(monkeypatch, [deploy_doc("web", "r.io/p/web:v1")])
+    monkeypatch.setattr(orc, "_ephemeral_deploy", lambda *a, **k: None)
+    calls = []
+    _spy_cleanup(monkeypatch, calls)
+    orc.cmd_deploy_check(_deploy_check_args(repo, sha, tmp_path, keep=False))
+    assert len(calls) == 1, "không --keep phải gọi cleanup() đúng một lần"
+
+
+def test_deploy_check_keep_skips_cleanup(tmp_path, monkeypatch):
+    """--keep: KHÔNG tự cleanup — namespace tạm được giữ để debug."""
+    repo, sha = _score_git_app(tmp_path)
+    _spy_pre_gitops(monkeypatch, [deploy_doc("web", "r.io/p/web:v1")])
+    monkeypatch.setattr(orc, "_ephemeral_deploy", lambda *a, **k: None)
+    calls = []
+    _spy_cleanup(monkeypatch, calls)
+    orc.cmd_deploy_check(_deploy_check_args(repo, sha, tmp_path, keep=True))
+    assert calls == [], "--keep không được gọi cleanup()"
+    # work dir được GIỮ (không xoá) để soi manifest tạm
+    assert (tmp_path / "w").is_dir()
+
+
+def test_deploy_check_cleanup_deletes_matching_namespace(monkeypatch):
+    """deploy-check-cleanup xoá đúng namespace khi ĐỦ 3 nhãn khớp app + run-id."""
+    monkeypatch.setattr(orc, "vault_api", lambda *a, **k: (-1, {}))
+    deleted = []
+    labels = {orc.CHECK_LABEL: "true", orc.CHECK_RUN_LABEL: "r1", orc.CHECK_APP_LABEL: "web"}
+    def fake_kubectl(args, **kw):
+        if args[:2] == ["get", "namespace"] and "json" in args:
+            return _cp(out=json.dumps({"metadata": {"labels": labels}}))
+        if args[:2] == ["get", "namespace"]:
+            return _cp(out="namespace/web-check-r1")
+        if args[:1] == ["delete"]:
+            deleted.append(args)
+            return _cp()
+        return _cp()
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    args = argparse.Namespace(app="web", run_id="r1", kubeconfig=None)
+    orc.cmd_deploy_check_cleanup(args)  # không SystemExit = thành công
+    assert any(a[:2] == ["delete", "namespace"] for a in deleted)
+
+
+def test_deploy_check_cleanup_refuses_mismatched_labels(monkeypatch):
+    """Nhãn không khớp (source-app khác) ⇒ TỪ CHỐI xoá, không đụng namespace thật."""
+    monkeypatch.setattr(orc, "vault_api", lambda *a, **k: (-1, {}))
+    deleted = []
+    # namespace tồn tại nhưng source-app='other' (không phải app đang cleanup)
+    labels = {orc.CHECK_LABEL: "true", orc.CHECK_RUN_LABEL: "r1", orc.CHECK_APP_LABEL: "other"}
+    def fake_kubectl(args, **kw):
+        if args[:2] == ["get", "namespace"] and "json" in args:
+            return _cp(out=json.dumps({"metadata": {"labels": labels}}))
+        if args[:2] == ["get", "namespace"]:
+            return _cp(out="namespace/web-check-r1")
+        if args[:1] == ["delete"]:
+            deleted.append(args)
+            return _cp()
+        return _cp()
+    monkeypatch.setattr(orc, "kubectl", fake_kubectl)
+    args = argparse.Namespace(app="web", run_id="r1", kubeconfig=None)
+    with pytest.raises(SystemExit):
+        orc.cmd_deploy_check_cleanup(args)
+    assert deleted == [], "KHÔNG được xoá namespace không khớp nhãn"
+
+
+def test_deploy_check_keep_rewrites_httproute_when_domain_set(tmp_path, monkeypatch):
+    """Có ingress.deploy_check_domain + --keep ⇒ hostname manifest TẠM bị rewrite sang
+    <app>-check-<run-id>.<domain>. Chỉ trên bản kubectl apply, không đụng repo."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"ingress": {"deploy_check_domain": "stg.example.com", "route_scheme": "http"}}))
+    repo, sha = _score_git_app(tmp_path)
+    _spy_pre_gitops(monkeypatch, [_route_doc()])
+    monkeypatch.setattr(orc, "kubectl", lambda args, **kw: _cp(rc=0, out="{}"))
+    orc.cmd_deploy_check(_deploy_check_args(repo, sha, tmp_path, keep=True))
+    applied = orc.load_all(tmp_path / "w" / "check-apply.yaml")
+    hr = [d for d in applied if d.get("kind") == "HTTPRoute"][0]
+    host = hr["spec"]["hostnames"][0]
+    assert host.startswith("web-check-") and host.endswith(".stg.example.com")
+    assert host != "web.staging.internal.dev"
+
+
+def test_deploy_check_keeps_original_hostname_without_domain(tmp_path, monkeypatch):
+    """Không có ingress.deploy_check_domain ⇒ giữ nguyên hostname gốc của HTTPRoute."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"ingress": {"route_scheme": "http"}}))  # KHÔNG có deploy_check_domain
+    repo, sha = _score_git_app(tmp_path)
+    _spy_pre_gitops(monkeypatch, [_route_doc(host="web.staging.internal.dev")])
+    monkeypatch.setattr(orc, "kubectl", lambda args, **kw: _cp(rc=0, out="{}"))
+    orc.cmd_deploy_check(_deploy_check_args(repo, sha, tmp_path, keep=True))
+    applied = orc.load_all(tmp_path / "w" / "check-apply.yaml")
+    hr = [d for d in applied if d.get("kind") == "HTTPRoute"][0]
+    assert hr["spec"]["hostnames"] == ["web.staging.internal.dev"]
+
+
+def test_deploy_check_output_has_summary(tmp_path, monkeypatch, capsys):
+    """Cuối mỗi lần chạy luôn in Run ID / Namespace / App URL (suy từ HTTPRoute) / Cleanup."""
+    monkeypatch.setattr(orc, "CONFIG", orc.EnvConfig(
+        {"ingress": {"route_scheme": "http"}}))
+    repo, sha = _score_git_app(tmp_path)
+    _spy_pre_gitops(monkeypatch, [_route_doc(host="web.staging.internal.dev", path="/api")])
+    monkeypatch.setattr(orc, "_ephemeral_deploy", lambda *a, **k: None)
+    monkeypatch.setattr(orc.CheckRun, "cleanup", lambda self: (True, []))
+    orc.cmd_deploy_check(_deploy_check_args(repo, sha, tmp_path, keep=False))
+    out = capsys.readouterr().out
+    assert "Run ID:" in out
+    assert "Namespace:" in out
+    assert "App URL: http://web.staging.internal.dev/api" in out
+    assert "Cleanup command: idpctl deploy-check-cleanup --app web --run-id" in out
+
+
+def test_deploy_check_fail_without_keep_hints_to_rerun(tmp_path, monkeypatch, capsys):
+    """Fail ở DB/Vault/rollout mà KHÔNG --keep ⇒ gợi ý chạy lại với --keep để debug."""
+    repo, sha = _score_git_app(tmp_path)
+    _spy_pre_gitops(monkeypatch, [deploy_doc("web", "r.io/p/web:v1")])
+    def boom(*a, **k):
+        raise orc.DeployCheckError("chờ Deployment", "pod chưa Ready",
+                                   orc.LAYER_KUBERNETES, "ảnh/DB/secret")
+    monkeypatch.setattr(orc, "_ephemeral_deploy", boom)
+    monkeypatch.setattr(orc.CheckRun, "cleanup", lambda self: (True, []))
+    with pytest.raises(SystemExit):
+        orc.cmd_deploy_check(_deploy_check_args(repo, sha, tmp_path, keep=False))
+    err = capsys.readouterr().err
+    assert "Chạy lại với --keep" in err
 
 
 def test_keys_for_vss_gathers_referenced_keys():

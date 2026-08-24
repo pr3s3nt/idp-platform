@@ -505,6 +505,9 @@ class CheckRun:
     vault_temp_prefix: str = ""     # tiền tố KV (kèm mount) chứa secret thử, để xoá
     build_images: list = field(default_factory=list)  # ảnh tạm mang run-id nếu chạy --build
     leftovers: list = field(default_factory=list)
+    # Hostname debug đem ghi đè vào HTTPRoute của manifest TẠM (chỉ khi --keep + có
+    # ingress.deploy_check_domain). Rỗng = giữ hostname gốc. Không bao giờ ghi vào repo.
+    rewrite_host: str = ""
 
     def labels(self) -> dict:
         return {
@@ -516,12 +519,17 @@ class CheckRun:
 
     # -- xác minh quyền sở hữu ------------------------------------------------------
     def _owns_namespace(self) -> bool:
+        """Chỉ coi là của lần chạy này khi ĐỦ CẢ BA nhãn khớp: check=true, check-run=run-id,
+        source-app=app. Cleanup TAY (deploy-check-cleanup) dựa vào đây để không bao giờ xoá
+        nhầm một namespace thật chỉ vì trùng một nhãn."""
         cp = kubectl(["get", "namespace", self.namespace, "-o", "json"],
                      kubeconfig=self.kubeconfig, check=False, capture=True)
         if cp.returncode != 0:
             return False
         labels = ((json.loads(cp.stdout or "{}").get("metadata") or {}).get("labels") or {})
-        return labels.get(CHECK_RUN_LABEL) == self.run_id
+        return (labels.get(CHECK_LABEL) == "true"
+                and labels.get(CHECK_RUN_LABEL) == self.run_id
+                and labels.get(CHECK_APP_LABEL) == self.app)
 
     # -- dọn dẹp --------------------------------------------------------------------
     def cleanup(self) -> tuple[bool, list[str]]:
@@ -550,8 +558,9 @@ class CheckRun:
         if cp.returncode == 0:
             if not self._owns_namespace():
                 leftovers.append(
-                    f"namespace {self.namespace} (KHÔNG mang nhãn {CHECK_RUN_LABEL}="
-                    f"{self.run_id} — TỪ CHỐI xoá, không phải của lần chạy này)")
+                    f"namespace {self.namespace} (KHÔNG đủ nhãn {CHECK_LABEL}=true + "
+                    f"{CHECK_RUN_LABEL}={self.run_id} + {CHECK_APP_LABEL}={self.app} "
+                    f"— TỪ CHỐI xoá, không phải của lần chạy này)")
             else:
                 d = kubectl(["delete", "namespace", self.namespace, "--wait=false",
                              "--ignore-not-found"],
@@ -733,6 +742,50 @@ def cmd_pre_gitops(args) -> None:
     log("pre-gitops OK — sẵn sàng cho bước GitOps")
 
 
+def _derive_app_url(manifests, host_override: str = "") -> str | None:
+    """Suy URL người-dùng-thấy từ HTTPRoute đầu tiên trong manifest, hoặc None.
+
+    `host_override` (khi đã rewrite hostname debug) được ưu tiên hơn spec.hostnames để URL in
+    ra khớp đúng hostname THẬT được apply. Scheme lấy ingress.route_scheme (mặc định http);
+    path lấy PathPrefix đầu tiên nếu khác '/'. Không có HTTPRoute/hostname ⇒ None.
+    """
+    if not manifests or not Path(manifests).is_file():
+        return None
+    for d in load_all(Path(manifests)):
+        if d.get("kind") != "HTTPRoute":
+            continue
+        spec = d.get("spec") or {}
+        hosts = spec.get("hostnames") or []
+        host = host_override or (hosts[0] if hosts else "")
+        if not host:
+            continue
+        scheme = CONFIG.get("ingress.route_scheme") or "http"
+        path = ""
+        rules = spec.get("rules") or []
+        if rules:
+            matches = rules[0].get("matches") or []
+            if matches:
+                p = (matches[0].get("path") or {}).get("value") or ""
+                if p and p != "/":
+                    path = p
+        return f"{scheme}://{host}{path}"
+    return None
+
+
+def _print_run_summary(run_id: str, namespace: str, app_url: str | None,
+                       cleanup_cmd: str, *, keep: bool) -> None:
+    """Tóm tắt CUỐI mỗi lần deploy-check: Run ID / Namespace / App URL (nếu có) / Cleanup."""
+    lines = ["", "=== deploy-check ===",
+             f"Run ID: {run_id}",
+             f"Namespace: {namespace}"]
+    if app_url:
+        lines.append(f"App URL: {app_url}")
+    if keep:
+        lines.append("Tài nguyên tạm: GIỮ LẠI (--keep) — dọn tay bằng lệnh dưới")
+    lines.append(f"Cleanup command: {cleanup_cmd}")
+    print("\n".join(lines), flush=True)
+
+
 def cmd_deploy_check(args) -> None:
     """Thử triển khai app từ máy lập trình viên vào namespace kiểm tra riêng, rồi dọn sạch.
 
@@ -762,10 +815,19 @@ def cmd_deploy_check(args) -> None:
         Path(tempfile.mkdtemp(prefix=f"deploycheck-{run_id}-"))
     run_state = CheckRun(app=app, env=env, sha=args.sha, run_id=run_id,
                          kubeconfig=args.kubeconfig, namespace=namespace)
+    keep = getattr(args, "keep", False)
+    # Hostname debug CHỈ khi --keep + có ingress.deploy_check_domain. Dùng chính `namespace`
+    # làm label DNS (đã DNS-safe + cap 63, trùng dạng <app>-check-<run-id>), tránh nhãn quá
+    # dài. Không có domain ⇒ giữ hostname gốc, chỉ suy URL từ HTTPRoute nếu có.
+    debug_domain = CONFIG.get("ingress.deploy_check_domain")
+    run_state.rewrite_host = f"{namespace}.{debug_domain}" if (keep and debug_domain) else ""
+    cleanup_cmd = f"idpctl deploy-check-cleanup --app {app} --run-id {run_id}" + \
+        (f" --kubeconfig {args.kubeconfig}" if args.kubeconfig else "")
     log(f"deploy-check {app}/{env} run-id={run_id} ns={namespace}")
 
     err: DeployCheckError | None = None
     ok, cleanup_note = True, "thành công"
+    app_url: str | None = None
     try:
         # bước 4: xác nhận source + SHA (trong try để lỗi cũng được format chẩn đoán)
         sha = _resolve_and_validate_sha(app_dir, args.sha, build=build)
@@ -794,6 +856,9 @@ def cmd_deploy_check(args) -> None:
             state_file=temp_state,
             do_vault=False, do_secrets=False, do_dry_run=True)
         result = run_pre_gitops(params)
+        # URL debug suy ngay khi có manifest — dùng được cả khi bước sau (rollout) hỏng.
+        # host_override = rewrite_host để URL khớp hostname THẬT sẽ apply (nếu đã rewrite).
+        app_url = _derive_app_url(result.manifests, run_state.rewrite_host)
 
         # --build: build + push ảnh tạm ĐÚNG ref mà manifest vừa trỏ tới, TRƯỚC khi apply
         # để pod kéo được. Ghi lại ref để cleanup xoá ảnh sau kiểm tra.
@@ -807,14 +872,27 @@ def cmd_deploy_check(args) -> None:
     except DeployCheckError as e:
         err = e
     finally:
-        ok, leftovers = run_state.cleanup()
-        if owns_work:
-            shutil.rmtree(work, ignore_errors=True)
-        cleanup_note = "thành công" if ok else "CÒN SÓT:\n  - " + "\n  - ".join(leftovers)
+        # --keep: GIỮ lại namespace/Vault/ảnh tạm (và cả work dir) để debug. Dọn TAY sau
+        # bằng deploy-check-cleanup. Không --keep: hành vi cũ — luôn dọn trong finally.
+        if keep:
+            ok, cleanup_note = True, "GIỮ LẠI (--keep)"
+        else:
+            ok, leftovers = run_state.cleanup()
+            if owns_work:
+                shutil.rmtree(work, ignore_errors=True)
+            cleanup_note = "thành công" if ok else \
+                "CÒN SÓT:\n  - " + "\n  - ".join(leftovers)
+
+    # Cuối MỌI lần chạy: Run ID / Namespace / App URL (nếu có) / Cleanup command.
+    _print_run_summary(run_id, namespace, app_url, cleanup_cmd, keep=keep)
 
     if err is not None:
         print("\n" + format_diagnostic(err, run_id=run_id, cleanup=cleanup_note),
               file=sys.stderr, flush=True)
+        # Fail ở Vault/DB/rollout mà KHÔNG giữ lại ⇒ gợi ý chạy lại để debug trên cụm.
+        if not keep and err.layer in (LAYER_VAULT, LAYER_DATABASE, LAYER_KUBERNETES):
+            print("Gợi ý: Chạy lại với --keep để giữ namespace tạm và debug tài nguyên "
+                  "Kubernetes.", file=sys.stderr, flush=True)
         raise SystemExit(1)
     if not ok:
         print("\n[FAIL] cleanup", file=sys.stderr)
@@ -826,6 +904,43 @@ def cmd_deploy_check(args) -> None:
         print(f"  kubectl delete namespace {namespace}", file=sys.stderr)
         raise SystemExit(2)
     log(f"deploy-check hoàn tất, cleanup {cleanup_note}. Run ID: {run_id}")
+
+
+def cmd_deploy_check_cleanup(args) -> None:
+    """Dọn TAY tài nguyên tạm còn lại của một lần `deploy-check --keep`, theo app + run-id.
+
+    Tái dựng ĐÚNG CheckRun của lần chạy đó từ quy tắc đặt tên TẤT ĐỊNH (namespace, policy/
+    role/tiền tố Vault), rồi gọi cùng `cleanup()`. Vì `_owns_namespace()` đòi đủ ba nhãn
+    check=true + check-run=<run-id> + source-app=<app>, lệnh này KHÔNG BAO GIỜ xoá một
+    namespace thật chỉ vì trùng tên — không khớp nhãn thì từ chối và báo còn sót.
+    """
+    app = validate_secret_name(args.app)
+    run_id = args.run_id
+    namespace = f"{app}-check-{run_id}"[:63].rstrip("-")
+
+    run_state = CheckRun(app=app, env="staging", sha="", run_id=run_id,
+                         kubeconfig=args.kubeconfig, namespace=namespace)
+    # Tên tài nguyên Vault tạm là TẤT ĐỊNH theo run-id (xem _setup_temp_vault) nên tái dựng
+    # được mà không cần state — để cleanup tay cũng gỡ sạch policy/role/secret thử.
+    run_state.vault_temp_policy = f"idp-check-{run_id}"[:120]
+    run_state.vault_temp_role = f"idp-check-{run_id}"[:120]
+    mount = _vault_str("kv_mount") or "kv"
+    run_state.vault_temp_prefix = f"{mount}/apps/{app}/_check-{run_id}/"
+    log(f"deploy-check-cleanup {app} run-id={run_id} ns={namespace}")
+
+    ok, leftovers = run_state.cleanup()
+    cleanup_cmd = f"idpctl deploy-check-cleanup --app {app} --run-id {run_id}" + \
+        (f" --kubeconfig {args.kubeconfig}" if args.kubeconfig else "")
+    if ok:
+        log(f"deploy-check-cleanup xong — không còn tài nguyên tạm của run-id {run_id}.")
+        return
+    print("\n[FAIL] deploy-check-cleanup", file=sys.stderr)
+    print(f"Nguyên nhân: không xoá hết (hoặc từ chối xoá) tài nguyên tạm", file=sys.stderr)
+    print(f"Tầng lỗi: {LAYER_KUBERNETES}", file=sys.stderr)
+    print(f"Run ID: {run_id}", file=sys.stderr)
+    print("Còn sót:\n  - " + "\n  - ".join(leftovers), file=sys.stderr)
+    print(f"Chạy lại sau khi xử lý: {cleanup_cmd}", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _resolve_and_validate_sha(app_dir: Path, sha: str, *, build: bool) -> str:
@@ -899,6 +1014,14 @@ def _ephemeral_deploy(run_state: CheckRun, result: PipelineResult, work: Path, a
     # --- Vault tạm: policy/role/secret thử + rewrite VSS sang tiền tố thử -------------
     if has_vault:
         _setup_temp_vault(run_state, docs)
+
+    # hostname debug: chỉ khi --keep + có ingress.deploy_check_domain (run_state.rewrite_host
+    # đã tính sẵn ở cmd_deploy_check). Ghi đè hostnames của HTTPRoute trong manifest TẠM để
+    # URL debug truy được theo từng lần chạy — KHÔNG đụng repo/GitOps, chỉ bản kubectl apply.
+    if run_state.rewrite_host:
+        for d in docs:
+            if d.get("kind") == "HTTPRoute":
+                (d.setdefault("spec", {}))["hostnames"] = [run_state.rewrite_host]
 
     # rewrite mọi doc namespaced sang namespace kiểm tra + gắn nhãn run-id
     for d in docs:

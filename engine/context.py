@@ -56,7 +56,13 @@ DEFAULTS: dict = {
                 # Scheme for USER-FACING urls the platform prints (onboarding output).
                 # Not a routing decision — the Gateway terminates TLS — just what URL a
                 # human is told to open. http keeps the historical output unchanged.
-                "route_scheme": "http"},
+                "route_scheme": "http",
+                # Wildcard domain for `deploy-check --keep` debug URLs. EMPTY (default) keeps
+                # each app's original HTTPRoute hostname; when set, a kept check rewrites the
+                # temp manifest's hostname to <app>-check-<run-id>.<deploy_check_domain> so a
+                # human can hit the ephemeral namespace. Only ever touches the applied temp
+                # manifest — never the config repo or GitOps.
+                "deploy_check_domain": ""},
     "images": {},
     "environments": {},
     # Empty version strings mean "do not check" — see check_tool_versions. A brownfield

@@ -25,7 +25,7 @@ Các khối chính (đọc comment trong chính file để biết chi tiết và
 | `database` + `database_profiles` | backend (`cnpg`/`statefulset`), provider/operator, ảnh, credential secret, backup, và profile staging/prod (instance, storage, HA, retention) |
 | `features` | cờ bật/tắt từng tính năng: `application_values`, `vault_secrets`, `postgres_application`, `stack_onboarding` |
 | `audit` | kho lịch sử deploy tuỳ chọn: `enabled`, `required` (fail-open/closed), tên biến chứa connection string |
-| `ingress` | `gateway_name`/`gateway_namespace` (phải khớp Gateway thật), `section_name`, `route_scheme` |
+| `ingress` | `gateway_name`/`gateway_namespace` (phải khớp Gateway thật), `section_name`, `route_scheme`, `deploy_check_domain` (domain wildcard cho URL debug của `deploy-check --keep`; rỗng = giữ hostname gốc) |
 | `images` | ảnh datastore (`postgres`) và ảnh nền golden path (`node`, `nginx`) |
 | `environments` | khác biệt theo môi trường: `config_branch`, `replicas`, `domain`, cpu/memory — phơi ra khi render dưới tiền tố `env.` |
 

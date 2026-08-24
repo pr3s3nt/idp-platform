@@ -388,7 +388,19 @@ def main(argv: list[str] | None = None) -> None:
                    help="build+push ảnh tạm mang run-id để kiểm cả source CHƯA commit")
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--work", help="thư mục làm việc (mặc định: thư mục tạm, tự xoá)")
+    p.add_argument("--keep", action="store_true",
+                   help="GIỮ lại namespace/Vault/ảnh tạm sau khi chạy (pass hay fail) để "
+                        "debug DB/Vault/rollout; dọn tay bằng deploy-check-cleanup")
     p.set_defaults(func=cmd_deploy_check)
+
+    # Dọn TAY tài nguyên tạm còn lại của một lần `deploy-check --keep`, theo run-id. CHỈ xoá
+    # tài nguyên mang đủ nhãn check/check-run/source-app khớp — từ chối chạm namespace thật.
+    p = sub.add_parser("deploy-check-cleanup",
+                       help="xoá tài nguyên tạm của một lần deploy-check --keep theo run-id")
+    p.add_argument("--app", required=True)
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--kubeconfig")
+    p.set_defaults(func=cmd_deploy_check_cleanup)
 
     p = sub.add_parser("apply-secrets")
     p.add_argument("--app", required=True)
